@@ -67,6 +67,21 @@ def test_check_config_fails_on_invalid_file(tmp_path: Path) -> None:
     assert "config.yaml" in result.output
 
 
+def test_check_config_reports_bad_database_url(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        (REPO / "config.yaml")
+        .read_text()
+        .replace("url: sqlite+aiosqlite:///data/autotrader.db", "url: not-a-db-url")
+    )
+
+    result = runner.invoke(app, ["check-config", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert "invalid config" in result.output
+    assert "database.url" in result.output
+
+
 def test_db_upgrade_creates_schema(tmp_path: Path) -> None:
     config = tmp_path / "config.yaml"
     text = (
