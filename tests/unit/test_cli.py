@@ -1,9 +1,12 @@
+from pathlib import Path
+
 import pytest
 from typer.testing import CliRunner
 
 from autotrader.cli import app
 
 runner = CliRunner()
+REPO = Path(__file__).resolve().parents[2]
 
 
 def test_help_lists_all_spec_commands() -> None:
@@ -40,3 +43,25 @@ def test_stub_commands_fail_loudly(args: list[str]) -> None:
 
     assert result.exit_code == 2
     assert "not implemented" in result.output
+
+
+def test_check_config_reports_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(REPO)
+    monkeypatch.delenv("ALPACA_PAPER", raising=False)
+
+    result = runner.invoke(app, ["check-config"])
+
+    assert result.exit_code == 0, result.output
+    assert "mode: paper" in result.output
+    assert "profile: fast_momentum_v1" in result.output
+    assert "hash: " in result.output
+
+
+def test_check_config_fails_on_invalid_file(tmp_path: Path) -> None:
+    bad = tmp_path / "config.yaml"
+    bad.write_text("mode: sideways\n")
+
+    result = runner.invoke(app, ["check-config", "--config", str(bad)])
+
+    assert result.exit_code == 1
+    assert "config.yaml" in result.output
