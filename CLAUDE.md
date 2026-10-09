@@ -14,6 +14,7 @@ Automated, agent-based crypto trading PoC (Alpaca paper first, live later with ~
 - The learning loop never touches the `risk` block, signal rules, models or prompts.
 - No `eval()`/`exec()` on config strings; use the shared expression evaluator (`core/expr.py`, G7). New expression names go into `core/features.py`.
 - Secrets only via env / `.env` (git-ignored). Never commit keys, never log them.
+- Before any new entry, ask `ControlGate.status()` (`core/kill.py`); it fails closed. Kill/pause block entries only — reduce-only exits must stay possible.
 
 ## Stack & conventions
 - Python 3.12, uv (`uv sync`, `uv run ...`), typer CLI (`autotrader ...`), src layout `src/autotrader/`.
@@ -36,6 +37,7 @@ uv run mypy                  # strict, src + tests (paths from pyproject)
 uv run autotrader --help     # CLI; unimplemented commands exit 2
 uv run autotrader check-config  # validate config.yaml + env + profile, print profile hash
 uv run autotrader db upgrade    # apply migrations to config.yaml's database.url
+uv run autotrader kill [--reason ...] / kill --clear  # kill-switch (fallback: touch data/control/KILL)
 uv run alembic revision --autogenerate -m "..."  # new migration after editing journal/models.py
 ```
 CI (`.github/workflows/ci.yml`) runs the same checks plus `pip-audit` on the exported lock file.
