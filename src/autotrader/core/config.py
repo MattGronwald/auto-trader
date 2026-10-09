@@ -33,6 +33,8 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 from autotrader.core.expr import Expression, ExpressionError, ResultType
 from autotrader.core.features import EVIDENCE_FIELDS, SIGNAL_FEATURES
@@ -310,8 +312,23 @@ def _resolve_path(value: Path, info: ValidationInfo) -> Path:
 ConfigPath = Annotated[Path, AfterValidator(_resolve_path)]
 
 
+def _resolve_sqlite_url(value: str, info: ValidationInfo) -> str:
+    """Relative SQLite paths resolve against the config dir, like every other path."""
+    try:
+        url = make_url(value)
+    except (ArgumentError, ValueError):
+        # Never echo the value: database URLs can carry credentials.
+        raise ValueError("not a valid SQLAlchemy database URL") from None
+    db = url.database
+    if url.get_backend_name() != "sqlite" or not db or db == ":memory:" or Path(db).is_absolute():
+        return value
+    return url.set(database=str(_resolve_path(Path(db), info))).render_as_string(
+        hide_password=False
+    )
+
+
 class Database(_Frozen):
-    url: str
+    url: Annotated[str, AfterValidator(_resolve_sqlite_url)]
 
 
 class Control(_Frozen):
@@ -399,7 +416,19 @@ def _validate[M: BaseModel](
     try:
         return model.model_validate(data, context=dict(context or {}))
     except ValidationError as e:
-        raise ConfigError(f"{source}: {e}") from None
+        raise ConfigError(f"{source}: {_format_errors(e)}") from None
+
+
+def _format_errors(error: ValidationError) -> str:
+    """`field.path: message` per error, without input values.
+
+    Pydantic's default text echoes the offending input, which for `database.url` can be
+    a credential-bearing URL.
+    """
+    return "; ".join(
+        f"{'.'.join(str(part) for part in err['loc']) or '<root>'}: {err['msg']}"
+        for err in error.errors(include_url=False, include_input=False)
+    )
 
 
 def parse_profile(data: Any, source: str = "<profile>") -> StrategyProfile:
