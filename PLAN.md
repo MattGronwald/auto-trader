@@ -128,10 +128,18 @@ Not code-first. Checklist from SPEC §12 plus: VPS + Compose + Postgres backups,
 
 ---
 
-## 5. Decisions needed from the owner
+## 5. Decisions (2026-10-09)
 
-1. **Alpaca paper keys** and where the core runs in Phase 0–1 (laptop vs. VPS). With client-side stops (G2), overnight paper runs on a laptop produce misleading results.
-2. Accept G1 (`exit()` path bypassing rate limits/pauses)? This is a deliberate softening of the non-negotiable §0.1 wording, not of its intent.
-3. `default_win_rate_prior` value (G3) and `trading_day_tz` (G6).
-4. Package/CLI tooling: uv + typer OK?
-5. Dashboard auth: bearer token only, or Tailscale-only + token (spec says both; confirm).
+| # | Topic | Decision |
+|---|---|---|
+| D1 | Runtime | Laptop (macOS) for Phases 0–3; VPS before Phase 5 (and earlier if overnight paper runs need to be trustworthy, see G2). |
+| D2 | Secrets | Laptop: `.env` in repo root (git-ignored), template in `.env.example`. Variables: `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`, `ALPACA_PAPER=true`, `ANTHROPIC_API_KEY` (from Phase 2), `DASHBOARD_TOKEN` (from Phase 3). Loaded via pydantic-settings; real env vars override `.env`. Separate key pairs for paper and live; live keys never on the laptop. |
+| D3 | G1 | Accepted: Risk Engine has `check()` for entries and `exit()` for reduce-only orders. |
+| D4 | G3 | `risk.default_win_rate_prior: 0.40`, used until `n ≥ learning.min_trades_for_evidence`. With the +10 pp cap, `p_win_est ≤ 0.50` initially → effectively requires reward:risk ≳ 1.6 after fees. Conservative on purpose. |
+| D5 | G6 | `trading_day_tz: UTC`, boundary 00:00 UTC (= 01:00/02:00 Berlin). Matches Alpaca bar timestamps, no DST jumps. |
+| D6 | G11 | `feed.stale_alert_s: 60`; `feed.stale_exit_s: 300` with `feed.stale_exit_enabled: false` in paper, `true` in live. |
+| D7 | Laptop mitigations | On core startup: reconcile first, then enforce overdue stops/time exits immediately. Optional `shutdown.flatten: false` (paper) for graceful stops. Run under `caffeinate -i` while plugged in. |
+| D8 | Tooling | uv + typer — pending owner confirmation. |
+| D9 | Dashboard auth | Bearer token + localhost/Tailscale-only binding (both, per SPEC §9.2/§14). |
+
+**Cloud dev sessions:** outbound access to `*.alpaca.markets` is currently blocked by the environment network policy. Unit/integration tests use `SimBroker` and recorded fixtures; Alpaca smoke tests run on the laptop (or after allowlisting the domain and adding paper keys as environment variables).
