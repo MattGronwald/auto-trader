@@ -489,3 +489,32 @@ async def test_close_all_continues_past_a_rejected_symbol() -> None:
     acks = await sim.close_all()
 
     assert [a.symbol for a in acks] == ["ETH/USD"]
+
+
+async def test_order_never_fills_on_a_bar_before_its_submission() -> None:
+    # PR #8 re-review: the stale-bar guard is per symbol, but submission time is the
+    # global clock. BTC 00:00, ETH 00:05, submit BTC (acked 00:05), then BTC 00:01
+    # filled the order four minutes before it existed.
+    sim = make_sim(cash="10000")
+    sim.process_bar(bar(0, 100.0))
+    sim.process_bar(bar(5, 10.0, symbol="ETH/USD"))
+    ack = await sim.submit_order(market("buy", "1"))
+    assert ack.submitted_at == T0 + timedelta(minutes=5)
+
+    sim.process_bar(bar(1, 90.0))  # new for BTC, but before the submission
+    assert (await sim.get_order(ack.order_id)).status == "new"
+
+    sim.process_bar(bar(6, 101.0))
+    status = await sim.get_order(ack.order_id)
+    assert status.status == "filled"
+    assert status.avg_fill_price == Decimal("101")
+
+
+async def test_clock_never_moves_backwards() -> None:
+    sim = make_sim(cash="10000")
+    sim.process_bar(bar(5, 100.0))
+    sim.process_bar(bar(1, 10.0, symbol="ETH/USD"))  # a lagging symbol
+
+    ack = await sim.submit_order(market("buy", "1"))
+
+    assert ack.submitted_at == T0 + timedelta(minutes=5)
