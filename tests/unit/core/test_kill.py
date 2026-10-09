@@ -8,7 +8,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from autotrader.core.bus import EventBus
-from autotrader.core.kill import ControlGate, KillCleared, KillTriggered, clear_kill, trigger_kill
+from autotrader.core.kill import (
+    ControlGate,
+    KillCleared,
+    KillTriggered,
+    clear_kill,
+    trigger_kill,
+    write_kill_file,
+)
 from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
@@ -212,3 +219,37 @@ async def test_clear_kill_is_idempotent(
 def test_events_carry_source() -> None:
     assert KillTriggered(source="file", reason=None).payload() == {"source": "file", "reason": None}
     assert KillCleared(source="cli").payload() == {"source": "cli"}
+
+
+# --- regressions from the PR #7 review -------------------------------------------
+
+
+async def test_failed_clear_keeps_a_file_only_kill(
+    gate: ControlGate,
+    kill_file: Path,
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # P2: clear used to unlink the file before the DB write; a failing write then
+    # silently lifted a `touch`-only kill.
+    kill_file.parent.mkdir(parents=True)
+    kill_file.touch()
+
+    async def broken(*_: object, **__: object) -> None:
+        raise RuntimeError("db is read-only")
+
+    monkeypatch.setattr(repo, "set_control", broken)
+
+    with pytest.raises(RuntimeError):
+        await clear_kill(kill_file, sessions, None, source="cli", now=NOW)
+
+    assert kill_file.exists()
+    monkeypatch.undo()
+    assert (await gate.status(NOW)).killed
+
+
+def test_write_kill_file_needs_no_database(kill_file: Path) -> None:
+    record = write_kill_file(kill_file, source="cli", reason="r", now=NOW)
+
+    assert json.loads(kill_file.read_text()) == record
+    assert record == {"source": "cli", "reason": "r", "ts": NOW.isoformat()}

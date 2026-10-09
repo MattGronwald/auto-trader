@@ -101,6 +101,33 @@ def _parse_aware(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def write_kill_file(
+    kill_file: Path, *, source: str, reason: str | None, now: datetime
+) -> dict[str, str | None]:
+    """Latch the kill via the file. Sync and DB-free: this step must not depend on
+    anything that can fail for database reasons. Raises if the file can't be written."""
+    record = {"source": source, "reason": reason, "ts": now.isoformat()}
+    kill_file.parent.mkdir(parents=True, exist_ok=True)
+    kill_file.write_text(json.dumps(record) + "\n")
+    log.warning("kill.triggered", source=source, reason=reason, kill_file=str(kill_file))
+    return record
+
+
+async def record_kill(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus | None,
+    record: dict[str, str | None],
+    now: datetime,
+) -> None:
+    """Second step of a kill: DB flag + `KillTriggered` event. Raises on failure."""
+    async with sessions() as session:
+        await repo.set_control(session, KILL_KEY, record)
+    if bus is not None:
+        await bus.publish(
+            KillTriggered(source=str(record["source"]), reason=record["reason"], ts=now)
+        )
+
+
 @dataclass(frozen=True)
 class KillResult:
     db_error: str | None  # set if the DB flag/event could not be written; file still is
@@ -115,20 +142,15 @@ async def trigger_kill(
     reason: str | None,
     now: datetime | None = None,
 ) -> KillResult:
-    """Kill: write the kill file first, then the DB flag and the `KillTriggered` event.
+    """Kill: latch the file first, then the DB flag and the `KillTriggered` event.
 
-    The file alone stops trading, so a DB failure is reported, not raised.
+    The file alone stops trading, so a DB failure is reported, not raised. Callers that
+    must create DB resources first (CLI) call `write_kill_file` before doing so.
     """
     now = now or datetime.now(UTC)
-    record = {"source": source, "reason": reason, "ts": now.isoformat()}
-    kill_file.parent.mkdir(parents=True, exist_ok=True)
-    kill_file.write_text(json.dumps(record) + "\n")
-    log.warning("kill.triggered", source=source, reason=reason, kill_file=str(kill_file))
+    record = write_kill_file(kill_file, source=source, reason=reason, now=now)
     try:
-        async with sessions() as session:
-            await repo.set_control(session, KILL_KEY, record)
-        if bus is not None:
-            await bus.publish(KillTriggered(source=source, reason=reason, ts=now))
+        await record_kill(sessions, bus, record, now)
     except Exception as e:
         log.exception("kill.db_update_failed")
         return KillResult(db_error=f"{type(e).__name__}: {e}")
@@ -143,11 +165,16 @@ async def clear_kill(
     source: str,
     now: datetime | None = None,
 ) -> None:
-    """Lift a kill: remove the file and the DB flag, record `KillCleared`."""
+    """Lift a kill: clear the DB flag, record `KillCleared`, and only then remove the file.
+
+    The file goes last: if any DB/audit step raises, the file (possibly the only latch,
+    e.g. after a bare `touch`) stays and the kill holds. With a concurrent trigger, the
+    result is "killed" unless the whole clear ran after the trigger's DB write.
+    """
     now = now or datetime.now(UTC)
-    kill_file.unlink(missing_ok=True)
     async with sessions() as session:
         await repo.set_control(session, KILL_KEY, None)
     if bus is not None:
         await bus.publish(KillCleared(source=source, ts=now))
+    kill_file.unlink(missing_ok=True)
     log.warning("kill.cleared", source=source)
