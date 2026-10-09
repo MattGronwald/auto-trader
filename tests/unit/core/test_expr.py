@@ -217,3 +217,114 @@ def test_compile_only_raises_expression_error(source: str) -> None:
         return
     with contextlib.suppress(EvaluationError):
         expr.evaluate({"close": [1.0, 2.0], "ema9": 1.0})
+
+
+# --- regressions from the PR #3 review -------------------------------------------
+
+_BIG = "9" * 400
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        f"close in {_BIG}..{_BIG}",  # was an uncaught OverflowError at compile
+        _BIG,  # was an uncaught OverflowError in evaluate_number()
+        "1e309",  # inf literal
+        "close > -1e309",
+    ],
+)
+def test_unrepresentable_or_non_finite_literals_rejected(source: str) -> None:
+    with pytest.raises(ExpressionError):
+        compile_(source)
+
+
+@pytest.mark.parametrize(
+    ("source", "env"),
+    [
+        ("1e308 * 10", {}),  # overflows to inf
+        ("close * 10", {"close": 1e308}),
+        ("close + 1", {"close": float("inf")}),
+        ("close > 1", {"close": float("nan")}),  # NaN would silently compare False
+        ("close > 1", {"close": int(_BIG)}),  # huge int from env
+    ],
+)
+def test_non_finite_values_are_evaluation_errors(source: str, env: Env) -> None:
+    with pytest.raises(EvaluationError):
+        compile_(source).evaluate(env)
+
+
+@pytest.mark.parametrize(
+    ("source", "value", "expected"),
+    [
+        ('rule_id == "in 1..2"', "in 1..2", True),  # was rewritten to "in __range__(1, 2)"
+        ("rule_id == 'x in 3..4'", "x in 3..4", True),
+        ('rule_id == """in 1..2"""', "in 1..2", True),
+        # PR #5 review: internal quotes must not end a triple-quoted literal
+        ('rule_id == """a " in 1..2 " b"""', 'a " in 1..2 " b', True),
+        ("rule_id == '''a ' in 1..2 ' b'''", "a ' in 1..2 ' b", True),
+        (r'rule_id == "a \" in 1..2 \" b"', 'a " in 1..2 " b', True),  # escaped quotes
+    ],
+)
+def test_range_syntax_inside_strings_is_untouched(source: str, value: str, expected: bool) -> None:
+    expr = Expression.compile(source, allowed_names=frozenset({"rule_id"}))
+
+    assert expr.evaluate_bool({"rule_id": value}) is expected
+
+
+def test_range_outside_string_still_rewritten_next_to_string() -> None:
+    expr = Expression.compile(
+        'rule_id == "a..b" and hour_utc in 1..2', allowed_names=frozenset({"rule_id", "hour_utc"})
+    )
+
+    assert expr.evaluate_bool({"rule_id": "a..b", "hour_utc": 2}) is True
+
+
+@pytest.mark.parametrize(
+    ("source", "result"),
+    [
+        ("1 + 2", "bool"),
+        ("min(close, 1)", "bool"),
+        ('"yes"', "bool"),
+        ("close > 1", "number"),
+        ("close > 1 and close < 2", "number"),
+        ("not close > 1", "number"),
+        ("True", "number"),
+    ],
+)
+def test_determinable_result_type_mismatch_rejected(source: str, result: str) -> None:
+    with pytest.raises(ExpressionError, match=f"expected a {result}"):
+        Expression.compile(source, allowed_names=SERIES_NAMES, result=result)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("source", "result"),
+    [
+        ("close > 1", "bool"),
+        ("close", "bool"),  # a bare name's type is only known at runtime
+        ("min(1, vol_z / 3)", "number"),
+        ("-close", "number"),
+        ("close[-1]", "number"),
+    ],
+)
+def test_matching_or_unknown_result_type_accepted(source: str, result: str) -> None:
+    Expression.compile(source, allowed_names=SERIES_NAMES, result=result)  # type: ignore[arg-type]
+
+
+# PR #5 review: finiteness checks must not turn exact int comparisons into float ones.
+
+
+@pytest.mark.parametrize(
+    ("source", "env", "expected"),
+    [
+        ("9007199254740992 == 9007199254740993", {}, False),
+        ("9007199254740992 < 9007199254740993", {}, True),
+        ("x == 9007199254740993", {"x": 9007199254740992}, False),
+        ("x == 9007199254740992.0", {"x": 9007199254740992}, True),  # mixed int/float exact
+        ("x in 9007199254740993..9007199254740995", {"x": 9007199254740992}, False),
+        ("x + 1 == 9007199254740993", {"x": 9007199254740992}, True),
+    ],
+)
+def test_large_integers_compare_exactly(source: str, env: Env, expected: bool) -> None:
+    expr = Expression.compile(source, allowed_names=frozenset({"x"}))
+
+    assert expr.evaluate_bool(env) is expected
