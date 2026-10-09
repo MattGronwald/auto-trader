@@ -34,7 +34,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from autotrader.core.expr import Expression, ExpressionError
+from autotrader.core.expr import Expression, ExpressionError, ResultType
 from autotrader.core.features import EVIDENCE_FIELDS, SIGNAL_FEATURES
 
 
@@ -65,7 +65,7 @@ class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-def _compiler(names: frozenset[str]) -> Callable[[object], Expression]:
+def _compiler(names: frozenset[str], result: ResultType) -> Callable[[object], Expression]:
     def compile_(value: object) -> Expression:
         # Unquoted YAML numbers (`score: 0.5`) arrive as int/float; treat them as literals.
         if isinstance(value, int | float) and not isinstance(value, bool):
@@ -73,7 +73,7 @@ def _compiler(names: frozenset[str]) -> Callable[[object], Expression]:
         if not isinstance(value, str):
             raise ValueError("expected an expression string")
         try:
-            return Expression.compile(value, allowed_names=names)
+            return Expression.compile(value, allowed_names=names, result=result)
         except ExpressionError as e:
             raise ValueError(str(e)) from None
 
@@ -81,8 +81,15 @@ def _compiler(names: frozenset[str]) -> Callable[[object], Expression]:
 
 
 _AS_SOURCE = PlainSerializer(lambda e: e.source, return_type=str)
-SignalExpr = Annotated[Expression, PlainValidator(_compiler(SIGNAL_FEATURES)), _AS_SOURCE]
-EvidenceExpr = Annotated[Expression, PlainValidator(_compiler(EVIDENCE_FIELDS)), _AS_SOURCE]
+SignalPredicate = Annotated[
+    Expression, PlainValidator(_compiler(SIGNAL_FEATURES, "bool")), _AS_SOURCE
+]
+SignalScore = Annotated[
+    Expression, PlainValidator(_compiler(SIGNAL_FEATURES, "number")), _AS_SOURCE
+]
+EvidencePredicate = Annotated[
+    Expression, PlainValidator(_compiler(EVIDENCE_FIELDS, "bool")), _AS_SOURCE
+]
 
 
 def _check_tz(value: str) -> str:
@@ -100,12 +107,32 @@ def _check_model_id(value: str) -> str:
     return value
 
 
-_CRON_FIELD = r"[\d*/,-]+"
+# minute, hour, day of month, month, day of week (0 and 7 = Sunday). Numeric only.
+_CRON_RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+_CRON_ITEM = re.compile(r"^(\*|(\d+)(?:-(\d+))?)(?:/(\d+))?$")
 
 
 def _check_cron(value: str) -> str:
-    if not re.fullmatch(rf"{_CRON_FIELD}( {_CRON_FIELD}){{4}}", value):
+    """Standard 5-field cron: `*`, `n`, `a-b`, each optionally `/step`, comma-separated.
+
+    Bounds and steps are checked so an impossible schedule fails at load, not when the
+    scheduler starts (WP 4.3: switch to the chosen scheduler's own parser).
+    """
+    fields = value.split(" ")
+    if len(fields) != len(_CRON_RANGES):
         raise ValueError(f"expected a 5-field cron expression, got {value!r}")
+    for field_, (low, high) in zip(fields, _CRON_RANGES, strict=True):
+        for item in field_.split(","):
+            match = _CRON_ITEM.match(item)
+            if match is None:
+                raise ValueError(f"invalid cron field {field_!r} in {value!r}")
+            _star, start, end, step = match.groups()
+            lo = int(start) if start else low
+            hi = int(end) if end else (int(start) if start else high)
+            if not low <= lo <= hi <= high or (step is not None and int(step) < 1):
+                raise ValueError(
+                    f"cron field {field_!r} out of range {low}-{high} (or bad step) in {value!r}"
+                )
     return value
 
 
@@ -139,10 +166,10 @@ class Timeframes(_Frozen):
 
 class SignalRule(_Frozen):
     id: Identifier
-    expr: SignalExpr
+    expr: SignalPredicate
     # Alpaca spot cannot short crypto; a `short` rule would never be executable.
     direction: Literal["long"]
-    score: SignalExpr
+    score: SignalScore
 
 
 class Scanner(_Frozen):
@@ -235,7 +262,7 @@ class Budget(_Frozen):
 class Learning(_Frozen):
     mode: Literal["propose_only", "auto_promote"]
     min_trades_for_evidence: Annotated[int, Field(ge=1)]
-    promote_if: EvidenceExpr
+    promote_if: EvidencePredicate
     max_active_learnings: Annotated[int, Field(ge=1)]
 
 
