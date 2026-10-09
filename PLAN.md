@@ -2,7 +2,7 @@
 
 Derived from `SPEC.md` (Draft v1, 2026-10-09). The spec stays the source of truth; this file covers sequencing, work packages, and spec gaps that must be closed before or during implementation.
 
-**Current repo state:** WP 0.1–0.3 done — uv project, package skeleton, typer CLI (`check-config`, `db upgrade` work, rest are stubs), ruff/mypy/pytest, GitHub Actions CI; config/profile loading with the G7 expression evaluator (`core/config.py`, `core/expr.py`); journal schema for all §7 tables + initial Alembic migration + repo for strategies/bars/events/control_state (`journal/`). Next: WP 0.4.
+**Current repo state:** WP 0.1–0.4 done — uv project, package skeleton, typer CLI (`check-config`, `db upgrade` work, rest are stubs), ruff/mypy/pytest, GitHub Actions CI; config/profile loading with the G7 expression evaluator (`core/config.py`, `core/expr.py`); journal schema for all §7 tables + initial Alembic migration + repo for strategies/bars/events/control_state (`journal/`); event bus with persist-then-deliver (`core/bus.py`) and JSON logging with `cycle_id` (`core/logging.py`). Next: WP 0.5.
 
 ---
 
@@ -51,7 +51,7 @@ Each WP ≈ one PR. DoD per phase is from SPEC §12 and is not repeated in full.
 | 0.1 | `pyproject.toml`, uv lock, ruff/mypy/pytest config, CI workflow, `.env.example`, `src/autotrader/` package skeleton, `cli.py` (typer) with stub commands. |
 | 0.2 | Config: `config.yaml` + `strategies/fast_momentum_v1.yaml` → pydantic models; profile hash; expression evaluator (G7) with validation at load. |
 | 0.3 | DB: SQLAlchemy models for all §7 tables, Alembic initial migration, repo layer. **Done:** money/qty columns are `Money` (exact Decimal; text on SQLite, NUMERIC(28,12) on Postgres), timestamps `UTCDateTime` (naive rejected); SQLite runs with `foreign_keys=ON` + WAL. Repo covers Phase 0 tables only; other tables get repo functions in their WP. Additions vs. §7: `risk_decisions.kind` (entry/exit, G1); `cycle_id` nullable on agent_calls/risk_decisions/orders/positions (reviewer calls, kill/flatten exits). |
-| 0.4 | Event bus (asyncio pub/sub + append-only `events` persistence), structlog setup. |
+| 0.4 | Event bus (asyncio pub/sub + append-only `events` persistence), structlog setup. **Done:** events persist before delivery (persist failure → `publish` raises, nothing delivered); one queue + worker per subscriber (slow handler can't block others, failing handler logged + skipped); class-based subscriptions; handler logs carry the event's `cycle_id`. Concrete event types are added by the WP that emits them. |
 | 0.5 | Kill-switch (file + `control_state`), checked by a `ControlGate` used by scanner and Risk Engine. |
 | 0.6 | `Broker` protocol, domain types (`BrokerOrder`, `Fill`, `Position`, `Account`, `FeeSchedule`), `SimBroker` (next-bar-open fill, slippage + fee model). |
 | 0.7 | `AlpacaBroker` paper: account/positions read; **verification spike** for G2 (order types for crypto), G10 (fee mechanics), current fee tiers, min notional / lot sizes. Results documented in `docs/alpaca-notes.md`. |
