@@ -14,7 +14,7 @@ import typer
 
 from autotrader.core.bus import EventBus
 from autotrader.core.config import AppConfig, ConfigError, Settings, load_config, load_profile
-from autotrader.core.kill import clear_kill, record_kill, write_kill_file
+from autotrader.core.kill import ClearResult, clear_kill, record_kill, write_kill_file
 from autotrader.core.logging import configure_logging
 from autotrader.journal import db
 
@@ -137,24 +137,27 @@ def _trigger_kill(cfg: AppConfig, reason: str | None) -> None:
 def _clear_kill(cfg: AppConfig) -> None:
     kill_file = cfg.control.kill_file
 
-    async def clear() -> None:
+    async def clear() -> ClearResult:
         engine = db.make_engine(cfg.database.url)
         sessions = db.make_sessionmaker(engine)
         bus = EventBus(sessions)
         try:
-            await clear_kill(kill_file, sessions, bus, source="cli")
+            return await clear_kill(kill_file, sessions, bus, source="cli")
         finally:
             await bus.close()
             await engine.dispose()
 
     try:
-        asyncio.run(clear())
+        result = asyncio.run(clear())
     except Exception as e:
         typer.echo(
             f"clear failed ({type(e).__name__}: {e}); kill is still active: {kill_file}",
             err=True,
         )
         raise typer.Exit(code=1) from None
+    if not result.file_removed:
+        typer.echo(f"a newer kill was triggered during the clear; still active: {kill_file}")
+        raise typer.Exit(code=1)
     typer.echo(f"kill cleared: removed {kill_file} and control_state.kill")
 
 
