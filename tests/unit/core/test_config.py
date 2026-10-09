@@ -53,6 +53,21 @@ def test_repo_config_loads_with_resolved_paths() -> None:
     assert config.strategy == REPO / "strategies" / "fast_momentum_v1.yaml"
     assert config.control.kill_file == REPO / "data" / "control" / "KILL"
     assert config.trading_day_tz == "UTC"
+    assert config.database.url == f"sqlite+aiosqlite:///{REPO / 'data' / 'autotrader.db'}"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql+asyncpg://u@db/autotrader",
+        "sqlite+aiosqlite:///:memory:",
+        "sqlite+aiosqlite:////abs/x.db",
+    ],
+)
+def test_non_relative_database_urls_untouched(tmp_path: Path, url: str) -> None:
+    path = _write_config(tmp_path, database={"url": url})
+
+    assert load_config(path, paper_settings()).database.url == url
 
 
 def test_risk_values_are_exact_decimals(profile_data: dict[str, Any]) -> None:
@@ -276,6 +291,27 @@ def test_stale_exit_must_follow_alert(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="stale_exit_s"):
         load_config(path, paper_settings())
+
+
+def test_malformed_database_url_is_config_error(tmp_path: Path) -> None:
+    # PR #4 review: SQLAlchemy's ArgumentError escaped as an uncaught exception.
+    path = _write_config(tmp_path, database={"url": "not-a-db-url"})
+
+    with pytest.raises(ConfigError, match=r"database\.url"):
+        load_config(path, paper_settings())
+
+
+def test_config_errors_never_echo_credentials(tmp_path: Path) -> None:
+    # Pydantic's default message echoes the input value of the failing field.
+    # Short on purpose: pydantic elides the middle of long inputs, which hid it by luck.
+    dsn = "postgresql://u:hunter2@h:x/d"
+    path = _write_config(tmp_path, database={"url": dsn})
+
+    with pytest.raises(ConfigError) as exc:
+        load_config(path, paper_settings())
+
+    assert "hunter2" not in str(exc.value)
+    assert "database.url" in str(exc.value)
 
 
 def test_invalid_trading_day_tz(tmp_path: Path) -> None:
