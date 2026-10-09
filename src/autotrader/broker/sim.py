@@ -2,7 +2,9 @@
 
 Fill model, driven by `process_bar()`:
 - Orders fill on the first bar processed after submission, never on the bar the
-  submitter saw ("next bar open").
+  submitter saw ("next bar open"). Per symbol, a bar is only processed if it is newer
+  than the last one; duplicates and older bars (replays, backfill overlap) are ignored,
+  so they can neither fill orders nor move the marked price. One timeframe per sim.
 - Market: bar open +/- `slippage_bps`, taker fee.
 - Limit: fills when the bar trades through the limit, at the better of open and limit,
   maker fee, no slippage.
@@ -21,6 +23,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import cast
 
+import structlog
+
 from autotrader.broker.base import (
     Account,
     AssetRules,
@@ -38,6 +42,7 @@ from autotrader.broker.base import (
 from autotrader.core.types import Bar
 
 _BPS = Decimal(10_000)
+log = structlog.get_logger(__name__)
 
 
 def _dec(value: float) -> Decimal:
@@ -70,12 +75,15 @@ class SimBroker:
         slippage_bps: Decimal,
         asset_rules: Mapping[str, AssetRules],
         mode: Mode = "paper",
+        timeframe: str = "1m",
     ) -> None:
         self.cash = cash
         self.fees = fees
         self.slippage_bps = slippage_bps
         self.asset_rules_by_symbol = dict(asset_rules)
         self.broker_mode = mode
+        self.timeframe = timeframe
+        self._last_bar_ts: dict[str, datetime] = {}
         self._holdings: dict[str, _Holding] = {}
         self._orders: dict[str, _Order] = {}
         self._last_price: dict[str, Decimal] = {}
@@ -129,12 +137,22 @@ class SimBroker:
         if symbol not in self._holdings:
             raise OrderRejected(f"no position in {symbol}")
         qty = self._holdings[symbol].qty - self._pending_qty(symbol, "sell")
+        if qty <= 0:
+            raise OrderRejected(f"position in {symbol} is already fully reserved by pending sells")
         return await self.submit_order(
             BrokerOrder(symbol=symbol, side="sell", qty=qty, type="market")
         )
 
     async def close_all(self) -> list[OrderAck]:
-        return [await self.close_position(s) for s in sorted(self._holdings)]
+        """Close every position; a rejected symbol is logged and skipped so it cannot
+        stop the others from being flattened. Returns the acks of submitted closes."""
+        acks: list[OrderAck] = []
+        for symbol in sorted(self._holdings):
+            try:
+                acks.append(await self.close_position(symbol))
+            except OrderRejected as e:
+                log.warning("sim.close_skipped", symbol=symbol, reason=str(e))
+        return acks
 
     async def stream_fills(self) -> AsyncIterator[Fill]:
         while True:
@@ -154,13 +172,24 @@ class SimBroker:
 
     # --- simulation ------------------------------------------------------------------
 
-    def process_bar(self, bar: Bar) -> None:
-        """Fill open orders for `bar.symbol` against this bar, then record its close."""
+    def process_bar(self, bar: Bar) -> bool:
+        """Fill open orders for `bar.symbol` against this bar, then record its close.
+
+        Returns False (and does nothing) for a bar that is not newer than the last one
+        processed for its symbol.
+        """
+        if bar.timeframe != self.timeframe:
+            raise ValueError(f"sim runs on {self.timeframe} bars, got timeframe {bar.timeframe}")
+        last = self._last_bar_ts.get(bar.symbol)
+        if last is not None and bar.ts <= last:
+            return False
+        self._last_bar_ts[bar.symbol] = bar.ts
         for o in [o for o in self._orders.values() if o.status == "new"]:
             if o.order.symbol == bar.symbol:
                 self._try_fill(o, bar)
         self._last_price[bar.symbol] = _dec(bar.close)
         self._now = bar.ts
+        return True
 
     def _try_fill(self, o: _Order, bar: Bar) -> None:
         order, open_ = o.order, _dec(bar.open)

@@ -8,9 +8,9 @@ Manager.
 
 from collections.abc import AsyncIterator
 from decimal import Decimal
-from typing import Literal, Protocol, Self
+from typing import Annotated, Literal, Protocol, Self
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 Side = Literal["buy", "sell"]
 OrderType = Literal["market", "limit"]
@@ -22,12 +22,25 @@ class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
+def _exact(value: object) -> object:
+    """Money/qty boundary: a float has already lost precision (0.1 + 0.2), so refuse it.
+
+    Decimal, int and numeric strings (JSON) are exact and accepted.
+    """
+    if isinstance(value, float | bool):
+        raise ValueError(f"expected an exact Decimal, int or numeric string, got {value!r}")
+    return value
+
+
+Dec = Annotated[Decimal, BeforeValidator(_exact)]
+
+
 class BrokerOrder(_Frozen):
     symbol: str
     side: Side
-    qty: Decimal = Field(gt=0)
+    qty: Dec = Field(gt=0)
     type: OrderType
-    limit_price: Decimal | None = Field(default=None, gt=0)
+    limit_price: Dec | None = Field(default=None, gt=0)
     client_order_id: str | None = None
 
     @model_validator(mode="after")
@@ -48,8 +61,8 @@ class OrderAck(_Frozen):
 class OrderStatus(_Frozen):
     order_id: str
     status: OrderState
-    filled_qty: Decimal
-    avg_fill_price: Decimal | None
+    filled_qty: Dec
+    avg_fill_price: Dec | None
     reason: str | None = None  # set for rejections
 
 
@@ -57,34 +70,34 @@ class Fill(_Frozen):
     order_id: str
     symbol: str
     side: Side
-    qty: Decimal
-    price: Decimal
-    fee: Decimal  # in quote currency (USD); G10: Alpaca's real mechanics verified in 0.7
+    qty: Dec
+    price: Dec
+    fee: Dec  # in quote currency (USD); G10: Alpaca's real mechanics verified in 0.7
     ts: AwareDatetime
 
 
 class Position(_Frozen):
     symbol: str
-    qty: Decimal
-    avg_entry_price: Decimal
+    qty: Dec
+    avg_entry_price: Dec
 
 
 class Account(_Frozen):
-    equity: Decimal  # cash + positions marked to last price
-    cash: Decimal
+    equity: Dec  # cash + positions marked to last price
+    cash: Dec
 
 
 class FeeSchedule(_Frozen):
-    maker_bps: Decimal = Field(ge=0)
-    taker_bps: Decimal = Field(ge=0)
+    maker_bps: Dec = Field(ge=0)
+    taker_bps: Dec = Field(ge=0)
 
 
 class AssetRules(_Frozen):
     """Per-symbol order constraints used by sizing (G4)."""
 
-    min_qty: Decimal = Field(gt=0)
-    qty_increment: Decimal = Field(gt=0)
-    min_notional: Decimal = Field(ge=0)
+    min_qty: Dec = Field(gt=0)
+    qty_increment: Dec = Field(gt=0)
+    min_notional: Dec = Field(ge=0)
 
 
 class BrokerError(Exception):
