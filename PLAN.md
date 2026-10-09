@@ -139,7 +139,7 @@ Not code-first. Checklist from SPEC §12 plus: VPS + Compose + Postgres backups,
 | D5 | G6 | `trading_day_tz: UTC`, boundary 00:00 UTC (= 01:00/02:00 Berlin). Matches Alpaca bar timestamps, no DST jumps. |
 | D6 | G11 | `feed.stale_alert_s: 60`; `feed.stale_exit_s: 300` with `feed.stale_exit_enabled: false` in paper, `true` in live. |
 | D7 | Laptop mitigations | On core startup: reconcile first, then enforce overdue stops/time exits immediately. Optional `shutdown.flatten: false` (paper) for graceful stops. Run under `caffeinate -i` while plugged in. |
-| D8 | Tooling | uv + typer — pending owner confirmation. |
+| D8 | Tooling | uv + typer (confirmed). |
 | D9 | Dashboard auth | Bearer token + localhost/Tailscale-only binding (both, per SPEC §9.2/§14). |
 
 **Cloud dev sessions:** outbound access to `*.alpaca.markets` is currently blocked by the environment network policy. Unit/integration tests use `SimBroker` and recorded fixtures; Alpaca smoke tests run on the laptop (or after allowlisting the domain and adding paper keys as environment variables).
