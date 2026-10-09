@@ -5,6 +5,9 @@ description = "Automated, agent-based crypto trading PoC (Alpaca paper first)."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "pydantic>=2.14.0",
+    "pydantic-settings>=2.15.0",
+    "pyyaml>=6.0.3",
     "typer>=0.27.3",
 ]
 
@@ -20,6 +23,7 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
     "ruff>=0.16.10",
+    "types-pyyaml>=6.0.12.20260906",
 ]
 
 [build-system]
@@ -49,6 +53,7 @@ python_version = "3.12"
 # module with an override if api/ or journal/ ever make it impractical.
 strict = true
 files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

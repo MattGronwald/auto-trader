@@ -1,0 +1,23 @@
+# Infrastructure config (SPEC §4.11). Secrets never go here — they come from env / `.env`.
+# Relative paths resolve against this file's directory.
+
+mode: paper                     # paper | live. `live` additionally requires env ALLOW_LIVE=1.
+strategy: strategies/fast_momentum_v1.yaml
+trading_day_tz: UTC             # D5: daily limits/budgets reset at 00:00 in this zone
+
+database:
+  url: sqlite+aiosqlite:///data/autotrader.db
+
+control:
+  kill_file: data/control/KILL  # G8: shared volume path in Docker
+
+kill:
+  flatten: null                 # null = mode default (paper: false, live: true)
+
+feed:                           # D6
+  stale_alert_s: 60
+  stale_exit_s: 300
+  stale_exit_enabled: null      # null = mode default (paper: false, live: true)
+
+shutdown:
+  flatten: false                # D7: flatten on graceful stop
