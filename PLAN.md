@@ -2,7 +2,7 @@
 
 Derived from `SPEC.md` (Draft v1, 2026-10-09). The spec stays the source of truth; this file covers sequencing, work packages, and spec gaps that must be closed before or during implementation.
 
-**Current repo state:** `README.md`, `LICENSE` (GPLv3), `.gitignore` (Python template), `SPEC.md`. No code.
+**Current repo state:** WP 0.1 done — uv project, package skeleton (`src/autotrader/` with empty subpackages), stub typer CLI, ruff/mypy/pytest config, GitHub Actions CI. Next: WP 0.2.
 
 ---
 
@@ -65,7 +65,7 @@ Each WP ≈ one PR. DoD per phase is from SPEC §12 and is not repeated in full.
 |---|---|
 | 1.1 | Indicators (EMA, RSI, ATR, VWAP, vol z, Bollinger, Donchian) — vectorised over pandas/numpy, tested against reference values. |
 | 1.2 | Signal Scanner: rule evaluation, pre-filters, rate limits, `CandidateSignal`. |
-| 1.3 | Risk Engine: `check()` with all 11 checks + `exit()` (G1, G3, G4). 100 % branch coverage, hypothesis property tests for sizing invariants. |
+| 1.3 | Risk Engine: `check()` with all 11 checks + `exit()` (G1, G3, G4). 100 % branch coverage, hypothesis property tests for sizing invariants. Add the CI gate here (`coverage report --include='src/autotrader/risk/*' --fail-under=100`); it cannot run in 0.1 because an empty package yields no coverage data. |
 | 1.4 | Cycle Runner FSM with persisted transitions, per-state timeouts; stub Decision Maker (rule-based). |
 | 1.5 | Position Manager: client-side stop, time exit, trailing, fill handling, reconciliation every 60 s → pause on mismatch. |
 | 1.6 | Alpaca order submission + fill stream (`stream_fills`), order status sync. |
