@@ -96,3 +96,20 @@ def test_db_upgrade_creates_schema(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert (tmp_path / "data" / "autotrader.db").is_file()  # resolved against config dir
     assert "at head" in result.output
+
+
+def test_log_level_option_configures_json_logging(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr("autotrader.cli.configure_logging", lambda level: calls.append(level))
+
+    result = runner.invoke(app, ["--log-level", "debug", "kill"])
+
+    assert result.exit_code == 2  # still a stub
+    assert calls == ["debug"]
+
+
+def test_invalid_log_level_rejected() -> None:
+    result = runner.invoke(app, ["--log-level", "loud", "kill"])
+
+    assert result.exit_code == 2
+    assert "loud" in result.output
