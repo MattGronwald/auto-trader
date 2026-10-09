@@ -4,12 +4,14 @@ Commands that are stubs until their work package lands exit with code 2, so an o
 never mistakes an unimplemented `kill` or `flatten` for a successful one.
 """
 
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
 
 from autotrader.core.config import AppConfig, ConfigError, Settings, load_config, load_profile
+from autotrader.core.logging import configure_logging
 from autotrader.journal import db
 
 app = typer.Typer(help="Automated, agent-based crypto trading PoC.", no_args_is_help=True)
@@ -19,6 +21,22 @@ db_app = typer.Typer(help="Database migrations.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 
 ConfigOption = Annotated[Path, typer.Option("--config", "-c", help="Path to config.yaml.")]
+
+
+class LogLevel(StrEnum):
+    debug = "debug"
+    info = "info"
+    warning = "warning"
+    error = "error"
+
+
+@app.callback()
+def main(
+    log_level: Annotated[LogLevel, typer.Option(help="Minimum level of JSON log lines.")] = (
+        LogLevel.info
+    ),
+) -> None:
+    configure_logging(log_level.value)
 
 
 def _not_implemented(command: str, wp: str) -> NoReturn:
