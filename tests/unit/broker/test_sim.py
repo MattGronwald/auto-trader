@@ -403,3 +403,89 @@ async def test_min_qty_above_increment_and_unknown_asset_rules() -> None:
         await sim.submit_order(market("buy", "0.05", symbol="SOL/USD"))
     with pytest.raises(OrderRejected, match="unknown symbol"):
         await sim.asset_rules("DOGE/USD")
+
+
+# --- regressions from the PR #8 review -------------------------------------------
+
+
+@pytest.mark.parametrize("replay_minute", [0, -1])  # same bar again, or an older one
+async def test_replayed_or_stale_bar_never_fills_new_orders(replay_minute: int) -> None:
+    # Look-ahead: re-processing the bar the submitter already saw filled at its open.
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    ack = await sim.submit_order(market("buy", "1"))
+
+    processed = sim.process_bar(bar(replay_minute, 80.0, c=80.0))
+
+    assert processed is False
+    assert (await sim.get_order(ack.order_id)).status == "new"
+    assert (await sim.get_account()).equity == Decimal("1000")  # stale close not used
+    assert sim.process_bar(bar(1, 101.0)) is True
+    assert (await sim.get_order(ack.order_id)).avg_fill_price == Decimal("101")
+
+
+async def test_bar_progression_is_tracked_per_symbol() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(5, 100.0))
+    # An ETH bar at an earlier minute is new for ETH and must be processed.
+    assert sim.process_bar(bar(1, 10.0, symbol="ETH/USD")) is True
+
+
+def test_other_timeframes_are_refused() -> None:
+    sim = make_sim()
+    five_min = Bar(symbol=BTC, timeframe="5m", ts=T0, open=1, high=1, low=1, close=1, volume=1)
+
+    with pytest.raises(ValueError, match="timeframe"):
+        sim.process_bar(five_min)
+
+
+@pytest.mark.parametrize("value", [0.1 + 0.2, 1.0, True])
+def test_broker_models_reject_floats_and_bools(value: object) -> None:
+    with pytest.raises(ValueError, match="Decimal"):
+        BrokerOrder(symbol=BTC, side="buy", qty=value, type="market")
+    with pytest.raises(ValueError, match="Decimal"):
+        FeeSchedule(maker_bps=value, taker_bps=Decimal(1))
+
+
+@pytest.mark.parametrize("value", [Decimal("0.3"), "0.3", 3])
+def test_broker_models_accept_exact_inputs(value: object) -> None:
+    order = BrokerOrder(symbol=BTC, side="buy", qty=value, type="market")
+
+    assert order.qty == Decimal(str(value))
+
+
+async def test_close_of_fully_reserved_position_is_a_typed_rejection() -> None:
+    sim = make_sim(cash="10000")
+    sim.process_bar(bar(0, 100.0))
+    await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(1, 100.0))
+    await sim.submit_order(limit("sell", "1", "200"))
+
+    with pytest.raises(OrderRejected, match="fully reserved"):
+        await sim.close_position(BTC)
+
+
+async def test_repeated_close_is_a_typed_rejection() -> None:
+    sim = make_sim(cash="10000")
+    sim.process_bar(bar(0, 100.0))
+    await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(1, 100.0))
+    await sim.close_position(BTC)
+
+    with pytest.raises(OrderRejected, match="fully reserved"):
+        await sim.close_position(BTC)
+
+
+async def test_close_all_continues_past_a_rejected_symbol() -> None:
+    sim = make_sim(cash="10000")
+    sim.process_bar(bar(0, 100.0))
+    sim.process_bar(bar(0, 10.0, symbol="ETH/USD"))
+    await sim.submit_order(market("buy", "1"))
+    await sim.submit_order(market("buy", "2", symbol="ETH/USD"))
+    sim.process_bar(bar(1, 100.0))
+    sim.process_bar(bar(1, 10.0, symbol="ETH/USD"))
+    await sim.submit_order(limit("sell", "1", "500"))  # BTC fully reserved
+
+    acks = await sim.close_all()
+
+    assert [a.symbol for a in acks] == ["ETH/USD"]
