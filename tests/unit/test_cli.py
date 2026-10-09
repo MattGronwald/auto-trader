@@ -160,3 +160,59 @@ def test_kill_with_invalid_config_points_to_touch_fallback(tmp_path: Path) -> No
 
     assert result.exit_code == 1
     assert "touch" in result.output
+
+
+def test_kill_survives_engine_init_failure(tmp_path: Path) -> None:
+    # P1: engine creation ran before the file write, so a broken DB path stopped the kill.
+    config = _tmp_config(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "blocker").write_text("a file where a directory should be")
+    text = config.read_text().replace(
+        "url: sqlite+aiosqlite:///data/autotrader.db",
+        "url: sqlite+aiosqlite:///data/blocker/autotrader.db",
+    )
+    config.write_text(text)
+
+    result = runner.invoke(app, ["kill", "-c", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "data" / "control" / "KILL").exists()
+    assert "database" in result.output.lower()
+
+
+def test_kill_survives_missing_db_driver(tmp_path: Path) -> None:
+    config = _tmp_config(tmp_path)
+    text = config.read_text().replace(
+        "url: sqlite+aiosqlite:///data/autotrader.db",
+        "url: postgresql+nosuchdriver://u@localhost/x",
+    )
+    config.write_text(text)
+
+    result = runner.invoke(app, ["kill", "-c", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "data" / "control" / "KILL").exists()
+
+
+def test_failed_clear_exits_nonzero_and_keeps_kill(tmp_path: Path) -> None:
+    config = _tmp_config(tmp_path)
+    kill_file = tmp_path / "data" / "control" / "KILL"
+    kill_file.parent.mkdir(parents=True)
+    kill_file.touch()  # file-only kill; DB never migrated -> clear's DB write fails
+
+    result = runner.invoke(app, ["kill", "--clear", "-c", str(config)])
+
+    assert result.exit_code == 1
+    assert kill_file.exists()
+    assert "still active" in result.output
+
+
+def test_kill_fails_loudly_if_the_file_cannot_be_written(tmp_path: Path) -> None:
+    config = _tmp_config(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "control").write_text("not a directory")
+
+    result = runner.invoke(app, ["kill", "-c", str(config)])
+
+    assert result.exit_code == 1
+    assert "NOT" in result.output
