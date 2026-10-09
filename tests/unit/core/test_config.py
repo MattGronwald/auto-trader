@@ -53,6 +53,21 @@ def test_repo_config_loads_with_resolved_paths() -> None:
     assert config.strategy == REPO / "strategies" / "fast_momentum_v1.yaml"
     assert config.control.kill_file == REPO / "data" / "control" / "KILL"
     assert config.trading_day_tz == "UTC"
+    assert config.database.url == f"sqlite+aiosqlite:///{REPO / 'data' / 'autotrader.db'}"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql+asyncpg://u@db/autotrader",
+        "sqlite+aiosqlite:///:memory:",
+        "sqlite+aiosqlite:////abs/x.db",
+    ],
+)
+def test_non_relative_database_urls_untouched(tmp_path: Path, url: str) -> None:
+    path = _write_config(tmp_path, database={"url": url})
+
+    assert load_config(path, paper_settings()).database.url == url
 
 
 def test_risk_values_are_exact_decimals(profile_data: dict[str, Any]) -> None:

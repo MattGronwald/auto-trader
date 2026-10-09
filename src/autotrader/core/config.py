@@ -33,6 +33,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 from autotrader.core.expr import Expression, ExpressionError
 from autotrader.core.features import EVIDENCE_FIELDS, SIGNAL_FEATURES
@@ -283,8 +284,19 @@ def _resolve_path(value: Path, info: ValidationInfo) -> Path:
 ConfigPath = Annotated[Path, AfterValidator(_resolve_path)]
 
 
+def _resolve_sqlite_url(value: str, info: ValidationInfo) -> str:
+    """Relative SQLite paths resolve against the config dir, like every other path."""
+    url = make_url(value)
+    db = url.database
+    if url.get_backend_name() != "sqlite" or not db or db == ":memory:" or Path(db).is_absolute():
+        return value
+    return url.set(database=str(_resolve_path(Path(db), info))).render_as_string(
+        hide_password=False
+    )
+
+
 class Database(_Frozen):
-    url: str
+    url: Annotated[str, AfterValidator(_resolve_sqlite_url)]
 
 
 class Control(_Frozen):

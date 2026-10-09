@@ -65,3 +65,19 @@ def test_check_config_fails_on_invalid_file(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "config.yaml" in result.output
+
+
+def test_db_upgrade_creates_schema(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    text = (
+        (REPO / "config.yaml")
+        .read_text()
+        .replace("strategy: strategies/", f"strategy: {REPO}/strategies/")
+    )
+    config.write_text(text)
+
+    result = runner.invoke(app, ["db", "upgrade", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "data" / "autotrader.db").is_file()  # resolved against config dir
+    assert "at head" in result.output
