@@ -33,7 +33,6 @@ def test_run_help_lists_core_and_api() -> None:
         ["review-now"],
         ["backtest-signals"],
         ["flatten"],
-        ["kill"],
     ],
 )
 def test_stub_commands_fail_loudly(args: list[str]) -> None:
@@ -102,14 +101,62 @@ def test_log_level_option_configures_json_logging(monkeypatch: pytest.MonkeyPatc
     calls: list[str] = []
     monkeypatch.setattr("autotrader.cli.configure_logging", lambda level: calls.append(level))
 
-    result = runner.invoke(app, ["--log-level", "debug", "kill"])
+    result = runner.invoke(app, ["--log-level", "debug", "flatten"])
 
     assert result.exit_code == 2  # still a stub
     assert calls == ["debug"]
 
 
 def test_invalid_log_level_rejected() -> None:
-    result = runner.invoke(app, ["--log-level", "loud", "kill"])
+    result = runner.invoke(app, ["--log-level", "loud", "flatten"])
 
     assert result.exit_code == 2
     assert "loud" in result.output
+
+
+def _tmp_config(tmp_path: Path) -> Path:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        (REPO / "config.yaml")
+        .read_text()
+        .replace("strategy: strategies/", f"strategy: {REPO}/strategies/")
+    )
+    return config
+
+
+def test_kill_and_clear(tmp_path: Path) -> None:
+    config = _tmp_config(tmp_path)
+    assert runner.invoke(app, ["db", "upgrade", "-c", str(config)]).exit_code == 0
+    kill_file = tmp_path / "data" / "control" / "KILL"
+
+    killed = runner.invoke(app, ["kill", "-c", str(config), "--reason", "manual test"])
+
+    assert killed.exit_code == 0, killed.output
+    assert kill_file.exists()
+    assert "KILL" in killed.output
+
+    cleared = runner.invoke(app, ["kill", "--clear", "-c", str(config)])
+
+    assert cleared.exit_code == 0, cleared.output
+    assert not kill_file.exists()
+
+
+def test_kill_works_without_database(tmp_path: Path) -> None:
+    # No `db upgrade`: the DB write fails, but the kill file still stops trading.
+    config = _tmp_config(tmp_path)
+
+    result = runner.invoke(app, ["kill", "-c", str(config)])
+
+    assert result.exit_code == 0
+    assert (tmp_path / "data" / "control" / "KILL").exists()
+    assert "database" in result.output.lower()
+
+
+def test_kill_with_invalid_config_points_to_touch_fallback(tmp_path: Path) -> None:
+    bad = tmp_path / "config.yaml"
+    bad.write_text("mode: sideways\n")
+
+    result = runner.invoke(app, ["kill", "-c", str(bad)])
+
+    assert result.exit_code == 1
+    assert "touch" in result.output
