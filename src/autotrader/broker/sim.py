@@ -5,6 +5,9 @@ Fill model, driven by `process_bar()`:
   submitter saw ("next bar open"). Per symbol, a bar is only processed if it is newer
   than the last one; duplicates and older bars (replays, backfill overlap) are ignored,
   so they can neither fill orders nor move the marked price. One timeframe per sim.
+- Across symbols, an order is stamped with the latest bar time seen for any symbol and
+  only fills on a bar strictly later than that, so a lagging symbol's older bar can
+  never fill an order placed after later information was observed.
 - Market: bar open +/- `slippage_bps`, taker fee.
 - Limit: fills when the bar trades through the limit, at the better of open and limit,
   maker fee, no slippage.
@@ -185,10 +188,10 @@ class SimBroker:
             return False
         self._last_bar_ts[bar.symbol] = bar.ts
         for o in [o for o in self._orders.values() if o.status == "new"]:
-            if o.order.symbol == bar.symbol:
+            if o.order.symbol == bar.symbol and bar.ts > o.submitted_at:
                 self._try_fill(o, bar)
         self._last_price[bar.symbol] = _dec(bar.close)
-        self._now = bar.ts
+        self._now = bar.ts if self._now is None else max(self._now, bar.ts)
         return True
 
     def _try_fill(self, o: _Order, bar: Bar) -> None:
