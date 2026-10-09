@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -7,7 +8,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from autotrader.core.bus import EventBus
+from autotrader.core.bus import BusClosedError, DomainEvent, EventBus
 from autotrader.core.kill import (
     ControlGate,
     KillCleared,
@@ -253,3 +254,74 @@ def test_write_kill_file_needs_no_database(kill_file: Path) -> None:
 
     assert json.loads(kill_file.read_text()) == record
     assert record == {"source": "cli", "reason": "r", "ts": NOW.isoformat()}
+
+
+# --- regressions from the PR #7 re-review ----------------------------------------
+
+
+async def test_older_clear_never_removes_a_newer_kill(
+    gate: ControlGate,
+    kill_file: Path,
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # P1: a clear paused in its DB/audit step; meanwhile a new kill latched its file (its
+    # DB write failed, the documented degraded mode). The old clear then unlinked it.
+    kill_file.parent.mkdir(parents=True)
+    kill_file.touch()
+    bus = EventBus(sessions)
+    entered, gate_open = asyncio.Event(), asyncio.Event()
+    real_publish = bus.publish
+
+    async def paused_publish(event: DomainEvent) -> None:
+        await real_publish(event)
+        entered.set()
+        await gate_open.wait()
+
+    monkeypatch.setattr(bus, "publish", paused_publish)
+    clearing = asyncio.create_task(clear_kill(kill_file, sessions, bus, source="cli", now=NOW))
+    await entered.wait()
+
+    write_kill_file(kill_file, source="cli", reason="new emergency", now=NOW)
+    gate_open.set()
+    result = await clearing
+    await bus.close()
+
+    assert result.file_removed is False
+    assert json.loads(kill_file.read_text())["reason"] == "new emergency"
+    assert (await gate.status(NOW)).killed
+
+
+async def test_failed_audit_keeps_a_db_only_kill(
+    gate: ControlGate, kill_file: Path, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    # P2: DB-only kill, KillCleared fails to persist -> the DB flag was already gone and
+    # there was no file, so the clear raised but trading resumed.
+    await _set(sessions, "kill", {"source": "api", "reason": "x", "ts": NOW.isoformat()})
+    bus = EventBus(sessions)
+    await bus.close()  # publish now raises BusClosedError
+
+    with pytest.raises(BusClosedError):
+        await clear_kill(kill_file, sessions, bus, source="cli", now=NOW)
+
+    assert (await gate.status(NOW)).killed
+
+
+async def test_successful_clear_of_db_only_kill_leaves_no_file(
+    gate: ControlGate, kill_file: Path, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    await _set(sessions, "kill", {"source": "api", "reason": "x", "ts": NOW.isoformat()})
+
+    result = await clear_kill(kill_file, sessions, None, source="cli", now=NOW)
+
+    assert result.file_removed is True
+    assert not kill_file.exists()
+    assert (await gate.status(NOW)).entries_allowed
+
+
+def test_kill_file_writes_leave_no_temp_files(kill_file: Path) -> None:
+    for i in range(3):
+        write_kill_file(kill_file, source="cli", reason=str(i), now=NOW)
+
+    names = sorted(p.name for p in kill_file.parent.iterdir())
+    assert names == ["KILL", "KILL.lock"]
