@@ -25,4 +25,14 @@ Automated, agent-based crypto trading PoC (Alpaca paper first, live later with ~
 - Verify broker/LLM facts (order types, fees, model IDs, prices) against current docs — don't hard-code from memory.
 
 ## Commands
-To be filled in by WP 0.1 (expected: `uv sync`, `uv run pytest`, `uv run ruff check`, `uv run mypy src`, `uv run autotrader --help`).
+```
+uv sync                      # create .venv, install deps from uv.lock
+uv run pytest                # unit + integration; `smoke` excluded by default
+uv run pytest -m smoke       # opt-in real-API smoke tests (needs keys in .env)
+uv run ruff check            # lint (`--fix` to autofix)
+uv run ruff format           # format
+uv run mypy                  # strict, src + tests (paths from pyproject)
+uv run autotrader --help     # CLI; unimplemented commands exit 2
+```
+CI (`.github/workflows/ci.yml`) runs the same checks plus `pip-audit` on the exported lock file.
+Add dependencies with `uv add <pkg>` / `uv add --dev <pkg>` — only in the WP that needs them.
