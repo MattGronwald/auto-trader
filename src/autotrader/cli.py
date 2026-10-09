@@ -1,16 +1,21 @@
 """`autotrader` command line (SPEC §11).
 
-All commands are stubs until their work package lands. Stubs exit with code 2 so an
-operator never mistakes an unimplemented `kill` or `flatten` for a successful one.
+Commands that are stubs until their work package lands exit with code 2, so an operator
+never mistakes an unimplemented `kill` or `flatten` for a successful one.
 """
 
-from typing import NoReturn
+from pathlib import Path
+from typing import Annotated, NoReturn
 
 import typer
+
+from autotrader.core.config import ConfigError, Settings, load_config, load_profile
 
 app = typer.Typer(help="Automated, agent-based crypto trading PoC.", no_args_is_help=True)
 run_app = typer.Typer(help="Run a long-lived process.", no_args_is_help=True)
 app.add_typer(run_app, name="run")
+
+ConfigOption = Annotated[Path, typer.Option("--config", "-c", help="Path to config.yaml.")]
 
 
 def _not_implemented(command: str, wp: str) -> NoReturn:
@@ -52,3 +57,17 @@ def flatten() -> None:
 def kill() -> None:
     """Trigger the kill-switch."""
     _not_implemented("kill", "0.5")
+
+
+@app.command("check-config")
+def check_config(config: ConfigOption = Path("config.yaml")) -> None:
+    """Validate config.yaml, env and the strategy profile; print the profile hash."""
+    try:
+        cfg = load_config(config, Settings())
+        profile = load_profile(cfg.strategy)
+    except ConfigError as e:
+        typer.echo(f"invalid config: {e}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"mode: {cfg.mode}")
+    typer.echo(f"profile: {profile.name} ({len(profile.signal_rules)} signal rules)")
+    typer.echo(f"hash: {profile.hash}")

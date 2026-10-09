@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Runtime data: SQLite DB, kill file (config.yaml paths)
+/data/
