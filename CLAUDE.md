@@ -17,7 +17,7 @@ Automated, agent-based crypto trading PoC (Alpaca paper first, live later with ~
 
 ## Stack & conventions
 - Python 3.12, uv (`uv sync`, `uv run ...`), typer CLI (`autotrader ...`), src layout `src/autotrader/`.
-- pydantic v2 domain types; `Decimal` for money/qty outside indicator math.
+- pydantic v2 domain types; `Decimal` for money/qty outside indicator math. DB columns: `Money` / `UTCDateTime` from `journal/types.py` (floats and naive datetimes are rejected on write).
 - SQLAlchemy 2 async + Alembic (`render_as_batch=True`); SQLite dev, Postgres prod.
 - structlog JSON logs with `cycle_id` bound via contextvars.
 - ruff + mypy (strict on `core/`, `risk/`, `broker/`) + pytest/hypothesis. `risk/` requires 100 % branch coverage.
@@ -34,6 +34,8 @@ uv run ruff format           # format
 uv run mypy                  # strict, src + tests (paths from pyproject)
 uv run autotrader --help     # CLI; unimplemented commands exit 2
 uv run autotrader check-config  # validate config.yaml + env + profile, print profile hash
+uv run autotrader db upgrade    # apply migrations to config.yaml's database.url
+uv run alembic revision --autogenerate -m "..."  # new migration after editing journal/models.py
 ```
 CI (`.github/workflows/ci.yml`) runs the same checks plus `pip-audit` on the exported lock file.
 Add dependencies with `uv add <pkg>` / `uv add --dev <pkg>` — only in the WP that needs them.

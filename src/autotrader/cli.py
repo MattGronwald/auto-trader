@@ -9,11 +9,14 @@ from typing import Annotated, NoReturn
 
 import typer
 
-from autotrader.core.config import ConfigError, Settings, load_config, load_profile
+from autotrader.core.config import AppConfig, ConfigError, Settings, load_config, load_profile
+from autotrader.journal import db
 
 app = typer.Typer(help="Automated, agent-based crypto trading PoC.", no_args_is_help=True)
 run_app = typer.Typer(help="Run a long-lived process.", no_args_is_help=True)
 app.add_typer(run_app, name="run")
+db_app = typer.Typer(help="Database migrations.", no_args_is_help=True)
+app.add_typer(db_app, name="db")
 
 ConfigOption = Annotated[Path, typer.Option("--config", "-c", help="Path to config.yaml.")]
 
@@ -59,11 +62,19 @@ def kill() -> None:
     _not_implemented("kill", "0.5")
 
 
+def _load_config(path: Path) -> AppConfig:
+    try:
+        return load_config(path, Settings())
+    except ConfigError as e:
+        typer.echo(f"invalid config: {e}", err=True)
+        raise typer.Exit(code=1) from None
+
+
 @app.command("check-config")
 def check_config(config: ConfigOption = Path("config.yaml")) -> None:
     """Validate config.yaml, env and the strategy profile; print the profile hash."""
+    cfg = _load_config(config)
     try:
-        cfg = load_config(config, Settings())
         profile = load_profile(cfg.strategy)
     except ConfigError as e:
         typer.echo(f"invalid config: {e}", err=True)
@@ -71,3 +82,11 @@ def check_config(config: ConfigOption = Path("config.yaml")) -> None:
     typer.echo(f"mode: {cfg.mode}")
     typer.echo(f"profile: {profile.name} ({len(profile.signal_rules)} signal rules)")
     typer.echo(f"hash: {profile.hash}")
+
+
+@db_app.command("upgrade")
+def db_upgrade(config: ConfigOption = Path("config.yaml")) -> None:
+    """Apply all pending migrations to the configured database."""
+    url = _load_config(config).database.url
+    db.upgrade(url)
+    typer.echo(f"database at head ({db.current_revision(url)})")
