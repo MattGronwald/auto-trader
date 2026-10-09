@@ -2,7 +2,7 @@
 
 Derived from `SPEC.md` (Draft v1, 2026-10-09). The spec stays the source of truth; this file covers sequencing, work packages, and spec gaps that must be closed before or during implementation.
 
-**Current repo state:** WP 0.1 done — uv project, package skeleton (`src/autotrader/` with empty subpackages), stub typer CLI, ruff/mypy/pytest config, GitHub Actions CI. Next: WP 0.2.
+**Current repo state:** WP 0.1–0.2 done — uv project, package skeleton, typer CLI (`check-config` works, rest are stubs), ruff/mypy/pytest, GitHub Actions CI; config/profile loading with the G7 expression evaluator (`core/config.py`, `core/expr.py`). Next: WP 0.3.
 
 ---
 
@@ -18,9 +18,9 @@ Ordered by how badly they bite if ignored.
 | G4 | **Sizing formula is ambiguous** (`size_fraction × that` inside a `min`). | §4.5 #7 | `qty = size_fraction × min(risk_qty, cap_qty, broker_max_qty)` → round down to lot size → reject if `< broker_min`. Property tests encode exactly this. |
 | G5 | **Timeframe mismatch.** Profile uses `trend: 4h`; feed only maintains 1m/5m/15m/1h. Alpaca crypto stream delivers 1m bars only. | §4.1, §6 | Feed resamples from 1m to all timeframes listed in the profile (derived set, not hard-coded). Backfill depth = max indicator lookback × largest TF (≈ 50 × 4h ≈ 9 days of 1m bars). |
 | G6 | **"Day" undefined for a 24/7 market.** Daily loss limit, daily budget, orders/day, reviewer schedule. | §4.5 #3, §6 | One config key `trading_day_tz` (default `UTC`), boundary at 00:00. Reviewer runs at 03:00 Europe/Berlin as specified, independently. |
-| G7 | **Unsafe expression evaluation.** `signal_rules[].expr`, `score`, `promote_if`, `applies_to` are strings. `eval()` is not acceptable. | §6, §8.2 | One shared, whitelisted AST evaluator (names = feature dict, ops = arithmetic/compare/bool/`min`/`max`/`abs`, `[-n]` = lag access, `in a..b` for ranges). Validate all expressions at profile load, fail fast. |
+| G7 | **Unsafe expression evaluation.** `signal_rules[].expr`, `score`, `promote_if`, `applies_to` are strings. `eval()` is not acceptable. | §6, §8.2 | One shared, whitelisted AST evaluator (names = feature dict, ops = arithmetic/compare/bool/`min`/`max`/`abs`, `[-n]` = lag access, `in a..b` for ranges). Validate all expressions at profile load, fail fast. **Done in 0.2** (`core/expr.py`): names checked against vocabularies in `core/features.py`; `**`/`%` excluded (DoS). Glob matching (`rule_id == breakout_*`) is not supported yet — add in 4.1 if `applies_to` needs it. |
 | G8 | **Kill file across containers.** Core and API are separate compose services; `touch KILL` must be visible to both. | §4.11, §11 | `KILL` lives in a shared volume (`/data/control/KILL`); path from config. Core additionally polls `control_state` in DB. |
-| G9 | **Model IDs.** `claude-haiku-latest` / `claude-sonnet-latest` are not real aliases. The price table must match exact IDs. | §6 | Pin exact model IDs in the profile; price table keyed by model ID in `config.yaml`, versioned. Verify current IDs/prices at Phase 2 start. |
+| G9 | **Model IDs.** `claude-haiku-latest` / `claude-sonnet-latest` are not real aliases. The price table must match exact IDs. | §6 | Pin exact model IDs in the profile; price table keyed by model ID in `config.yaml`, versioned. Verify current IDs/prices at Phase 2 start. **0.2:** profile pins `claude-haiku-5-5` / `claude-sonnet-5-5`; IDs containing `latest` are rejected at load. Price table deferred to 2.1. |
 | G10 | **Alpaca crypto fee mechanics.** Fees on buys may be deducted from the received asset qty → position qty ≠ ordered qty → false reconciliation mismatches. | §4.6, §4.7 | Verify in Phase 0; reconciliation compares against broker-reported qty, Position Manager adopts broker qty after fill. |
 | G11 | **Stale data + client-side stops.** "Position Manager still runs on last known price" means the stop is effectively off while stale. | §4.1 | Stale > N s with an open position → alert; stale > M s → market-exit via `exit()` (configurable, default on in live). |
 | G12 | File name: layout says `spec.md`, repo has `SPEC.md`. | §11 | Keep `SPEC.md`. Trivial. |
@@ -76,7 +76,7 @@ Each WP ≈ one PR. DoD per phase is from SPEC §12 and is not repeated in full.
 
 | WP | Content |
 |---|---|
-| 2.1 | Cost meter wrapping the Anthropic client; price table; per-call/per-cycle/daily aggregates; hard budget → scanner stops emitting. |
+| 2.1 | Cost meter wrapping the Anthropic client; price table (add to `config.yaml` + `AppConfig`, keyed by exact model ID, G9); per-call/per-cycle/daily aggregates; hard budget → scanner stops emitting. |
 | 2.2 | Agent runner: template rendering, tool-use structured output, pydantic validation, persistence to `agent_calls`, timeouts; malformed output fails the cycle, never the process. |
 | 2.3 | Technical Analyst + Decision Maker, `prompts/*/v1.md`, prompt hash/version stored per call. |
 | 2.4 | Recorded-fixture replay (agent calls served from `agent_calls`) for CI and dry runs. |
@@ -97,7 +97,7 @@ Each WP ≈ one PR. DoD per phase is from SPEC §12 and is not repeated in full.
 
 | WP | Content |
 |---|---|
-| 4.1 | Hypothesis registry + lifecycle, `applies_to` predicates via the shared evaluator. |
+| 4.1 | Hypothesis registry + lifecycle, `applies_to` predicates via the shared evaluator (needs its own name vocabulary in `core/features.py`; glob matching if wanted). |
 | 4.2 | Evidence computation (matching vs. non-matching, bootstrap p-value on R). |
 | 4.3 | Journal Reviewer agent + scheduler (03:00 Europe/Berlin); output consumed by code that enforces §8.3 boundaries. |
 | 4.4 | Active Learnings block injection, `learnings_applied` attribution, cap handling. |

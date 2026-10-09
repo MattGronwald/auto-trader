@@ -1,0 +1,58 @@
+name: fast_momentum_v1
+description: >
+  Short-horizon momentum/breakout on liquid crypto. Hold minutes to hours.
+  Prefer many small, well-defined trades over conviction bets. Cut losers fast.
+universe: [BTC/USD, ETH/USD, SOL/USD]        # start small; liquidity + spread matter
+timeframes: { signal: 5m, context: [15m, 1h], trend: 4h }
+
+signal_rules:                                 # deterministic, run by Scanner
+  - id: breakout_donchian20_volspike
+    expr: "close > donchian_high_20[-1] and vol_z > 1.5 and ema9 > ema21"
+    direction: long
+    score: "min(1, vol_z / 3)"
+  - id: pullback_ema21_uptrend
+    expr: "ema21 > ema50 and low <= ema21 and close > ema21 and rsi14 > 45"
+    direction: long
+    score: "0.5"
+  # shorts: Alpaca spot cannot short crypto → long-only in PoC (schema rejects `short`)
+
+scanner:
+  max_candidates_per_symbol_per_hour: 2
+  max_concurrent_cycles: 2
+  min_vol_z: 0.5
+  max_spread_bps: 15
+
+agents:                                       # exact model IDs (G9); re-verify at Phase 2 start
+  technical: { model: claude-haiku-5-5, prompt_version: v1 }
+  context:   { enabled: false }
+  decision:  { model: claude-sonnet-5-5, prompt_version: v1, mode: single }   # single | debate
+  reviewer:  { model: claude-sonnet-5-5, prompt_version: v1, schedule: "0 3 * * *", tz: Europe/Berlin }
+  exit_review: { enabled: false }
+
+risk:                                         # HUMAN-EDITABLE ONLY. Learning loop cannot touch this block.
+  risk_per_trade_pct: 1.0                     # of equity, at stop
+  max_position_pct: 30
+  max_positions: 2
+  max_gross_exposure_pct: 60
+  max_daily_loss_pct: 3
+  max_drawdown_pct: 10                        # pauses trading, manual resume
+  min_stop_atr: 0.8
+  max_stop_atr: 3.0
+  max_hold_min: 480
+  max_orders_per_hour: 6
+  max_orders_per_day: 30
+  max_price_deviation_pct: 1.0
+  default_win_rate_prior: 0.40                # D4: used until n >= learning.min_trades_for_evidence
+  trailing: { enabled: true, trigger_r: 1.0, trail_atr: 1.5 }
+
+budget:
+  llm_usd_per_day: 3.00
+  llm_usd_per_cycle_max: 0.10
+
+learning:
+  mode: propose_only            # propose_only | auto_promote (Phase 4+)
+  min_trades_for_evidence: 20
+  promote_if: "p_value < 0.1 and delta_expectancy_r > 0.15"   # vs. baseline window
+  max_active_learnings: 12
+
+benchmark: { symbol: BTC/USD, type: buy_and_hold }

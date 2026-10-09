@@ -12,7 +12,7 @@ Automated, agent-based crypto trading PoC (Alpaca paper first, live later with ~
 - Every LLM call goes through the cost meter (tokens, model, USD, cycle id, agent).
 - LLM agents run on scanner signals only — never on a timer.
 - The learning loop never touches the `risk` block, signal rules, models or prompts.
-- No `eval()`/`exec()` on config strings; use the shared expression evaluator (G7).
+- No `eval()`/`exec()` on config strings; use the shared expression evaluator (`core/expr.py`, G7). New expression names go into `core/features.py`.
 - Secrets only via env / `.env` (git-ignored). Never commit keys, never log them.
 
 ## Stack & conventions
@@ -33,6 +33,7 @@ uv run ruff check            # lint (`--fix` to autofix)
 uv run ruff format           # format
 uv run mypy                  # strict, src + tests (paths from pyproject)
 uv run autotrader --help     # CLI; unimplemented commands exit 2
+uv run autotrader check-config  # validate config.yaml + env + profile, print profile hash
 ```
 CI (`.github/workflows/ci.yml`) runs the same checks plus `pip-audit` on the exported lock file.
 Add dependencies with `uv add <pkg>` / `uv add --dev <pkg>` — only in the WP that needs them.
