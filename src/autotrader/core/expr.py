@@ -22,9 +22,11 @@ make every comparison silently False, inf would win every score ranking).
 from __future__ import annotations
 
 import ast
+import io
 import math
 import operator
 import re
+import tokenize
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -39,8 +41,6 @@ MAX_SOURCE_LEN = 1000
 _RANGE_FN = "__range__"
 _NUM = r"-?\d+(?:\.\d+)?"
 _RANGE_RE = re.compile(rf"\bin\s+({_NUM})\s*\.\.\s*({_NUM})")
-# Quoted string literals (incl. escapes); the `a..b` rewrite must not touch their content.
-_STRING_RE = re.compile(r"""("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')""")
 
 _BIN_OPS: dict[type[ast.operator], Callable[[float, float], float]] = {
     ast.Add: operator.add,
@@ -81,13 +81,36 @@ def _finite(v: float) -> float | None:
     return f if math.isfinite(f) else None
 
 
+def _string_spans(source: str) -> list[tuple[int, int]]:
+    """(start, end) offsets of string literals, as Python's own tokenizer sees them.
+
+    Covers every quoting form (triple quotes with inner quotes, escapes, prefixes). On a
+    tokenizer error (e.g. unterminated string) returns what it has; `ast.parse` then
+    rejects the source anyway.
+    """
+    line_starts = [0]
+    for line in source.splitlines(keepends=True):
+        line_starts.append(line_starts[-1] + len(line))
+    spans: list[tuple[int, int]] = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.STRING:
+                (r0, c0), (r1, c1) = tok.start, tok.end
+                spans.append((line_starts[r0 - 1] + c0, line_starts[r1 - 1] + c1))
+    except (tokenize.TokenError, SyntaxError):
+        pass
+    return spans
+
+
 def _rewrite_ranges(source: str) -> str:
     """`x in a..b` -> `x in __range__(a, b)`, outside string literals only."""
-    parts = _STRING_RE.split(source)  # odd indices are the quoted strings
-    return "".join(
-        part if i % 2 else _RANGE_RE.sub(rf"in {_RANGE_FN}(\1, \2)", part)
-        for i, part in enumerate(parts)
-    )
+    out, pos = [], 0
+    for start, end in _string_spans(source):
+        out.append(_RANGE_RE.sub(rf"in {_RANGE_FN}(\1, \2)", source[pos:start]))
+        out.append(source[start:end])
+        pos = end
+    out.append(_RANGE_RE.sub(rf"in {_RANGE_FN}(\1, \2)", source[pos:]))
+    return "".join(out)
 
 
 @dataclass(frozen=True)
@@ -141,7 +164,7 @@ class Expression:
     def evaluate_number(self, env: Env) -> float:
         result = self.evaluate(env)
         try:
-            return _number(result)
+            return float(_number(result))
         except EvaluationError as e:
             raise EvaluationError(f"{self.source!r}: {e}") from None
 
@@ -158,10 +181,10 @@ def _numeric_literal(node: ast.expr) -> float | None:
         inner = _numeric_literal(node.operand)
         return None if inner is None else -inner
     if isinstance(node, ast.Constant) and _is_number(node.value):
-        value = _finite(cast(float, node.value))
-        if value is None:
-            raise _Reject(f"number literal out of range: {str(node.value)[:20]}...")
-        return value
+        value = cast(float, node.value)
+        if _finite(value) is None:
+            raise _Reject(f"number literal out of range: {str(value)[:20]}...")
+        return value  # original int/float: ints must keep comparing exactly
     return None
 
 
@@ -271,12 +294,17 @@ def _resolve(name: str, env: Env, lag: int = 0) -> Value:
 
 
 def _number(v: Value) -> float:
+    """Validate `v` as a finite number and return it unchanged.
+
+    The original int/float is returned, not `float(v)`: Python compares ints and mixed
+    int/float exactly, while floats collapse distinct ints beyond 2**53.
+    """
     if not _is_number(v):
         raise EvaluationError(f"expected number, got {v!r}")
-    f = _finite(cast(float, v))  # int or float, checked above
-    if f is None:
+    number = cast(float, v)  # int or float, checked above
+    if _finite(number) is None:
         raise EvaluationError(f"non-finite or out-of-range number {str(v)[:20]}")
-    return f
+    return number
 
 
 def _boolean(v: Value) -> bool:

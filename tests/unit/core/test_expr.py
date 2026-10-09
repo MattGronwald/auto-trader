@@ -259,6 +259,10 @@ def test_non_finite_values_are_evaluation_errors(source: str, env: Env) -> None:
         ('rule_id == "in 1..2"', "in 1..2", True),  # was rewritten to "in __range__(1, 2)"
         ("rule_id == 'x in 3..4'", "x in 3..4", True),
         ('rule_id == """in 1..2"""', "in 1..2", True),
+        # PR #5 review: internal quotes must not end a triple-quoted literal
+        ('rule_id == """a " in 1..2 " b"""', 'a " in 1..2 " b', True),
+        ("rule_id == '''a ' in 1..2 ' b'''", "a ' in 1..2 ' b", True),
+        (r'rule_id == "a \" in 1..2 \" b"', 'a " in 1..2 " b', True),  # escaped quotes
     ],
 )
 def test_range_syntax_inside_strings_is_untouched(source: str, value: str, expected: bool) -> None:
@@ -304,3 +308,23 @@ def test_determinable_result_type_mismatch_rejected(source: str, result: str) ->
 )
 def test_matching_or_unknown_result_type_accepted(source: str, result: str) -> None:
     Expression.compile(source, allowed_names=SERIES_NAMES, result=result)  # type: ignore[arg-type]
+
+
+# PR #5 review: finiteness checks must not turn exact int comparisons into float ones.
+
+
+@pytest.mark.parametrize(
+    ("source", "env", "expected"),
+    [
+        ("9007199254740992 == 9007199254740993", {}, False),
+        ("9007199254740992 < 9007199254740993", {}, True),
+        ("x == 9007199254740993", {"x": 9007199254740992}, False),
+        ("x == 9007199254740992.0", {"x": 9007199254740992}, True),  # mixed int/float exact
+        ("x in 9007199254740993..9007199254740995", {"x": 9007199254740992}, False),
+        ("x + 1 == 9007199254740993", {"x": 9007199254740992}, True),
+    ],
+)
+def test_large_integers_compare_exactly(source: str, env: Env, expected: bool) -> None:
+    expr = Expression.compile(source, allowed_names=frozenset({"x"}))
+
+    assert expr.evaluate_bool(env) is expected
