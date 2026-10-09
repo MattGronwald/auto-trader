@@ -121,6 +121,19 @@ def _set(data: dict[str, Any], path: str, value: Any) -> None:
         ("agents.context.enabled", True, "context"),
         ("agents.reviewer.tz", "Mars/Olympus", "tz"),
         ("agents.reviewer.schedule", "every night", "schedule"),
+        # regressions from the PR #3 review
+        ("agents.reviewer.schedule", "99 99 99 99 99", "schedule"),
+        ("agents.reviewer.schedule", "*/0 * * * *", "schedule"),
+        ("agents.reviewer.schedule", "0 3 31 2-1 *", "schedule"),  # reversed range
+        ("agents.reviewer.schedule", "0 24 * * *", "schedule"),
+        ("agents.reviewer.schedule", "60 3 * * *", "schedule"),
+        ("agents.reviewer.schedule", "0 3 0 * *", "schedule"),  # day-of-month starts at 1
+        ("agents.reviewer.schedule", "0 3 * 13 *", "schedule"),
+        ("agents.reviewer.schedule", "0 3 * * 8", "schedule"),
+        ("signal_rules.0.expr", "1 + 2", "expected a bool"),
+        ("signal_rules.0.score", "close > 1", "expected a number"),
+        ("signal_rules.0.score", "1e309", "score"),
+        ("learning.promote_if", "p_value * 2", "expected a bool"),
         ("risk.min_stop_atr", 3.0, "min_stop_atr"),
         ("risk.max_daily_loss_pct", 0, "max_daily_loss_pct"),
         ("risk.max_position_pct", 101, "max_position_pct"),
@@ -152,6 +165,23 @@ def test_non_string_expression_rejected(profile_data: dict[str, Any]) -> None:
     profile_data["signal_rules"][0]["expr"] = True
 
     with pytest.raises(ConfigError, match="expected an expression string"):
+        parse_profile(profile_data)
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    ["0 3 * * *", "*/15 * * * *", "0 0-6/2 1,15 1-12 0-7", "30 23 31 12 7"],
+)
+def test_valid_cron_schedules_accepted(profile_data: dict[str, Any], schedule: str) -> None:
+    profile_data["agents"]["reviewer"]["schedule"] = schedule
+
+    assert parse_profile(profile_data).agents.reviewer.schedule == schedule
+
+
+def test_overflowing_literal_is_config_error_not_crash(profile_data: dict[str, Any]) -> None:
+    profile_data["signal_rules"][0]["score"] = "9" * 400
+
+    with pytest.raises(ConfigError, match="score"):
         parse_profile(profile_data)
 
 

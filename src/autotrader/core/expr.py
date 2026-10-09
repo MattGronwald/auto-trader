@@ -13,20 +13,28 @@ Language:
 
 Deliberately absent: `**` and `%` (`9**9**9` is a CPU/memory bomb), attribute access,
 calls other than the three above, comprehensions, conditionals, slices.
+
+Numbers must be finite: inf/NaN or out-of-range literals are rejected at compile time,
+and a non-finite input or intermediate result is an `EvaluationError` (NaN would otherwise
+make every comparison silently False, inf would win every score ranking).
 """
 
 from __future__ import annotations
 
 import ast
+import io
+import math
 import operator
 import re
+import tokenize
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 Value = float | int | bool | str
 Env = Mapping[str, Value | Sequence[float]]
+ResultType = Literal["bool", "number"]
 
 MAX_SOURCE_LEN = 1000
 
@@ -64,13 +72,62 @@ def _is_number(v: object) -> bool:
     return isinstance(v, int | float) and not isinstance(v, bool)
 
 
+def _finite(v: float) -> float | None:
+    """`v` as a finite float, or None if it is inf/NaN or too large for a float."""
+    try:
+        f = float(v)
+    except OverflowError:
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _string_spans(source: str) -> list[tuple[int, int]]:
+    """(start, end) offsets of string literals, as Python's own tokenizer sees them.
+
+    Covers every quoting form (triple quotes with inner quotes, escapes, prefixes). On a
+    tokenizer error (e.g. unterminated string) returns what it has; `ast.parse` then
+    rejects the source anyway.
+    """
+    line_starts = [0]
+    for line in source.splitlines(keepends=True):
+        line_starts.append(line_starts[-1] + len(line))
+    spans: list[tuple[int, int]] = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.STRING:
+                (r0, c0), (r1, c1) = tok.start, tok.end
+                spans.append((line_starts[r0 - 1] + c0, line_starts[r1 - 1] + c1))
+    except (tokenize.TokenError, SyntaxError):
+        pass
+    return spans
+
+
+def _rewrite_ranges(source: str) -> str:
+    """`x in a..b` -> `x in __range__(a, b)`, outside string literals only."""
+    out, pos = [], 0
+    for start, end in _string_spans(source):
+        out.append(_RANGE_RE.sub(rf"in {_RANGE_FN}(\1, \2)", source[pos:start]))
+        out.append(source[start:end])
+        pos = end
+    out.append(_RANGE_RE.sub(rf"in {_RANGE_FN}(\1, \2)", source[pos:]))
+    return "".join(out)
+
+
 @dataclass(frozen=True)
 class Expression:
     source: str
     _tree: ast.Expression = field(repr=False, compare=False)
 
     @classmethod
-    def compile(cls, source: str, *, allowed_names: frozenset[str]) -> Expression:
+    def compile(
+        cls, source: str, *, allowed_names: frozenset[str], result: ResultType | None = None
+    ) -> Expression:
+        """Parse and check `source`.
+
+        `result` rejects expressions whose result type is statically known to be wrong
+        (e.g. a predicate `1 + 2`). A bare name's type is only known at evaluation time.
+        """
+
         def fail(reason: str) -> ExpressionError:
             return ExpressionError(f"invalid expression {source!r}: {reason}")
 
@@ -78,7 +135,7 @@ class Expression:
             raise fail(f"longer than {MAX_SOURCE_LEN} characters")
         if _RANGE_FN in source:
             raise fail(f"{_RANGE_FN} is reserved")
-        rewritten = _RANGE_RE.sub(rf"in {_RANGE_FN}(\1, \2)", source)
+        rewritten = _rewrite_ranges(source)
         try:
             with warnings.catch_warnings():
                 # e.g. `1and x` parses but warns; ambiguous input is an error here.
@@ -90,6 +147,9 @@ class Expression:
             _Checker(allowed_names).check(tree.body)
         except _Reject as e:
             raise fail(str(e)) from None
+        kind = _static_type(tree.body)
+        if result is not None and kind is not None and kind != result:
+            raise fail(f"expected a {result} expression, got a {kind}")
         return cls(source=source, _tree=tree)
 
     def evaluate(self, env: Env) -> Value:
@@ -103,9 +163,10 @@ class Expression:
 
     def evaluate_number(self, env: Env) -> float:
         result = self.evaluate(env)
-        if not _is_number(result):
-            raise EvaluationError(f"{self.source!r}: expected number, got {result!r}")
-        return float(result)
+        try:
+            return float(_number(result))
+        except EvaluationError as e:
+            raise EvaluationError(f"{self.source!r}: {e}") from None
 
 
 # --- compile-time whitelist --------------------------------------------------------
@@ -120,7 +181,26 @@ def _numeric_literal(node: ast.expr) -> float | None:
         inner = _numeric_literal(node.operand)
         return None if inner is None else -inner
     if isinstance(node, ast.Constant) and _is_number(node.value):
-        return float(cast(float, node.value))
+        value = cast(float, node.value)
+        if _finite(value) is None:
+            raise _Reject(f"number literal out of range: {str(value)[:20]}...")
+        return value  # original int/float: ints must keep comparing exactly
+    return None
+
+
+def _static_type(node: ast.expr) -> str | None:
+    """Result type if it follows from the syntax alone; None for names/lags."""
+    match node:
+        case ast.Compare() | ast.BoolOp() | ast.UnaryOp(op=ast.Not()):
+            return "bool"
+        case ast.BinOp() | ast.UnaryOp() | ast.Call():
+            return "number"
+        case ast.Constant(value=bool()):
+            return "bool"
+        case ast.Constant(value=str()):
+            return "string"
+        case ast.Constant():
+            return "number"
     return None
 
 
@@ -181,6 +261,7 @@ class _Checker:
             case ast.Constant(value=value):
                 if type(value) not in (int, float, bool, str):
                     raise _Reject(f"unsupported literal {value!r}")
+                _numeric_literal(node)  # rejects inf and out-of-range numbers
             case ast.Call(func=ast.Name(id=fn), args=args, keywords=[]) if fn in _FUNCS:
                 arity_ok = len(args) == 1 if fn == "abs" else len(args) >= 2
                 if not arity_ok or any(isinstance(a, ast.Starred) for a in args):
@@ -213,9 +294,17 @@ def _resolve(name: str, env: Env, lag: int = 0) -> Value:
 
 
 def _number(v: Value) -> float:
+    """Validate `v` as a finite number and return it unchanged.
+
+    The original int/float is returned, not `float(v)`: Python compares ints and mixed
+    int/float exactly, while floats collapse distinct ints beyond 2**53.
+    """
     if not _is_number(v):
         raise EvaluationError(f"expected number, got {v!r}")
-    return float(v)
+    number = cast(float, v)  # int or float, checked above
+    if _finite(number) is None:
+        raise EvaluationError(f"non-finite or out-of-range number {str(v)[:20]}")
+    return number
 
 
 def _boolean(v: Value) -> bool:
@@ -225,7 +314,9 @@ def _boolean(v: Value) -> bool:
 
 
 def _compare(op: ast.cmpop, a: Value, b: Value) -> bool:
-    if (_is_number(a) and _is_number(b)) or (isinstance(a, str) and isinstance(b, str)):
+    if _is_number(a) and _is_number(b):
+        return _CMP_OPS[type(op)](_number(a), _number(b))
+    if isinstance(a, str) and isinstance(b, str):
         return _CMP_OPS[type(op)](a, b)
     if isinstance(a, bool) and isinstance(b, bool) and not isinstance(op, _ORDERING_OPS):
         return _CMP_OPS[type(op)](a, b)
@@ -254,7 +345,10 @@ def _eval(node: ast.expr, env: Env) -> Value:
             a, b = _number(_eval(left, env)), _number(_eval(right, env))
             if isinstance(bin_op, ast.Div) and b == 0:
                 raise EvaluationError("division by zero")
-            return _BIN_OPS[type(bin_op)](a, b)
+            try:
+                return _number(_BIN_OPS[type(bin_op)](a, b))
+            except OverflowError:
+                raise EvaluationError("arithmetic overflow") from None
         case ast.Compare(left=left, ops=ops, comparators=comparators):
             current = _eval(left, env)
             for cmp_op, comp in zip(ops, comparators, strict=True):
