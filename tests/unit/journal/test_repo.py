@@ -79,6 +79,34 @@ async def test_new_profile_version_closes_previous(session: AsyncSession) -> Non
     assert second.active_to is None
 
 
+async def test_register_sees_changes_from_other_sessions(db_url: str) -> None:
+    # PR #4 review: with expire_on_commit=False a cached Strategy row looked still active
+    # after another session had switched profiles, so registration became a wrong no-op.
+    profile = load_profile(PROFILE_PATH)
+    data = profile.model_dump(mode="json")
+    data["risk"]["max_positions"] = 1
+    other = parse_profile(data)
+
+    engine = make_engine(db_url)
+    sessions = make_sessionmaker(engine)
+    async with sessions() as a, sessions() as b:
+        first = await repo.register_strategy(a, profile, "a", now=T0)
+        await a.refresh(first)
+        await a.commit()
+        await repo.register_strategy(b, other, "b", now=T0 + timedelta(hours=1))
+
+        again = await repo.register_strategy(a, profile, "a", now=T0 + timedelta(hours=2))
+
+    async with sessions() as fresh:
+        active = (
+            await fresh.scalars(select(m.Strategy.id).where(m.Strategy.active_to.is_(None)))
+        ).all()
+    await engine.dispose()
+
+    assert again.id == first.id
+    assert active == [first.id]
+
+
 async def test_reactivating_old_version_reuses_its_row(session: AsyncSession) -> None:
     profile = load_profile(PROFILE_PATH)
     data = profile.model_dump(mode="json")
@@ -125,6 +153,18 @@ async def test_get_bars_filters_symbol_and_window(session: AsyncSession) -> None
 
 async def test_upsert_no_bars_is_noop(session: AsyncSession) -> None:
     await repo.upsert_bars(session, [])
+
+
+async def test_upsert_backfill_sized_batch(session: AsyncSession) -> None:
+    # PR #4 review: 9 days of 1m bars x 3 symbols (PLAN G5 backfill) exceeded SQLite's
+    # bind-parameter limit in a single INSERT.
+    symbols = ("BTC/USD", "ETH/USD", "SOL/USD")
+    bars = [bar(i, symbol=s) for s in symbols for i in range(9 * 1440)]
+
+    await repo.upsert_bars(session, bars)
+
+    count = await session.scalar(select(func.count()).select_from(m.BarRow))
+    assert count == 38_880
 
 
 # --- events --------------------------------------------------------------------------

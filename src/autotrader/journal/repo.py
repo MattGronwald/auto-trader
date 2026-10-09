@@ -35,7 +35,13 @@ async def register_strategy(
     profile's row is (re)opened, so cycles keep pointing at the exact profile they ran.
     """
     now = now or _now()
-    row = await session.scalar(select(Strategy).where(Strategy.hash == profile.hash))
+    # populate_existing: sessions use expire_on_commit=False, so a row cached earlier in
+    # this session could still look active after another session switched profiles.
+    row = await session.scalar(
+        select(Strategy)
+        .where(Strategy.hash == profile.hash)
+        .execution_options(populate_existing=True)
+    )
     if row is not None and row.active_to is None:
         return row
     await session.execute(
@@ -51,6 +57,10 @@ async def register_strategy(
 
 
 # --- bars ----------------------------------------------------------------------------
+
+# Rows per INSERT: 8 bind params each -> 8,000 params, well under SQLite's 32,766 and
+# asyncpg's 32,767 per statement. A 9-day x 3-symbol backfill is ~39k rows.
+_BAR_BATCH = 1000
 
 
 async def upsert_bars(session: AsyncSession, bars: Sequence[Bar]) -> None:
@@ -72,13 +82,14 @@ async def upsert_bars(session: AsyncSession, bars: Sequence[Bar]) -> None:
     ]
     dialect = (await session.connection()).dialect.name
     insert = pg_insert if dialect == "postgresql" else sqlite_insert
-    stmt = insert(BarRow).values(rows)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["symbol", "timeframe", "ts"],
-        set_={c: stmt.excluded[c] for c in ("o", "h", "l", "c", "v")},
-    )
-    await session.execute(stmt)
-    await session.commit()
+    for i in range(0, len(rows), _BAR_BATCH):
+        stmt = insert(BarRow).values(rows[i : i + _BAR_BATCH])
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["symbol", "timeframe", "ts"],
+            set_={c: stmt.excluded[c] for c in ("o", "h", "l", "c", "v")},
+        )
+        await session.execute(stmt)
+    await session.commit()  # one transaction for the whole batch
 
 
 async def get_bars(
