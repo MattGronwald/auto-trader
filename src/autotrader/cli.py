@@ -4,13 +4,17 @@ Commands that are stubs until their work package lands exit with code 2, so an o
 never mistakes an unimplemented `kill` or `flatten` for a successful one.
 """
 
+import asyncio
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
 
+from autotrader.core.bus import EventBus
 from autotrader.core.config import AppConfig, ConfigError, Settings, load_config, load_profile
+from autotrader.core.kill import ClearResult, clear_kill, record_kill, write_kill_file
 from autotrader.core.logging import configure_logging
 from autotrader.journal import db
 
@@ -74,10 +78,87 @@ def flatten() -> None:
     _not_implemented("flatten", "1.5")
 
 
+_KILL_FALLBACK = (
+    "To stop trading without a valid config, create the kill file directly: "
+    "touch data/control/KILL (or the path set in control.kill_file)."
+)
+
+
 @app.command("kill")
-def kill() -> None:
-    """Trigger the kill-switch."""
-    _not_implemented("kill", "0.5")
+def kill(
+    config: ConfigOption = Path("config.yaml"),
+    reason: Annotated[str | None, typer.Option(help="Recorded with the kill.")] = None,
+    clear: Annotated[bool, typer.Option("--clear", help="Lift an active kill.")] = False,
+) -> None:
+    """Trigger the kill-switch: stop all new entries (exits stay possible)."""
+    try:
+        cfg = load_config(config, Settings())
+    except ConfigError as e:
+        typer.echo(f"invalid config: {e}\n{_KILL_FALLBACK}", err=True)
+        raise typer.Exit(code=1) from None
+    if clear:
+        _clear_kill(cfg)
+    else:
+        _trigger_kill(cfg, reason)
+
+
+def _trigger_kill(cfg: AppConfig, reason: str | None) -> None:
+    kill_file = cfg.control.kill_file
+    now = datetime.now(UTC)
+    # Latch first, before any DB setup: engine creation alone can fail (bad path,
+    # missing driver), and that must never prevent the kill.
+    try:
+        record = write_kill_file(kill_file, source="cli", reason=reason, now=now)
+    except OSError as e:
+        typer.echo(f"KILL NOT ACTIVE: cannot write {kill_file}: {e}\n{_KILL_FALLBACK}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"KILL active: {kill_file}")
+
+    async def record_in_db() -> None:
+        engine = db.make_engine(cfg.database.url)
+        sessions = db.make_sessionmaker(engine)
+        bus = EventBus(sessions)
+        try:
+            await record_kill(sessions, bus, record, now)
+        finally:
+            await bus.close()
+            await engine.dispose()
+
+    try:
+        asyncio.run(record_in_db())
+    except Exception as e:
+        typer.echo(
+            f"warning: database not updated ({type(e).__name__}: {e}); "
+            "the kill file alone stops trading.",
+            err=True,
+        )
+
+
+def _clear_kill(cfg: AppConfig) -> None:
+    kill_file = cfg.control.kill_file
+
+    async def clear() -> ClearResult:
+        engine = db.make_engine(cfg.database.url)
+        sessions = db.make_sessionmaker(engine)
+        bus = EventBus(sessions)
+        try:
+            return await clear_kill(kill_file, sessions, bus, source="cli")
+        finally:
+            await bus.close()
+            await engine.dispose()
+
+    try:
+        result = asyncio.run(clear())
+    except Exception as e:
+        typer.echo(
+            f"clear failed ({type(e).__name__}: {e}); kill is still active: {kill_file}",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+    if not result.file_removed:
+        typer.echo(f"a newer kill was triggered during the clear; still active: {kill_file}")
+        raise typer.Exit(code=1)
+    typer.echo(f"kill cleared: removed {kill_file} and control_state.kill")
 
 
 def _load_config(path: Path) -> AppConfig:
