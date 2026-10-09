@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run mypy
+      # Unit + SimBroker integration only; `smoke` tests are excluded by pytest addopts.
+      - run: uv run pytest --cov
+      - name: pip-audit
+        run: |
+          uv export --locked --no-hashes --no-emit-project -o requirements-audit.txt
+          uv run pip-audit -r requirements-audit.txt --strict
