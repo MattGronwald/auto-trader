@@ -117,6 +117,10 @@ class Order(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     cycle_id: Mapped[int | None] = mapped_column(ForeignKey("cycles.id"))
     broker_order_id: Mapped[str | None] = mapped_column(String(64), unique=True)
+    client_order_id: Mapped[str | None] = mapped_column(String(64), unique=True)  # D14
+    # SPEC §7 has no symbol on orders, but exits from a kill/flatten have no cycle to
+    # take it from, and open entry orders must block their symbol (check 5).
+    symbol: Mapped[str | None] = mapped_column(String(32))
     mode: Mapped[str] = mapped_column(Mode)
     type: Mapped[str] = mapped_column(String(16))
     side: Mapped[str] = mapped_column(String(8))

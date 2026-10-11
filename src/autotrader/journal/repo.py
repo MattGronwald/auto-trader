@@ -1,13 +1,15 @@
 """Journal access. Functions take an `AsyncSession` and commit their own unit of work.
 
 Phase 0 needs live here (strategies, bars, events, control state), plus the read-only
-queries the Scanner (WP 1.2) runs on cycles and positions; the other tables get their
-write functions in the work package that writes them. There is deliberately no
+queries the Scanner (WP 1.2) runs on cycles and positions; WP 1.3 adds the risk-decision,
+order and equity-snapshot functions. The other tables get their write functions in the
+work package that writes them. There is deliberately no
 update/delete for events and no delete anywhere (SPEC §4.8: nothing is deleted).
 """
 
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select, update
@@ -17,7 +19,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from autotrader.core.config import StrategyProfile
 from autotrader.core.types import Bar
-from autotrader.journal.models import BarRow, ControlState, Cycle, Event, Position, Strategy
+from autotrader.journal.models import (
+    BarRow,
+    ControlState,
+    Cycle,
+    EquitySnapshot,
+    Event,
+    Order,
+    Position,
+    RiskDecision,
+    Strategy,
+)
 
 # SPEC §4.3: a cycle in any other state is still open.
 TERMINAL_CYCLE_STATES = frozenset({"FILLED", "REJECTED", "EXPIRED", "ERROR"})
@@ -191,3 +203,160 @@ async def get_control(session: AsyncSession, key: str) -> Any:
 async def set_control(session: AsyncSession, key: str, value: Any) -> None:
     await session.merge(ControlState(key=key, value=value))
     await session.commit()
+
+
+# --- risk decisions / orders / equity (WP 1.3) ---------------------------------------
+
+# Entry orders that may still fill: not yet acked, acked and not final, or unknown
+# after an ambiguous submit failure (WP 1.5 reconciles those by client_order_id).
+OPEN_ENTRY_STATUSES = ("pending", "new", "unknown")
+
+
+async def record_risk_decision(
+    session: AsyncSession,
+    *,
+    cycle_id: int | None,
+    kind: str,
+    approved: bool,
+    reasons: list[str],
+    adjusted: dict[str, str],
+    computed_size: Decimal | None,
+    ts: datetime,
+) -> RiskDecision:
+    row = RiskDecision(
+        cycle_id=cycle_id,
+        kind=kind,
+        approved=approved,
+        reasons=reasons,
+        adjusted=adjusted,
+        computed_size=computed_size,
+        ts=ts,
+    )
+    session.add(row)
+    await session.commit()
+    return row
+
+
+async def insert_order(
+    session: AsyncSession,
+    *,
+    cycle_id: int | None,
+    client_order_id: str | None,
+    symbol: str,
+    mode: str,
+    type_: str,
+    side: str,
+    qty: Decimal,
+    limit_price: Decimal | None,
+    stop_price: Decimal | None,
+    tp_price: Decimal | None,
+    status: str,
+    now: datetime,
+) -> Order:
+    row = Order(
+        cycle_id=cycle_id,
+        client_order_id=client_order_id,
+        symbol=symbol,
+        mode=mode,
+        type=type_,
+        side=side,
+        qty=qty,
+        limit_price=limit_price,
+        stop_price=stop_price,
+        tp_price=tp_price,
+        status=status,
+        submitted_at=now,
+        updated_at=now,
+    )
+    session.add(row)
+    await session.commit()
+    return row
+
+
+async def update_order(
+    session: AsyncSession,
+    order_id: int,
+    *,
+    status: str,
+    now: datetime,
+    broker_order_id: str | None = None,
+) -> None:
+    values: dict[str, Any] = {"status": status, "updated_at": now}
+    if broker_order_id is not None:
+        values["broker_order_id"] = broker_order_id
+    await session.execute(update(Order).where(Order.id == order_id).values(**values))
+    await session.commit()
+
+
+async def open_entry_orders(session: AsyncSession) -> list[Order]:
+    rows = await session.scalars(
+        select(Order)
+        .where(Order.side == "buy", Order.status.in_(OPEN_ENTRY_STATUSES))
+        .order_by(Order.id)
+        .execution_options(populate_existing=True)
+    )
+    return list(rows)
+
+
+async def count_entry_orders(session: AsyncSession, since: datetime, *, inclusive: bool) -> int:
+    """Entry orders that were sent (or may have been) since `since`; `not_submitted`
+    never reached the broker and does not count."""
+    after = Order.submitted_at >= since if inclusive else Order.submitted_at > since
+    count = await session.scalar(
+        select(func.count())
+        .select_from(Order)
+        .where(Order.side == "buy", Order.status != "not_submitted", after)
+    )
+    return int(count or 0)
+
+
+async def insert_equity_snapshot(
+    session: AsyncSession,
+    *,
+    ts: datetime,
+    equity: Decimal,
+    cash: Decimal,
+    exposure: Decimal,
+    hwm: Decimal,
+    daily_pnl: Decimal,
+) -> None:
+    session.add(
+        EquitySnapshot(
+            ts=ts, equity=equity, cash=cash, exposure=exposure, hwm=hwm, daily_pnl=daily_pnl
+        )
+    )
+    await session.commit()
+
+
+async def latest_snapshot(session: AsyncSession) -> EquitySnapshot | None:
+    return await session.scalar(select(EquitySnapshot).order_by(EquitySnapshot.ts.desc()).limit(1))
+
+
+async def day_start_equity(session: AsyncSession, day_start: datetime) -> Decimal | None:
+    """Equity of the last snapshot at or before `day_start`; if there is none (first day
+    of operation), the first snapshot after it. None without any snapshot."""
+    before = await session.scalar(
+        select(EquitySnapshot.equity)
+        .where(EquitySnapshot.ts <= day_start)
+        .order_by(EquitySnapshot.ts.desc())
+        .limit(1)
+    )
+    if before is not None:
+        return before
+    return await session.scalar(
+        select(EquitySnapshot.equity)
+        .where(EquitySnapshot.ts > day_start)
+        .order_by(EquitySnapshot.ts)
+        .limit(1)
+    )
+
+
+async def strategy_trade_stats(session: AsyncSession, strategy_id: int) -> tuple[int, int]:
+    """(closed trades, wins) of a strategy; a win is realized P&L > 0 after fees."""
+    closed = (
+        select(Position.realized_pnl)
+        .join(Cycle, Position.cycle_id == Cycle.id)
+        .where(Cycle.strategy_id == strategy_id, Position.closed_at.is_not(None))
+    )
+    pnls = list(await session.scalars(closed))
+    return len(pnls), sum(1 for p in pnls if p is not None and p > 0)
