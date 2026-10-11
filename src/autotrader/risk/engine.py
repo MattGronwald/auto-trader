@@ -175,6 +175,15 @@ class RiskEngine:
         # is then already in the positions read below (never neither-position-nor-entry).
         open_rows = await self._refresh_open_entries(deadline)
         account = await self._within(deadline, self._broker.get_account)
+        # Persist a new peak (or the first-ever baseline) right after the account read,
+        # before anything else here can fail: otherwise a spike seen by a check that then
+        # rejects or fails would be forgotten and never bound drawdown. Exposure is
+        # unknown at this point (NULL).
+        async with self._sessions() as session:
+            stored_hwm = await repo.max_hwm(session)
+        if stored_hwm is None or account.equity > stored_hwm:
+            await self._write_snapshot(now, account.equity, account.cash, None)
+        hwm = account.equity if stored_hwm is None else max(stored_hwm, account.equity)
         held = await self._held_positions(deadline)
         rules = await self._within(deadline, lambda: self._broker.asset_rules(symbol))
         fees = self._broker.fee_schedule()
@@ -184,14 +193,7 @@ class RiskEngine:
                 session, day_start(now, self._tz), inclusive=True
             )
             baseline = await repo.day_start_equity(session, day_start(now, self._tz))
-            stored_hwm = await repo.max_hwm(session)
             trades_n, wins = await repo.strategy_trade_stats(session, self._strategy_id)
-        if stored_hwm is None or account.equity > stored_hwm:
-            # A new peak (or the first check ever, whose snapshot is the baseline) is stored
-            # now, even if this check rejects: otherwise a spike between two periodic
-            # snapshots that falls back before the next one would never bound drawdown.
-            await self._write_snapshot(now, account.equity, account.cash, held)
-        hwm = account.equity if stored_hwm is None else max(stored_hwm, account.equity)
         portfolio = PortfolioState(
             equity=account.equity,
             cash=account.cash,
@@ -391,12 +393,17 @@ class RiskEngine:
         deadline = self._monotonic() + self._io_timeout  # its own budget; no lock shared
         now = self._clock()
         account = await self._within(deadline, self._broker.get_account)
-        held = await self._held_positions(deadline)
+        try:
+            held = await self._held_positions(deadline)
+        except Exception:  # the equity (and a peak) is still recorded, exposure unknown
+            await self._write_snapshot(now, account.equity, account.cash, None)
+            raise
         await self._write_snapshot(now, account.equity, account.cash, held)
 
     async def _write_snapshot(
-        self, now: datetime, equity: Decimal, cash: Decimal, held: tuple[HeldPosition, ...]
+        self, now: datetime, equity: Decimal, cash: Decimal, held: tuple[HeldPosition, ...] | None
     ) -> None:
+        """Append one row; `held=None` (positions not read) stores exposure NULL."""
         async with self._sessions() as session:
             stored_hwm = await repo.max_hwm(session)
             baseline = await repo.day_start_equity(session, day_start(now, self._tz))
@@ -408,7 +415,9 @@ class RiskEngine:
                 cash=cash,
                 # Informational only, never used for a limit: an unpriced holding is
                 # estimated at cost basis here (check 8 rejects on it instead).
-                exposure=sum(
+                exposure=None
+                if held is None
+                else sum(
                     (
                         p.market_value if p.market_value is not None else p.qty * p.avg_entry_price
                         for p in held

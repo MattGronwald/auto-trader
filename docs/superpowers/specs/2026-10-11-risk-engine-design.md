@@ -181,7 +181,8 @@ filled → rejected by `check_exit`) or is refused by the broker (the sell is st
 
 ### `snapshot_equity()`
 Called by `run core` every 60 s. Writes `equity_snapshots`: equity (from the broker
-account), cash, exposure (informational only, never used for a limit: an unpriced holding
+account), cash, exposure (informational only, never used for a limit; `NULL` when the
+positions were not read — migration 0003 made the column nullable; an unpriced holding
 is estimated at `qty × avg_entry_price`),
 `hwm = max(highest stored hwm, equity)`, `daily_pnl = equity − day_start_equity`. The
 previous HWM is the maximum over **all** snapshot rows (`repo.max_hwm`), never the latest
@@ -195,9 +196,14 @@ attempt follows on schedule; a success logs `risk.snapshot_written`. The core lo
 awaits a snapshot, so a hung REST call (or even a hung DB write, which only stalls the
 task) cannot delay kill detection or feed ticks; if the task ever ends it is
 logged as `risk.snapshot_task_died` and restarted on the next tick. `check()` folds live equity into the
-`hwm` it uses and, when live equity exceeds the stored maximum, writes a snapshot at once,
-also when the check then rejects: a spike between two periodic snapshots that falls back
-before the next one still bounds drawdown, including after a restart.
+`hwm` it uses and, when live equity exceeds the stored maximum (or no snapshot exists),
+writes an "account observation" snapshot **immediately after the account read** — before
+the positions, asset-rules and journal reads, so their failure cannot lose it — with
+exposure `NULL` (unknown). It is written also when the check then rejects or fails: a
+spike between two periodic snapshots that falls back before the next one still bounds
+drawdown, including after a restart. `snapshot_equity()` likewise records the account
+even when the positions read after it fails (exposure `NULL`, the error is still raised
+and logged). Snapshots are append-only; the HWM is the max over all rows.
 
 `day_start_equity` = equity of the last snapshot at or before the current trading-day
 start (D5). If none exists (first day of operation) the first snapshot of the day is used.

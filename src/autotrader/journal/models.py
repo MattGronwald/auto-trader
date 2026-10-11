@@ -189,7 +189,7 @@ class EquitySnapshot(Base):
     ts: Mapped[datetime] = mapped_column(primary_key=True)
     equity: Mapped[Decimal]
     cash: Mapped[Decimal]
-    exposure: Mapped[Decimal]
+    exposure: Mapped[Decimal | None]  # NULL: unknown (account observed, positions not read)
     hwm: Mapped[Decimal]
     daily_pnl: Mapped[Decimal]
     benchmark_equity: Mapped[Decimal | None]
