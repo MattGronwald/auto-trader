@@ -19,7 +19,9 @@ from autotrader.core.feed import (
     SymbolFresh,
     SymbolStale,
     backfill_depth,
+    history_size,
 )
+from autotrader.core.indicators import compute_features
 from autotrader.core.logging import configure_logging
 from autotrader.core.types import Bar, Quote
 from autotrader.journal import models as m
@@ -164,21 +166,44 @@ def test_backfill_depth_is_lookback_times_largest_timeframe_plus_one_bucket() ->
 
 def test_backfill_depth_covers_at_least_one_day_for_vwap() -> None:
     # D12: VWAP is anchored at the trading-day start, so the window must reach back past it.
-    assert backfill_depth(["5m"], lookback=50) == timedelta(days=1, minutes=5)
+    # 25 h: the longest civil day (DST fall-back), so a non-UTC trading day still fits.
+    assert backfill_depth(["5m"], lookback=50) == timedelta(hours=25, minutes=5)
+    assert backfill_depth(["1m"], lookback=50) == timedelta(hours=25, minutes=1)
 
 
 async def test_history_retains_a_full_day_per_timeframe(
     sessions: async_sessionmaker[AsyncSession], bus: EventBus
 ) -> None:
     # D12: with only 2 x lookback bars, 1m VWAP would lose its day anchor after minutes.
-    clock = Clock(T0 + 1500 * M + GRACE)
-    feed = make_feed(FakeSource([bar(i) for i in range(1500)]), sessions, bus, clock)
+    clock = Clock(T0 + 1600 * M + GRACE)
+    feed = make_feed(FakeSource([bar(i) for i in range(1600)]), sessions, bus, clock)
 
     await feed.backfill()
 
-    assert len(feed.history(BTC, "1m")) == 24 * 60 + 1
-    assert len(feed.history(BTC, "5m")) == 24 * 12 + 1
-    assert len(feed.history(BTC, "1h")) == 24 + 1
+    assert len(feed.history(BTC, "1m")) == 25 * 60 + 1
+    assert len(feed.history(BTC, "5m")) == 25 * 12 + 1
+    assert len(feed.history(BTC, "1h")) == 25 + 1
+
+
+def test_retained_history_keeps_vwap_anchor_on_a_25_hour_dst_day() -> None:
+    # PR #11 review: Europe/Berlin's 2026-10-25 lasts 25 h. Near its end the retained
+    # 1m window must still reach back past the local day start, or VWAP masks to NaN.
+    start = datetime(2026, 10, 24, 21, 59, tzinfo=UTC)  # 23:59 Berlin on the 24th
+    bars = [
+        Bar(
+            symbol=BTC,
+            timeframe="1m",
+            ts=start + i * M,
+            open=100.0,
+            high=100.0,
+            low=100.0,
+            close=100.0,
+            volume=1.0,
+        )
+        for i in range(25 * 60 + 1)  # through 22:59 UTC = 23:59 Berlin on the 25th
+    ]
+    kept = bars[-history_size("1m") :]
+    assert compute_features(kept, trading_day_tz="Europe/Berlin")["vwap"][-1] == 100.0
 
 
 # --- backfill ------------------------------------------------------------------------

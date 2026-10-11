@@ -115,6 +115,23 @@ def test_vol_z_population_std_and_nan_on_zero_spread() -> None:
     assert math.isnan(vol_z(s(2, 2, 2), 3).iloc[-1])  # zero std -> NaN, never inf
 
 
+@pytest.mark.parametrize("volume", [0.1, 0.3, 1.1, 7.0])
+def test_vol_z_is_nan_for_constant_fractional_window(volume: float) -> None:
+    # PR #11 review: the mean of 20 x 0.1 rounds away from 0.1, leaving a tiny nonzero
+    # std and a fake finite z of +-1. D12 requires NaN for zero variance.
+    assert math.isnan(vol_z(pd.Series([volume] * 20), 20).iloc[-1])
+
+
+def test_vol_z_keeps_genuinely_small_variance() -> None:
+    out = vol_z(pd.Series([0.1] * 19 + [0.1 + 1e-9]), 20).iloc[-1]
+    assert out == pytest.approx(math.sqrt(19))
+
+
+def test_bollinger_collapses_on_constant_fractional_window() -> None:
+    upper, middle, lower = bollinger(pd.Series([0.1] * 20), 20, 2.0)
+    assert upper.iloc[-1] == middle.iloc[-1] == lower.iloc[-1] == 0.1
+
+
 def test_vwap_typical_price_weighted_and_resets_at_day_boundary() -> None:
     day1 = T0
     day2 = T0 + timedelta(days=1)

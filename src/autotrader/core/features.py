@@ -33,6 +33,6 @@ SIGNAL_FEATURES = frozenset(
 EVIDENCE_FIELDS = frozenset({"trades_n", "win_rate", "avg_r", "p_value", "delta_expectancy_r"})
 
 # Longest indicator lookback in bars (EMA 50, SPEC §4.1). Drives the backfill depth (G5)
-# and in-memory history size, both floored at one day for VWAP (D12); keep in sync with
+# and in-memory history size, both floored at 25 h (longest civil day) for VWAP (D12); keep in sync with
 # the periods in `core/indicators.py`.
 MAX_INDICATOR_LOOKBACK = 50
