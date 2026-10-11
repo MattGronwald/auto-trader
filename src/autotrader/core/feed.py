@@ -49,6 +49,7 @@ from autotrader.journal import repo
 log = structlog.get_logger(__name__)
 
 ONE_MINUTE = timedelta(minutes=1)
+ONE_DAY = timedelta(days=1)
 
 
 # --- events --------------------------------------------------------------------------
@@ -109,9 +110,16 @@ class BarSource(Protocol):
 
 def backfill_depth(timeframes: Sequence[str], lookback: int = MAX_INDICATOR_LOOKBACK) -> timedelta:
     """G5: longest indicator lookback x largest timeframe, plus one bucket so the oldest
-    bucket in the window is complete."""
+    bucket in the window is complete. At least one day plus a bucket, so the day-anchored
+    VWAP (D12) has the current trading day's start in the window."""
     largest = max((parse_timeframe(tf) for tf in timeframes), default=ONE_MINUTE)
-    return largest * (lookback + 1)
+    return max(largest * (lookback + 1), ONE_DAY + largest)
+
+
+def history_size(timeframe: str, lookback: int = MAX_INDICATOR_LOOKBACK) -> int:
+    """Bars kept in memory per symbol/timeframe: 2 x lookback for the indicators, but at
+    least one day plus one bar so the VWAP day anchor (D12) stays in the window."""
+    return max(2 * lookback, ONE_DAY // parse_timeframe(timeframe) + 1)
 
 
 # --- feed ----------------------------------------------------------------------------
@@ -145,7 +153,9 @@ class MarketFeed:
         self._clock = clock
         self._resampler = Resampler(self._timeframes, grace=grace)
         self._history: dict[tuple[str, str], deque[Bar]] = {
-            (s, tf): deque(maxlen=2 * lookback) for s in symbols for tf in ["1m", *self._timeframes]
+            (s, tf): deque(maxlen=history_size(tf, lookback))
+            for s in symbols
+            for tf in ["1m", *self._timeframes]
         }
         self._lock = asyncio.Lock()
         self._pending: dict[str, dict[datetime, Bar]] = {s: {} for s in symbols}

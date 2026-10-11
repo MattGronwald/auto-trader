@@ -162,6 +162,25 @@ def test_backfill_depth_is_lookback_times_largest_timeframe_plus_one_bucket() ->
     assert backfill_depth(["5m", "15m", "1h", "4h"], lookback=50) == timedelta(hours=4 * 51)
 
 
+def test_backfill_depth_covers_at_least_one_day_for_vwap() -> None:
+    # D12: VWAP is anchored at the trading-day start, so the window must reach back past it.
+    assert backfill_depth(["5m"], lookback=50) == timedelta(days=1, minutes=5)
+
+
+async def test_history_retains_a_full_day_per_timeframe(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    # D12: with only 2 x lookback bars, 1m VWAP would lose its day anchor after minutes.
+    clock = Clock(T0 + 1500 * M + GRACE)
+    feed = make_feed(FakeSource([bar(i) for i in range(1500)]), sessions, bus, clock)
+
+    await feed.backfill()
+
+    assert len(feed.history(BTC, "1m")) == 24 * 60 + 1
+    assert len(feed.history(BTC, "5m")) == 24 * 12 + 1
+    assert len(feed.history(BTC, "1h")) == 24 + 1
+
+
 # --- backfill ------------------------------------------------------------------------
 
 
