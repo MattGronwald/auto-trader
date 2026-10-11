@@ -7,8 +7,10 @@ history and announces each closed bar as `BarClosed`.
 are normal), so a missing minute in the stream can't be told apart from a minute
 without trades. Stream bars are therefore only *pending*: persisted and announced as 1m
 right away, but not resampled. When a window of the smallest higher timeframe is due
-(its end + `grace` has passed), one REST fetch for all symbols covers it; REST bars are
-merged with the stream's by minute, and the window is fed to the resampler in order.
+(its end + `grace` has passed), one REST fetch for all symbols covers it. REST is
+authoritative: it adds minutes the stream missed and replaces minutes the stream sent
+differently (persisted, logged as `feed.bar_corrected`, not re-announced). Accepted bars
+from either source update price age. The window is then fed to the resampler in order.
 Higher timeframes are built from these verified minutes, so they are complete too.
 If REST keeps failing, the window is closed from stream data after `unverified_after`
 and logged as `feed.unverified_close`. While disconnected nothing is finalised (no flat
@@ -256,8 +258,13 @@ class MarketFeed:
                 )
                 verified = []
             for b in verified:
-                if b.ts not in self._pending[b.symbol]:
-                    await self._accept(b)  # a minute the stream missed
+                # REST is authoritative within verification: it adds minutes the stream
+                # missed and corrects minutes the stream delivered differently.
+                old = self._pending[b.symbol].get(b.ts)
+                if old is not None and old != b:
+                    log.info("feed.bar_corrected", symbol=b.symbol, ts=b.ts.isoformat())
+                if old != b:
+                    await self._accept(b)
             for symbol in self._symbols:
                 for ts in sorted(t for t in self._pending[symbol] if t < due_end):
                     b = self._pending[symbol].pop(ts)
@@ -269,13 +276,17 @@ class MarketFeed:
                 self._append(higher)
                 await self._announce(higher)
             self._finalized_until = due_end
+        for symbol in self._symbols:  # recovered bars can make a stale symbol fresh
+            await self._mark_fresh(symbol)
 
     # --- internals -------------------------------------------------------------------
 
     async def _accept(self, bar: Bar) -> None:
-        """New or duplicate bar for an unfinalised window: persist, announce if new."""
+        """New, duplicate or corrected bar for an unfinalised window: keep the latest
+        version, persist it, update price age; announce only the first time."""
         known = bar.ts in self._pending[bar.symbol]
         self._pending[bar.symbol][bar.ts] = bar
+        self._observe(bar.symbol, bar.ts + ONE_MINUTE)
         async with self._sessions() as session:
             await repo.upsert_bars(session, [bar])
         if not known:

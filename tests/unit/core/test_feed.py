@@ -516,3 +516,51 @@ def test_events_are_typed() -> None:
     assert SymbolFresh(symbol=BTC).payload() == {"symbol": BTC}
     assert FeedConnected().payload() == {}
     assert FeedDisconnected().payload() == {}
+
+
+# --- regressions from the PR #10 re-review ---------------------------------------
+
+
+async def test_rest_corrections_replace_pending_stream_values(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus, announced: list[BarClosed]
+) -> None:
+    # The verification only merged minutes the stream lacked; a REST correction for a
+    # minute the stream already delivered was ignored by the aggregate and the DB.
+    clock = Clock(T0 + M)
+    source = FakeSource([bar(0, 200)])  # REST says close 200
+    feed = make_feed(source, sessions, bus, clock)
+    await feed.on_bar(bar(0, 100))  # stream said close 100
+
+    clock.now = T0 + 5 * M + GRACE
+    await feed.tick()
+    await bus.drain()
+
+    (five,) = feed.history(BTC, "5m")
+    assert five.close == 200
+    async with sessions() as s:
+        (stored,) = await repo.get_bars(s, BTC, "1m", since=T0)
+    assert stored.close == 200
+    assert [e.timeframe for e in announced].count("1m") == 1  # no second 1m announcement
+
+
+async def test_recovered_bar_refreshes_price_age(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    # A bar recovered by verification was persisted and announced, but the symbol stayed
+    # stale because only stream input updated the price age.
+    clock = Clock(T0 + M)
+    source = BrokenLatest([bar(0), bar(4, 104)])  # latest() fails; history() works
+    feed = make_feed(source, sessions, bus, clock)
+    await feed.on_bar(bar(0))
+    await feed.tick()
+
+    clock.now = T0 + 2 * M + 2 * S
+    await feed.tick()
+    assert feed.is_stale(BTC)
+
+    clock.now = T0 + 5 * M + GRACE  # minute-4 bar ended 20 s ago (< 60 s)
+    await feed.tick()
+    await bus.drain()
+
+    assert not feed.is_stale(BTC)
+    assert "SymbolFresh" in await event_types(sessions)
