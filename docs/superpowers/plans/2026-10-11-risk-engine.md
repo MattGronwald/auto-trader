@@ -6,6 +6,8 @@
 
 **Architecture:** `risk/checks.py` holds pure functions over frozen inputs from `risk/types.py`. `risk/engine.py` gathers state from broker, feed view and journal under one lock, calls the pure checks, persists `risk_decisions`/`orders`, applies pause side effects, re-checks the control gate, and submits. `run core` hands the broker to the engine and snapshots equity every 60 s.
 
+> Update 2026-10-11 (PR #13 review round 2): `check()` and `exit()` now use separate locks (exits never wait for entries); see the spec §6. The plan below is kept as written.
+
 **Tech Stack:** Python 3.12, pydantic v2, SQLAlchemy 2 async + Alembic, pytest + hypothesis, uv.
 
 **Spec:** `docs/superpowers/specs/2026-10-11-risk-engine-design.md` (read it first; this plan argues from it).

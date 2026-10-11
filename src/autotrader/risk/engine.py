@@ -1,19 +1,25 @@
 """Risk Engine (SPEC §0.1, §4.5; spec 2026-10-11 §6). The only holder of the `Broker`.
 
-`check()` gathers state under one lock, runs the pure `check_entry`, persists the
+`check()` gathers state under the entry lock, runs the pure `check_entry`, persists the
 decision, applies a pause side effect on rejection, writes the order row, asks the
 control gate again right before submitting, then submits. `exit()` is
 reduce-only and ignores kill/pause. Any failure while gathering rejects (fail closed).
 
-Each locked section has ONE budget of `io_timeout_s`, measured from taking the lock and
+Two locks: entries serialise on one, exits on another, and an exit never waits for an
+entry (a stalled journal call inside `check()` cannot block a stop-out). That is safe
+because an entry that runs beside an exit still sees the position being exited and
+rejects or over-counts it (conservative), and a late IOC fill after a kill-flatten can
+happen with or without a shared lock (fills are broker-side); the Position Manager handles
+it (WP 1.5).
+
+Each locked section has ONE budget of `io_timeout_s`, measured from taking its lock and
 shared by its network/gate awaits only (gate.status, get_account, get_positions, each
 asset_rules and get_order, submit/close); each is wrapped in `_within`. Journal reads and
 writes (every `self._sessions()` block, `_write_snapshot`) run outside any `wait_for`, so
-a timeout never cancels a DB session mid-statement or mid-commit. A hung call inside one
-entry therefore delays an exit by at most ~1 x `io_timeout_s` plus local journal work. A
-step whose budget is already spent is not called: its timeout outcome applies, and a
-submit that was never attempted is `not_submitted`. `asyncio.CancelledError` is never
-caught.
+a timeout never cancels a DB session mid-statement or mid-commit; SQLite errors on a
+locked DB after `busy_timeout` (5 s) instead of hanging. A step whose budget is already
+spent is not called: its timeout outcome applies, and a submit that was never attempted
+is `not_submitted`. `asyncio.CancelledError` is never caught.
 """
 
 import asyncio
@@ -105,12 +111,13 @@ class RiskEngine:
         self._clock = clock
         self._io_timeout = io_timeout_s
         self._monotonic = monotonic  # the budget clock (injectable for tests)
-        self._lock = asyncio.Lock()
+        self._entry_lock = asyncio.Lock()  # check(): two entries never pass check 5 together
+        self._exit_lock = asyncio.Lock()  # exit(): never waits for an entry
 
     # --- entries ---------------------------------------------------------------------
 
     async def check(self, intent: EntryIntent) -> OrderResult:
-        async with self._lock:
+        async with self._entry_lock:
             deadline = self._monotonic() + self._io_timeout
             now = self._clock()
             try:
@@ -347,7 +354,7 @@ class RiskEngine:
     async def exit(self, request: ExitRequest) -> OrderResult:
         """Reduce-only full exit (G1). No gate check: kill and pause never block it.
         Carries no client_order_id because `Broker.close_position` takes none."""
-        async with self._lock:
+        async with self._exit_lock:
             deadline = self._monotonic() + self._io_timeout
             now = self._clock()
             try:

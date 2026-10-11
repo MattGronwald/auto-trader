@@ -119,13 +119,19 @@ fee-reduced quantity of G10 and precision mismatches. Partial exits are out of s
 
 ## 6. Engine flow (`risk/engine.py`)
 
-One `asyncio.Lock` serialises every entry and exit, from gathering to submit. Two entries
-can therefore never pass check 5 on the same state; together with the Cycle Runner's caps
-(G14) the limits are exact.
+**Two locks.** An entry lock serialises every `check()`, from gathering to submit, so two
+entries can never pass check 5 on the same state; together with the Cycle Runner's caps
+(G14) the limits are exact. A separate exit lock serialises every `exit()`, so two exits
+on one symbol cannot both sell. An exit never waits for an entry: a stalled journal call
+inside `check()` (outside the io budget by design) cannot block a stop-out. This is safe
+because an entry that runs beside an exit still sees the position being exited and
+rejects it or over-counts it (conservative), and a late IOC fill after a kill-flatten can
+happen with or without a shared lock (fills are broker-side), so the Position Manager
+handles it (WP 1.5). (Until the PR #13 round-2 review a single lock covered both.)
 
-**Time budget.** Because the lock is held across broker calls, each locked section has
+**Time budget.** Because each lock is held across broker calls, each locked section has
 **one** budget, `RiskEngine(io_timeout_s=10.0)` (`run core` passes the default), measured
-from taking the lock. Only the network/gate awaits draw on it: `gate.status`,
+from taking its lock. Only the network/gate awaits draw on it: `gate.status`,
 `get_account`, `get_positions`, each `asset_rules` and `get_order`, and the submit or
 `close_position`; each gets what is left (`wait_for(..., deadline − now)`). Journal reads
 and writes (every DB session, the peak snapshot write) run outside any `wait_for`, so a
@@ -135,9 +141,11 @@ the stage-specific outcome (any gather await → `state unavailable: TimeoutErro
 persisted; pre-submit gate → `not_submitted`; submit or `close_position` → `unknown`). A
 step whose budget is already spent is not called: the gate counts as unavailable
 (`not_submitted`), and a submit or close that was never attempted is `not_submitted`, not
-`unknown`, because nothing reached the broker. So an `exit()` waits for the lock at most
-~1 × `io_timeout_s` behind one in-flight entry, plus that entry's local journal work, never
-forever. `asyncio.CancelledError` is never caught. `snapshot_equity()` (lock-free) bounds
+`unknown`, because nothing reached the broker. So one hung broker call holds its lock
+(and delays the next entry, or the next exit) by at most ~1 × `io_timeout_s`. A journal
+call that stalls instead errors on SQLite after `busy_timeout` (5 s, pinned in
+`make_engine`); on Postgres `statement_timeout` / `command_timeout` follow in WP 1.6.
+`asyncio.CancelledError` is never caught. `snapshot_equity()` (lock-free) bounds
 its own broker calls with a separate budget. Broker-side request timeouts in
 `AlpacaBroker` remain WP 1.6.
 
@@ -249,7 +257,10 @@ If no snapshot exists at all, the engine takes one before checking.
   submit share one budget (a check with a slow gather and a hung submit ends after ~1
   budget; a budget spent before the gate or submit skips them → `not_submitted`, no
   broker order; same for an exit's close; budget assertions use an injected budget clock,
-  never wall time); slow journal work in the gather is never cancelled by the budget; an unpriced or
+  never wall time); slow journal work in the gather is never cancelled by the budget; round 2: a peak seen by a
+  check whose positions read then fails still bounds drawdown (also after restart), a
+  stalled journal read inside `check()` never blocks an `exit()`, concurrent entries stay
+  serialised and concurrent exits on one symbol sell once; an unpriced or
   stale held position rejects entries but not exits; a retried `unknown` exit never sells
   twice. `run core`: a hung snapshot never delays kill detection at the default interval;
   a dead snapshot task is logged and restarted.
