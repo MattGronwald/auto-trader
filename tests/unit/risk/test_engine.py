@@ -681,11 +681,15 @@ async def hang() -> NoReturn:
 
 class HangingAccount(SimBroker):
     entered: asyncio.Event | None = None
+    release: asyncio.Event | None = None  # set by the test: the call then times out
 
     async def get_account(self) -> Account:
         if self.entered is not None:
             self.entered.set()
-        await hang()
+        if self.release is None:
+            await hang()
+        await self.release.wait()
+        raise TimeoutError
 
 
 async def test_hung_entry_gather_cannot_block_an_exit(
@@ -693,23 +697,24 @@ async def test_hung_entry_gather_cannot_block_an_exit(
 ) -> None:
     broker = _sim(HangingAccount)
     assert isinstance(broker, HangingAccount)
-    broker.entered = asyncio.Event()
+    broker.entered, broker.release = asyncio.Event(), asyncio.Event()
     await _held_btc(broker)
-    engine = make_engine_(broker, sessions, gate, io_timeout_s=0.05, monotonic=Mono())
+    engine = make_engine_(broker, sessions, gate, monotonic=Mono())  # 10 s budget
     entry = asyncio.create_task(engine.check(intent(cycle_id)))
     try:
-        await broker.entered.wait()  # the entry holds the lock inside the hung call
+        await broker.entered.wait()  # the entry holds its lock inside the hung call
         exited = await asyncio.wait_for(engine.exit(ExitRequest(symbol=BTC, reason="stop")), 2)
         assert exited.decision.approved and exited.status == "new"
+        assert not entry.done()  # the exit did not wait for the entry at all
+        broker.release.set()  # now let the entry's broker call time out
         checked = await asyncio.wait_for(entry, 2)
     finally:
         entry.cancel()
         await asyncio.gather(entry, return_exceptions=True)
     assert checked.decision.reasons == ("state unavailable: TimeoutError",)
-    # The exit no longer waits for the entry's timeout at all (separate locks).
-    assert [(d.kind, d.approved) for d in await decisions(sessions)] == [
-        ("exit", True),
+    assert sorted((d.kind, d.approved) for d in await decisions(sessions)) == [
         ("entry", False),
+        ("exit", True),
     ]
     assert [(o.side, o.status) for o in await orders(sessions)] == [("sell", "new")]
 
@@ -1109,12 +1114,14 @@ async def test_concurrent_entries_are_still_serialised(
     sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
 ) -> None:
     engine = make_engine_(sim, sessions, gate)
-    first, second = await asyncio.gather(
+    results = await asyncio.gather(
         engine.check(intent(cycle_id)), engine.check(intent(await new_cycle(sessions)))
     )
-    assert first.status == "new"
-    assert not second.decision.approved
-    assert "already has a position or open entry" in second.decision.reasons[0]
+    # whichever ran first (no order assumed): one submitted, the other saw it
+    (won,) = [r for r in results if r.decision.approved]
+    (lost,) = [r for r in results if not r.decision.approved]
+    assert won.status == "new"
+    assert "already has a position or open entry" in lost.decision.reasons[0]
     assert [o.status for o in await orders(sessions)] == ["new"]
 
 
