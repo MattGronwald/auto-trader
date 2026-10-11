@@ -335,6 +335,50 @@ async def test_equity_peak_seen_by_a_rejected_check_still_bounds_drawdown(
     assert await orders(sessions) == []
 
 
+class ParkingPositions(EquityBroker):
+    """The first armed `get_positions` parks until the test releases it; later calls
+    (e.g. a concurrent snapshot's) pass straight through."""
+
+    parked: asyncio.Event | None = None
+    release: asyncio.Event | None = None
+
+    async def get_positions(self) -> list[Position]:
+        if self.parked is not None and self.release is not None and not self.parked.is_set():
+            self.parked.set()
+            await self.release.wait()
+        return await super().get_positions()
+
+
+async def test_peak_committed_by_a_concurrent_snapshot_bounds_the_parked_check(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    """Codex round 3: the check read HWM 1000 early, then waited on positions while the
+    snapshot task committed a 1200 peak; equity fell back before the check resumed."""
+    broker = _sim(ParkingPositions)
+    assert isinstance(broker, ParkingPositions)
+    clock = Clock(NOW)
+    engine = make_engine_(broker, sessions, gate, clock=clock, monotonic=Mono())
+    await engine.snapshot_equity()  # baseline and HWM 1000
+    broker.parked, broker.release = asyncio.Event(), asyncio.Event()
+    clock.now = NOW + timedelta(seconds=10)
+    entry = asyncio.create_task(engine.check(intent(cycle_id)))  # reads equity/HWM 1000
+    try:
+        await asyncio.wait_for(broker.parked.wait(), 2)  # parked in get_positions
+        broker.equity = D("1200")
+        clock.now = NOW + timedelta(seconds=20)
+        await engine.snapshot_equity()  # commits the 1200 peak meanwhile
+        broker.equity = D("1000")  # and it falls back before the check resumes
+        broker.release.set()
+        result = await asyncio.wait_for(entry, 2)
+    finally:
+        entry.cancel()
+        await asyncio.gather(entry, return_exceptions=True)
+    assert not result.decision.approved and "drawdown" in result.decision.reasons[0]
+    async with sessions() as s:
+        assert await repo.get_control(s, PAUSED_KEY) is True
+    assert await orders(sessions) == []
+
+
 async def test_snapshot_records_the_peak_even_when_positions_fail(
     sessions: async_sessionmaker[AsyncSession], gate: ControlGate
 ) -> None:
