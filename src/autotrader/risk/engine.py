@@ -190,7 +190,6 @@ class RiskEngine:
             stored_hwm = await repo.max_hwm(session)
         if stored_hwm is None or account.equity > stored_hwm:
             await self._write_snapshot(now, account.equity, account.cash, None)
-        hwm = account.equity if stored_hwm is None else max(stored_hwm, account.equity)
         held = await self._held_positions(deadline)
         rules = await self._within(deadline, lambda: self._broker.asset_rules(symbol))
         fees = self._broker.fee_schedule()
@@ -200,7 +199,11 @@ class RiskEngine:
                 session, day_start(now, self._tz), inclusive=True
             )
             baseline = await repo.day_start_equity(session, day_start(now, self._tz))
+            # Re-read: the snapshot task may have committed a higher peak while this check
+            # awaited positions/rules; the decision uses the max of both durable reads.
+            late_hwm = await repo.max_hwm(session)
             trades_n, wins = await repo.strategy_trade_stats(session, self._strategy_id)
+        hwm = max(h for h in (stored_hwm, late_hwm, account.equity) if h is not None)
         portfolio = PortfolioState(
             equity=account.equity,
             cash=account.cash,

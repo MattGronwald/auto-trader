@@ -215,7 +215,11 @@ writes an "account observation" snapshot **immediately after the account read** 
 the positions, asset-rules and journal reads, so their failure cannot lose it — with
 exposure `NULL` (unknown). It is written also when the check then rejects or fails: a
 spike between two periodic snapshots that falls back before the next one still bounds
-drawdown, including after a restart. `snapshot_equity()` likewise records the account
+drawdown, including after a restart. The early `max_hwm` read is not trusted alone: the
+check re-reads `max_hwm` in its later journal session (with the counts, baseline and
+stats) and decides with `max(early stored HWM, late stored HWM, live equity)`, so a peak
+the snapshot task commits while the check awaits positions or rules still bounds
+drawdown. `snapshot_equity()` likewise records the account
 even when the positions read after it fails (exposure `NULL`, the error is still raised
 and logged). Snapshots are append-only; the HWM is the max over all rows.
 
