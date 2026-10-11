@@ -1,6 +1,5 @@
 """Risk Engine inputs and outputs (SPEC §4.5, spec 2026-10-11). Frozen; exact Decimals."""
 
-from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -84,6 +83,3 @@ class RiskDecision(_Frozen):
     qty: Dec | None = None
     order: BrokerOrder | None = None
     pause: Pause | None = None  # side effect the engine must apply on rejection
-
-
-ZERO = Decimal(0)
