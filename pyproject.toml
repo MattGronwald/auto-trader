@@ -7,6 +7,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "aiosqlite>=0.22.1",
     "alembic>=1.20.0",
+    "alpaca-py>=0.44.0",
     "pydantic>=2.14.0",
     "pydantic-settings>=2.15.0",
     "pyyaml>=6.0.3",
@@ -65,6 +66,11 @@ addopts = "-ra --strict-markers -m 'not smoke'"
 asyncio_mode = "auto"
 markers = [
     "smoke: hits real external APIs (Alpaca, Anthropic); opt-in via `-m smoke`",
+]
+filterwarnings = [
+    "error",  # warnings fail the run (locally and in CI)
+    # alpaca-py 0.44 imports websockets.legacy; third-party, nothing to fix on our side.
+    "ignore:websockets.legacy is deprecated:DeprecationWarning",
 ]
 
 [tool.coverage.run]
