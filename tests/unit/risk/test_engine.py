@@ -1,10 +1,12 @@
 """RiskEngine on SimBroker, a migrated SQLite journal and the real ControlGate."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 from sqlalchemy import select
@@ -139,6 +141,7 @@ def make_engine_(
     view: FakeView | None = None,
     clock: Clock | None = None,
     tz: str = "UTC",
+    io_timeout_s: float = 10.0,
 ) -> RiskEngine:
     return RiskEngine(
         broker,
@@ -150,6 +153,7 @@ def make_engine_(
         sessions=sessions,
         trading_day_tz=tz,
         clock=clock or Clock(NOW),
+        io_timeout_s=io_timeout_s,
     )
 
 
@@ -627,3 +631,115 @@ async def test_snapshot_tracks_hwm_and_daily_pnl(
     assert [r.hwm for r in rows] == [D("1000"), rows[1].equity, rows[1].equity]
     assert rows[2].daily_pnl == rows[2].equity - D("1000")
     assert rows[2].exposure == D("100.0")  # marked at the feed view's last price (100)
+
+
+# --- time budget: a hung call must not hold the lock forever ---------------------------
+
+
+async def hang() -> NoReturn:
+    await asyncio.Event().wait()  # never set: a stuck REST call
+    raise AssertionError("unreachable")
+
+
+class HangingAccount(SimBroker):
+    entered: asyncio.Event | None = None
+
+    async def get_account(self) -> Account:
+        if self.entered is not None:
+            self.entered.set()
+        await hang()
+
+
+async def test_hung_entry_gather_cannot_block_an_exit(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    broker = _sim(HangingAccount)
+    assert isinstance(broker, HangingAccount)
+    broker.entered = asyncio.Event()
+    await _held_btc(broker)
+    engine = make_engine_(broker, sessions, gate, io_timeout_s=0.05)
+    entry = asyncio.create_task(engine.check(intent(cycle_id)))
+    try:
+        await broker.entered.wait()  # the entry holds the lock inside the hung call
+        exited = await asyncio.wait_for(engine.exit(ExitRequest(symbol=BTC, reason="stop")), 2)
+        assert exited.decision.approved and exited.status == "new"
+        checked = await asyncio.wait_for(entry, 2)
+    finally:
+        entry.cancel()
+        await asyncio.gather(entry, return_exceptions=True)
+    assert checked.decision.reasons == ("state unavailable: TimeoutError",)
+    assert [(d.kind, d.approved) for d in await decisions(sessions)] == [
+        ("entry", False),
+        ("exit", True),
+    ]
+    assert [(o.side, o.status) for o in await orders(sessions)] == [("sell", "new")]
+
+
+class HangingSubmit(SimBroker):
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        await hang()
+
+
+async def test_hung_entry_submit_is_unknown(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    engine = make_engine_(_sim(HangingSubmit), sessions, gate, io_timeout_s=0.05)
+    result = await asyncio.wait_for(engine.check(intent(cycle_id)), 2)
+    assert result.decision.approved and result.status == "unknown"
+    (row,) = await orders(sessions)
+    assert (row.status, row.broker_order_id) == ("unknown", None)
+
+
+class StuckGate:
+    """Allows the gathering call; the pre-submit call hangs or raises."""
+
+    def __init__(self, fail: str) -> None:
+        self.fail = fail
+        self.calls = 0
+
+    async def status(self, now: datetime | None = None) -> ControlStatus:
+        self.calls += 1
+        if self.calls > 1:
+            if self.fail == "hang":
+                await hang()
+            raise ConnectionError("control state unreadable")
+        return ControlStatus(killed=False, reasons=())
+
+
+@pytest.mark.parametrize("fail", ["hang", "raise"])
+async def test_unanswered_pre_submit_gate_means_not_submitted(
+    fail: str, sim: SimBroker, sessions: async_sessionmaker[AsyncSession], cycle_id: int
+) -> None:
+    engine = make_engine_(sim, sessions, StuckGate(fail), io_timeout_s=0.05)
+    result = await asyncio.wait_for(engine.check(intent(cycle_id)), 2)
+    assert result.status == "not_submitted"
+    (row,) = await orders(sessions)
+    assert (row.status, row.broker_order_id) == ("not_submitted", None)
+
+
+class HangingPositions(SimBroker):
+    async def get_positions(self) -> list[Position]:
+        await hang()
+
+
+class HangingClose(SimBroker):
+    async def close_position(self, symbol: str) -> OrderAck:
+        await hang()
+
+
+async def test_hung_exit_state_rejects_and_hung_close_is_unknown(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    request = ExitRequest(symbol=BTC, reason="stop")
+    stuck = make_engine_(_sim(HangingPositions), sessions, gate, io_timeout_s=0.05)
+    rejected = await asyncio.wait_for(stuck.exit(request), 2)
+    assert rejected.decision.reasons == ("state unavailable: TimeoutError",)
+    assert await orders(sessions) == []
+
+    broker = _sim(HangingClose)
+    await _held_btc(broker)
+    closing = make_engine_(broker, sessions, gate, io_timeout_s=0.05)
+    result = await asyncio.wait_for(closing.exit(request), 2)
+    assert result.decision.approved and result.status == "unknown"
+    (row,) = await orders(sessions)
+    assert (row.side, row.status, row.broker_order_id) == ("sell", "unknown", None)
