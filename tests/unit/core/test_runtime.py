@@ -14,7 +14,7 @@ from autotrader.broker.base import Account, BrokerError, FeeSchedule
 from autotrader.core.config import AppConfig, Settings, load_config, load_profile
 from autotrader.core.feed import Latest
 from autotrader.core.logging import configure_logging
-from autotrader.core.runtime import run_core
+from autotrader.core.runtime import _snapshot_loop, run_core
 from autotrader.core.types import Bar, Quote
 from autotrader.journal import models as m
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
@@ -138,7 +138,6 @@ async def test_run_core_persists_bars_and_responds_to_kill_file(cfg: AppConfig) 
             stop=stop,
             tick_s=0.01,
             snapshot_s=0.01,
-            snapshot_timeout_s=5,  # explicit: a derived 5 ms budget made this test flaky in CI
         )
     )
     try:
@@ -212,50 +211,44 @@ async def test_broker_connect_failure_aborts_startup(cfg: AppConfig) -> None:
         )
 
 
-async def test_hung_equity_snapshot_does_not_stall_the_loop(cfg: AppConfig) -> None:
+class FlakySnapshots:
+    """Times out (the engine's own budget), then raises, then succeeds."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def snapshot_equity(self) -> None:
+        self.calls += 1
+        if self.calls == 1:
+            raise TimeoutError
+        if self.calls == 2:
+            raise ConnectionError("broker down")
+
+
+async def test_snapshot_loop_logs_failures_and_keeps_going() -> None:
     buf = io.StringIO()
     configure_logging(stream=buf)
-    stop = asyncio.Event()
-    broker = HangingSnapshotBroker()
-
-    async def connect(_: Settings) -> Any:
-        return broker
-
-    task = asyncio.create_task(
-        run_core(
-            cfg,
-            Settings(_env_file=None),
-            load_profile(cfg.strategy),
-            "yaml",
-            source=StreamingSource(),
-            connect_broker=connect,
-            stop=stop,
-            tick_s=0.01,
-            snapshot_s=0.05,
-            snapshot_timeout_s=0.05,
-        )
-    )
+    loop_task = asyncio.create_task(_snapshot_loop(FlakySnapshots(), 0.01))
     try:
-        await _wait_for(lambda: any(ln["event"] == "core.started" for ln in _log_lines(buf)))
-        cfg.control.kill_file.parent.mkdir(parents=True, exist_ok=True)
-        cfg.control.kill_file.touch()
-        await _wait_for(lambda: any(ln["event"] == "core.kill_detected" for ln in _log_lines(buf)))
-        # the timed-out attempt is logged and the snapshot task keeps going
         await _wait_for(
-            lambda: sum(ln["event"] == "risk.snapshot_failed" for ln in _log_lines(buf)) >= 2
+            lambda: any(ln["event"] == "risk.snapshot_written" for ln in _log_lines(buf))
         )
-        failed = [ln for ln in _log_lines(buf) if ln["event"] == "risk.snapshot_failed"]
-        assert all(ln["timeout"] is True for ln in failed)
     finally:
-        stop.set()
-        await asyncio.wait_for(task, timeout=5)
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+    events = [ln for ln in _log_lines(buf) if ln["event"].startswith("risk.snapshot")]
+    assert [(ln["event"], ln.get("timeout")) for ln in events[:3]] == [
+        ("risk.snapshot_failed", True),
+        ("risk.snapshot_failed", None),
+        ("risk.snapshot_written", None),
+    ]
 
 
 async def test_hung_snapshot_at_the_default_interval_never_delays_kill_detection(
     cfg: AppConfig,
 ) -> None:
-    """Default snapshot_s (60 s, so a 30 s attempt budget): the core loop must not wait
-    for a snapshot at all, only the background snapshot task does."""
+    """Default snapshot_s (60 s); the snapshot hangs inside the engine's own 10 s budget.
+    The core loop never waits for a snapshot, only the background snapshot task does."""
     buf = io.StringIO()
     configure_logging(stream=buf)
     stop = asyncio.Event()
@@ -325,7 +318,6 @@ async def test_dead_snapshot_task_is_logged_and_restarted(cfg: AppConfig) -> Non
             connect_broker=connect,
             stop=stop,
             tick_s=0.01,
-            snapshot_timeout_s=5,
         )
     )
     try:
