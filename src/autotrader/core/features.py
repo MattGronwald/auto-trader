@@ -30,3 +30,7 @@ SIGNAL_FEATURES = frozenset(
 
 # Hypothesis evidence available to `learning.promote_if` (SPEC §7 `hypotheses`, §8.2).
 EVIDENCE_FIELDS = frozenset({"trades_n", "win_rate", "avg_r", "p_value", "delta_expectancy_r"})
+
+# Longest indicator lookback in bars (EMA 50, SPEC §4.1). Drives the backfill depth (G5);
+# keep in sync with the indicator set (WP 1.1).
+MAX_INDICATOR_LOOKBACK = 50
