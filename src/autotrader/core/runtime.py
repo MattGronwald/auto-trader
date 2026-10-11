@@ -5,13 +5,13 @@ the Cycle Runner (WP 1.4).
 
 The broker is connected here and handed to the `RiskEngine`, which is its only holder from
 then on (SPEC §0.1); `run core` also snapshots equity every 60 s for the daily-loss and
-drawdown checks. Nothing calls `check()`/`exit()` until the Cycle Runner (WP 1.4) and
+drawdown checks, in one supervised background task so a hung snapshot can never delay
+kill detection or feed ticks. Nothing calls `check()`/`exit()` until the Cycle Runner (WP 1.4) and
 Position Manager (WP 1.5).
 """
 
 import asyncio
 import contextlib
-import math
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -49,6 +49,7 @@ async def run_core(
     sessions = make_sessionmaker(engine)
     bus = EventBus(sessions)
     stream_task: asyncio.Task[None] | None = None
+    snapshot_task: asyncio.Task[None] | None = None
     try:
         async with sessions() as session:
             strategy = await repo.register_strategy(session, profile, profile_yaml)
@@ -99,22 +100,25 @@ async def run_core(
         )
 
         killed: bool | None = None
-        snapshot_timeout = snapshot_s / 2 if snapshot_timeout_s is None else snapshot_timeout_s
-        loop = asyncio.get_running_loop()
-        last_snapshot = -math.inf  # the first tick snapshots
+        snapshot_timeout = (
+            min(snapshot_s / 2, 30.0) if snapshot_timeout_s is None else snapshot_timeout_s
+        )
+
+        def start_snapshots() -> asyncio.Task[None]:
+            return asyncio.create_task(
+                _snapshot_loop(risk, snapshot_s, snapshot_timeout), name="equity-snapshots"
+            )
+
+        snapshot_task = start_snapshots()
         while not stop.is_set():
             if stream_task.done():
                 stream_task.result()  # re-raise the stream's failure
                 raise RuntimeError("market data stream ended unexpectedly")
+            if snapshot_task.done():  # it never returns; only an escaped BaseException ends it
+                error = None if snapshot_task.cancelled() else snapshot_task.exception()
+                log.error("risk.snapshot_task_died", error=repr(error))
+                snapshot_task = start_snapshots()
             await feed.tick()
-            if loop.time() - last_snapshot >= snapshot_s:
-                try:
-                    await asyncio.wait_for(risk.snapshot_equity(), timeout=snapshot_timeout)
-                except TimeoutError:  # a hung REST call must not stall kill detection
-                    log.error("risk.snapshot_failed", timeout=True)
-                except Exception:
-                    log.exception("risk.snapshot_failed")
-                last_snapshot = loop.time()
             status = await gate.status()
             if status.killed != killed:
                 if status.killed:
@@ -126,12 +130,34 @@ async def run_core(
                 await asyncio.wait_for(stop.wait(), timeout=tick_s)
         log.info("core.stopping")
     finally:
+        if snapshot_task is not None:
+            snapshot_task.cancel()
+            await asyncio.gather(snapshot_task, return_exceptions=True)
         await source.stop()
         if stream_task is not None and not stream_task.done():
             stream_task.cancel()
             await asyncio.gather(stream_task, return_exceptions=True)
         await bus.close()
         await engine.dispose()
+
+
+async def _snapshot_loop(risk: RiskEngine, interval_s: float, timeout_s: float) -> None:
+    """Snapshot equity now, then every `interval_s`. Each attempt is bounded by
+    `timeout_s`; a failure or timeout is logged and the loop carries on. Runs beside the
+    core loop, so a hung REST call only delays the next snapshot, never kill detection."""
+    loop = asyncio.get_running_loop()
+    next_at = loop.time()
+    while True:
+        try:
+            await asyncio.wait_for(risk.snapshot_equity(), timeout=timeout_s)
+        except TimeoutError:
+            log.error("risk.snapshot_failed", timeout=True)
+        except Exception:
+            log.exception("risk.snapshot_failed")
+        else:
+            log.info("risk.snapshot_written")
+        next_at = max(next_at + interval_s, loop.time())
+        await asyncio.sleep(next_at - loop.time())
 
 
 async def _check_broker(connect_broker: BrokerConnect, settings: Settings) -> Any:
