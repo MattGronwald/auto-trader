@@ -373,3 +373,120 @@ async def test_strategy_trade_stats_counts_closed_trades_of_that_strategy(
     await session.commit()
     assert await repo.strategy_trade_stats(session, cycle.strategy_id) == (3, 2)
     assert await repo.strategy_trade_stats(session, cycle.strategy_id + 1) == (0, 0)
+
+
+# --- cycles (WP 1.4) -----------------------------------------------------------------
+
+
+async def _strategy_id(session: AsyncSession) -> int:
+    return (await repo.register_strategy(session, load_profile(PROFILE_PATH), "y", now=T0)).id
+
+
+async def test_append_event_without_commit_is_rolled_back(session: AsyncSession) -> None:
+    await repo.append_event(session, "Ping", {"n": 1}, commit=False)
+    await session.rollback()
+    assert await repo.events_after(session, 0) == []
+
+
+async def test_insert_cycle_flushes_an_id_but_does_not_commit(session: AsyncSession) -> None:
+    sid = await _strategy_id(session)
+    row = await repo.insert_cycle(
+        session,
+        strategy_id=sid,
+        symbol="BTC/USD",
+        rule_id="r1",
+        signal_features={"close": 1.0, "vol_z": None, "_timeframe": "5m"},
+        state="NEW",
+        now=T0,
+    )
+    assert row.id is not None
+    await session.rollback()
+    assert await session.scalar(select(func.count()).select_from(m.Cycle)) == 0
+
+
+async def test_transition_cycle_is_guarded_and_sets_terminal_fields(
+    session: AsyncSession,
+) -> None:
+    sid = await _strategy_id(session)
+    row = await repo.insert_cycle(
+        session,
+        strategy_id=sid,
+        symbol="BTC/USD",
+        rule_id="r1",
+        signal_features={},
+        state="NEW",
+        now=T0,
+    )
+    await session.commit()
+
+    await repo.transition_cycle(session, row.id, from_state="NEW", to_state="ENRICHING", now=T0)
+    with pytest.raises(repo.StaleTransition):
+        await repo.transition_cycle(session, row.id, from_state="NEW", to_state="ENRICHING", now=T0)
+    done = T0 + timedelta(seconds=1)
+    await repo.transition_cycle(
+        session,
+        row.id,
+        from_state="ENRICHING",
+        to_state="EXPIRED",
+        now=done,
+        reason="symbol stale",
+    )
+    await session.commit()
+
+    got = await session.get(m.Cycle, row.id, populate_existing=True)
+    assert got is not None
+    assert (got.state, got.outcome, got.reject_reason, got.finished_at) == (
+        "EXPIRED",
+        "EXPIRED",
+        "symbol stale",
+        done,
+    )
+    assert await repo.cycle_state(session, row.id) == "EXPIRED"
+    assert await repo.cycle_state(session, row.id + 99) is None
+
+
+async def test_non_terminal_transition_leaves_outcome_empty(session: AsyncSession) -> None:
+    sid = await _strategy_id(session)
+    row = await repo.insert_cycle(
+        session,
+        strategy_id=sid,
+        symbol="BTC/USD",
+        rule_id="r1",
+        signal_features={},
+        state="NEW",
+        now=T0,
+    )
+    await repo.transition_cycle(
+        session, row.id, from_state="NEW", to_state="ENRICHING", now=T0, reason="ignored"
+    )
+    await session.commit()
+    got = await session.get(m.Cycle, row.id, populate_existing=True)
+    assert got is not None
+    assert (got.outcome, got.finished_at, got.reject_reason) == (None, None, None)
+
+
+async def test_open_cycles_and_order_lookup(session: AsyncSession) -> None:
+    sid = await _strategy_id(session)
+    kw: dict[str, Any] = dict(strategy_id=sid, rule_id="r1", signal_features={}, now=T0)
+    open_ = await repo.insert_cycle(session, symbol="BTC/USD", state="RISK_CHECK", **kw)
+    await repo.insert_cycle(session, symbol="ETH/USD", state="ERROR", **kw)
+    await session.commit()
+
+    assert [c.id for c in await repo.open_cycles(session)] == [open_.id]
+    assert not await repo.has_order_for_cycle(session, open_.id)
+    await repo.insert_order(
+        session,
+        cycle_id=open_.id,
+        client_order_id=f"at-c{open_.id}-e",
+        symbol="BTC/USD",
+        mode="paper",
+        type_="limit",
+        side="buy",
+        qty=Decimal("1"),
+        limit_price=Decimal("100"),
+        stop_price=None,
+        tp_price=None,
+        status="pending",
+        now=T0,
+    )
+    assert await repo.has_order_for_cycle(session, open_.id)

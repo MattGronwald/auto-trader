@@ -145,6 +145,7 @@ States: `NEW → ENRICHING → ANALYZING → DECIDING → RISK_CHECK → SUBMITT
 - One cycle per `CandidateSignal`. Every state transition is persisted with timestamp and payload (full audit trail).
 - Timeouts per state (e.g. LLM call > 30 s → `ERROR`, logged, cycle discarded; no retry storms).
 - Budget check before each LLM call: if daily LLM budget exceeded → cycle `EXPIRED` with reason `budget`.
+- *Note 2026-10-11 (WP 1.4, PLAN D15):* a stub/agent skip ends the cycle `REJECTED` (no SKIPPED state). `RISK_CHECK` and `SUBMITTED` have no timeout; only a bounded forced shutdown cancels `check()`, which is safe because the order row is written before submit. After submission only proven outcomes are mapped (`filled` → `FILLED`; `rejected`/`not_submitted` → `REJECTED`); `new`/`unknown`/`canceled` stay `SUBMITTED` until reconciliation (WP 1.5), which will set `EXPIRED` only on a filled qty of 0 and `FILLED` on any fill. Orders are reconciled by order row, not by cycle state.
 
 ### 4.4 Agents
 All agents share a common runner: build prompt from template + context → call Anthropic API with tool-use/structured output → validate with pydantic → persist request/response/tokens/cost → return typed object. No agent has side effects on the broker or DB beyond its own log.
