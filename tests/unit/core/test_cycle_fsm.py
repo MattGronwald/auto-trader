@@ -7,6 +7,7 @@ import pytest
 
 from autotrader.core.cycle import (
     RECONCILIATION_ONLY_EDGES,
+    RUNNER_EDGES,
     TERMINAL,
     CycleState,
     CycleTransitioned,
@@ -67,6 +68,25 @@ def test_reconciliation_may_take_its_own_edges_and_the_shared_one() -> None:
     assert {(S.SUBMITTED, S.EXPIRED), (S.RISK_CHECK, S.FILLED)} == RECONCILIATION_ONLY_EDGES
     for from_, to in [*RECONCILIATION_ONLY_EDGES, (S.SUBMITTED, S.FILLED)]:
         check_edge(from_, to, reconciliation=True)
+
+
+def _accepted(*, reconciliation: bool) -> set[tuple[CycleState | None, CycleState]]:
+    accepted: set[tuple[CycleState | None, CycleState]] = set()
+    for from_ in (None, *S):
+        for to in S:
+            try:
+                check_edge(from_, to, reconciliation=reconciliation)
+            except ValueError:
+                continue
+            accepted.add((from_, to))
+    return accepted
+
+
+def test_check_edge_accepts_exactly_the_declared_edges() -> None:
+    assert not RUNNER_EDGES & RECONCILIATION_ONLY_EDGES
+    runner: set[tuple[CycleState | None, CycleState]] = {*RUNNER_EDGES, (None, S.NEW)}
+    assert _accepted(reconciliation=False) == runner
+    assert _accepted(reconciliation=True) == runner | RECONCILIATION_ONLY_EDGES
 
 
 @pytest.mark.parametrize(

@@ -142,8 +142,12 @@ class EventBus:
 
     def _unit_done(self, unit: asyncio.Task[DomainEvent | None]) -> None:
         self._units.discard(unit)
-        if not unit.cancelled():
-            unit.exception()  # retrieved here; a caller that is still waiting re-raises it
+        if unit.cancelled():
+            return
+        exc = unit.exception()  # retrieved here; a caller that is still waiting re-raises it
+        if exc is not None and not isinstance(exc, CommitUncertain):  # that one is logged
+            # The caller may be gone (cancelled): without this the failure would vanish.
+            log.error("bus.unit_failed", error=repr(exc))
 
     async def _unit(
         self, build: Build, verify: Verify, on_uncertain: OnUncertain | None
@@ -166,6 +170,12 @@ class EventBus:
                 try:
                     await session.commit()
                 except Exception as e:
+                    # On SQLite a failed COMMIT may still hold a lock that blocks the
+                    # read-back in the fresh session below.
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        log.exception("bus.rollback_failed", event_type=event_type)
                     if not await self._confirmed(verify, event):
                         error = CommitUncertain(f"{event_type} may or may not be committed")
                         log.error(

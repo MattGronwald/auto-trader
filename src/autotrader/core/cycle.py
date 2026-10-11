@@ -227,6 +227,7 @@ class CycleRunner:
         self._checks: dict[int, asyncio.Future[OrderResult]] = {}  # cycles inside check()
         self._closing = False
         self._suspended = False
+        self._admitting_started = False
 
     @property
     def admission_suspended(self) -> bool:
@@ -265,6 +266,7 @@ class CycleRunner:
         log.info("cycle.dropped", symbol=event.symbol, rule_id=event.rule_id, reason=reason)
 
     async def _admit(self, event: CandidateSignal) -> None:
+        self._admitting_started = True
         if (reason := self._blocked()) is not None:
             self._drop(event, reason)
             return
@@ -326,7 +328,7 @@ class CycleRunner:
                 return
             cycle_id = published.cycle_id
             if self._closing:  # committed after close() began: recover() ends it
-                log.warning("cycle.not_started", cycle_id=cycle_id, reason="shutting down")
+                self._not_started(cycle_id)
                 return None
             task = asyncio.create_task(self._run(cycle_id, event), name=f"cycle-{cycle_id}")
             self._tasks[cycle_id] = task
@@ -342,7 +344,15 @@ class CycleRunner:
     # --- recovery --------------------------------------------------------------------
 
     async def recover(self) -> None:
-        """Startup: end cycles that provably sent nothing; leave the rest to WP 1.5."""
+        """Startup: end cycles that provably sent nothing; leave the rest to WP 1.5.
+
+        Must run before the first admission (`RuntimeError` otherwise): run later, it could
+        move a live cycle's RISK_CHECK to ERROR before `check()` inserts its order row.
+        Fails closed: the first failed write aborts and raises; the caller must then not
+        subscribe the runner.
+        """
+        if self._admitting_started or self._tasks:
+            raise RuntimeError("recover() must run before admission")
         async with self._sessions() as session:
             rows = await repo.open_cycles(session)
             with_order = {r.id for r in rows if await repo.has_order_for_cycle(session, r.id)}
@@ -500,11 +510,18 @@ class CycleRunner:
             confidence=decision.confidence,
             size_fraction=decision.size_fraction,
         )
+        if self._closing:  # a step that swallowed its cancellation must not reach check()
+            self._not_started(cur.cycle_id)
+            return None  # stays DECIDING: recover() ends it
         await self._advance(cur, S.RISK_CHECK, details=intent.model_dump(mode="json"))
         if signal_is_stale(candidate.bar_ts, candidate.timeframe, self._clock()):
             await self._advance(cur, S.EXPIRED, reason="signal stale")
             return None
         return intent
+
+    @staticmethod
+    def _not_started(cycle_id: int) -> None:
+        log.warning("cycle.not_started", cycle_id=cycle_id, reason="shutting down")
 
     async def _enrich(self, candidate: CandidateSignal) -> CycleSnapshot | str:
         """The snapshot, or the reason the cycle expires."""
@@ -538,6 +555,9 @@ class CycleRunner:
 
     async def _risk_check(self, cur: _Cursor, intent: EntryIntent) -> None:
         """RISK_CHECK onwards. `check()` once; after it, no fallback ERROR write (§9)."""
+        if self._closing:  # no order row exists yet: recover() ends RISK_CHECK as ERROR
+            self._not_started(cur.cycle_id)
+            return
         check = asyncio.ensure_future(self._risk.check(intent))
         check.add_done_callback(_consume)
         self._checks[cur.cycle_id] = check

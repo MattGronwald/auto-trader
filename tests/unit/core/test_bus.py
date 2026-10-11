@@ -683,3 +683,55 @@ async def test_close_is_bounded_and_reports_what_it_abandons(
         await asyncio.wait_for(bus.publish_tx(note_build("b"), note_visible), timeout=5)
     hold.set()  # clean up: let the abandoned unit finish
     await unit
+
+
+async def test_unit_failure_with_a_gone_caller_is_logged(hbus: EventBus) -> None:
+    hold, entered = asyncio.Event(), asyncio.Event()
+    with capture_logs() as logs:
+        caller = asyncio.create_task(
+            hbus.publish_tx(note_build("a", hold=hold, entered=entered, fail=True), note_visible)
+        )
+        await entered.wait()
+        caller.cancel()
+        hold.set()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        await hbus.close()  # waits for the unit; its done-callback runs first
+    (failed,) = [e for e in logs if e["event"] == "bus.unit_failed"]
+    assert failed["log_level"] == "error"
+    assert "build failed" in failed["error"]
+
+
+async def test_commit_error_rolls_back_before_the_read_back(
+    hbus: EventBus, hook: CommitHook, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    real_rollback = AsyncSession.rollback
+
+    async def spy_rollback(self: AsyncSession) -> None:
+        order.append("rollback")
+        await real_rollback(self)
+
+    async def spy_verify(session: AsyncSession, event: DomainEvent) -> bool:
+        order.append("verify")
+        return await note_visible(session, event)
+
+    monkeypatch.setattr(AsyncSession, "rollback", spy_rollback)
+    hook.fail_after = 1  # committed, acknowledgement lost
+    out = await hbus.publish_tx(note_build("a"), spy_verify)
+    assert isinstance(out, Note)
+    assert order == ["rollback", "verify"]
+
+
+async def test_a_failing_rollback_after_a_commit_error_is_logged_and_the_read_back_still_runs(
+    hbus: EventBus, hook: CommitHook, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def broken_rollback(self: AsyncSession) -> None:
+        raise RuntimeError("rollback failed")
+
+    monkeypatch.setattr(AsyncSession, "rollback", broken_rollback)
+    hook.fail_after = 1
+    with capture_logs() as logs:
+        out = await hbus.publish_tx(note_build("a"), note_visible)
+    assert isinstance(out, Note)
+    assert any(e["event"] == "bus.rollback_failed" for e in logs)

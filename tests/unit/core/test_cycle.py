@@ -18,7 +18,7 @@ from structlog.testing import capture_logs
 from autotrader.agents.stub import StubBuy, StubSkip
 from autotrader.core.bus import CommitUncertain, EventBus
 from autotrader.core.config import StrategyProfile, parse_profile
-from autotrader.core.cycle import CycleRunner, CycleSnapshot, Decision
+from autotrader.core.cycle import CycleRunner, CycleSnapshot, CycleState, Decision, _Cursor
 from autotrader.core.kill import ControlGate, ControlStatus, write_kill_file
 from autotrader.core.scanner import CandidateSignal
 from autotrader.core.types import Bar, Quote
@@ -991,3 +991,79 @@ async def test_close_does_not_wait_for_an_admission_and_that_cycle_never_starts(
     assert row.state == "NEW" and risk.calls == []
     await make_runner(sessions, bus, gate, FakeRisk(), strategy_id).recover()
     assert (await cycle_row(sessions, row.id)).state == "ERROR"
+
+
+async def test_a_step_that_swallows_cancellation_never_starts_check_after_close(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    deciding, swallowed, proceed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def stubborn(c: CandidateSignal, snap: CycleSnapshot) -> Decision:
+        deciding.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:  # e.g. an SDK call that eats the cancellation
+            swallowed.set()
+        await proceed.wait()
+        return StubBuy(D("98"), D("104"), D("0.6"), D("1"))
+
+    risk = FakeRisk()
+    runner = make_runner(sessions, bus, gate, risk, strategy_id, decide=stubborn)
+    await runner.on_candidate(candidate())
+    await deciding.wait()
+    closing = asyncio.create_task(runner.close(budget_s=5))
+    await swallowed.wait()
+    proceed.set()  # decide returns after close() began
+    report = await closing
+    assert report.abandoned == ()
+    assert risk.calls == []
+    (row,) = await all_cycles(sessions)
+    assert row.state == "DECIDING"  # RISK_CHECK was never written
+
+    await make_runner(sessions, bus, gate, FakeRisk(), strategy_id).recover()
+    assert (await cycle_row(sessions, row.id)).state == "ERROR"
+
+
+async def test_risk_check_entered_after_close_started_never_calls_check(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    risk = FakeRisk()
+    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    cid = await new_cycle(sessions, strategy_id, state="RISK_CHECK")
+    intent = EntryIntent(
+        cycle_id=cid,
+        symbol=BTC,
+        stop=D("98"),
+        take_profit=D("104"),
+        confidence=D("0.6"),
+        size_fraction=D("1"),
+    )
+    await runner.close(budget_s=1)
+    await runner._risk_check(_Cursor(cid, CycleState.RISK_CHECK), intent)
+    assert risk.calls == []
+    assert (await cycle_row(sessions, cid)).state == "RISK_CHECK"
+    await make_runner(sessions, bus, gate, FakeRisk(), strategy_id).recover()
+    assert (await cycle_row(sessions, cid)).state == "ERROR"
+
+
+async def test_recover_must_run_before_admission(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    risk = FakeRisk()
+    risk.release = asyncio.Event()  # keeps the admitted cycle's task alive
+    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    await runner.on_candidate(candidate())
+    await risk.started.wait()
+    with pytest.raises(RuntimeError, match="before admission"):
+        await runner.recover()
+    risk.release.set()
+    await runner.join()
