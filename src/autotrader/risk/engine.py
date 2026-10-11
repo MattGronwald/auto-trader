@@ -2,7 +2,7 @@
 
 `check()` gathers state under one lock, runs the pure `check_entry`, persists the
 decision, applies a pause side effect on rejection, writes the order row, asks the
-control gate again right before submitting, then submits. `exit()` (Task 7) is
+control gate again right before submitting, then submits. `exit()` is
 reduce-only and ignores kill/pause. Any failure while gathering rejects (fail closed).
 """
 
@@ -25,9 +25,10 @@ from autotrader.core.tradingday import day_start, next_day_start
 from autotrader.core.types import Bar, Quote
 from autotrader.journal import repo
 from autotrader.journal.models import Order
-from autotrader.risk.checks import check_entry
+from autotrader.risk.checks import check_entry, check_exit
 from autotrader.risk.types import (
     EntryIntent,
+    ExitRequest,
     HeldPosition,
     MarketSnapshot,
     OpenEntry,
@@ -281,6 +282,47 @@ class RiskEngine:
             else:
                 await repo.set_control(session, PAUSED_KEY, True)
                 log.warning("risk.paused_manual_resume")
+
+    # --- exits -----------------------------------------------------------------------
+
+    async def exit(self, request: ExitRequest) -> OrderResult:
+        """Reduce-only full exit (G1). No gate check: kill and pause never block it.
+        Carries no client_order_id because `Broker.close_position` takes none."""
+        async with self._lock:
+            now = self._clock()
+            try:
+                held = await self._held_positions()
+            except Exception as e:  # fail closed: unknown positions must not size an exit
+                log.exception("risk.exit_state_unavailable", symbol=request.symbol)
+                decision = RiskDecision(
+                    approved=False, reasons=(f"state unavailable: {type(e).__name__}",)
+                )
+                await self._persist(request.cycle_id, "exit", decision, now)
+                return OrderResult(decision)
+            decision = check_exit(request, held, mode_matches=self._mode == self._broker.mode())
+            await self._persist(request.cycle_id, "exit", decision, now)
+            if decision.qty is None:
+                log.warning("risk.exit_rejected", symbol=request.symbol, reason=decision.reasons[0])
+                return OrderResult(decision)
+            async with self._sessions() as session:
+                row = await repo.insert_order(
+                    session,
+                    cycle_id=request.cycle_id,
+                    client_order_id=None,
+                    symbol=request.symbol,
+                    mode=self._mode,
+                    type_="market",
+                    side="sell",
+                    qty=decision.qty,
+                    limit_price=None,
+                    stop_price=None,
+                    tp_price=None,
+                    status="pending",
+                    now=now,
+                )
+            return await self._submit(
+                row.id, decision, lambda: self._broker.close_position(request.symbol)
+            )
 
     # --- equity snapshots ------------------------------------------------------------
 

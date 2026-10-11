@@ -22,13 +22,19 @@ from autotrader.broker.base import (
 )
 from autotrader.broker.sim import SimBroker
 from autotrader.core.config import StrategyProfile, load_profile
-from autotrader.core.kill import PAUSED_KEY, PAUSED_UNTIL_KEY, ControlGate, ControlStatus
+from autotrader.core.kill import (
+    PAUSED_KEY,
+    PAUSED_UNTIL_KEY,
+    ControlGate,
+    ControlStatus,
+    write_kill_file,
+)
 from autotrader.core.types import Bar, Quote
 from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
 from autotrader.risk.engine import Gate, RiskEngine
-from autotrader.risk.types import EntryIntent
+from autotrader.risk.types import EntryIntent, ExitRequest
 
 REPO = Path(__file__).resolve().parents[3]
 PROFILE: StrategyProfile = load_profile(REPO / "strategies" / "fast_momentum_v1.yaml")
@@ -397,20 +403,6 @@ async def test_acked_entry_still_new_keeps_blocking_its_symbol(
     assert [o.status for o in await orders(sessions)] == ["new"]
 
 
-async def test_snapshot_equity_marks_held_positions(
-    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
-) -> None:
-    clock = Clock(NOW)
-    engine = make_engine_(sim, sessions, gate, clock=clock)
-    await engine.check(intent(cycle_id))
-    sim.process_bar(five(30, close=100.0))  # IOC limit 100.10 fills on the next bar
-    clock.now = NOW + timedelta(minutes=1)  # equity_snapshots is keyed by ts
-    await engine.snapshot_equity()
-    async with sessions() as s:
-        snap = await repo.latest_snapshot(s)
-    assert snap is not None and snap.exposure > 0 and snap.equity > 0
-
-
 class OrderingBroker(SimBroker):
     """Reports positions only once get_order has been called (a fill seen late)."""
 
@@ -450,3 +442,65 @@ async def test_own_orders_are_refreshed_before_positions_are_read(
     result = await engine.check(intent(second))
     assert not result.decision.approved
     assert "already has a position or open entry" in result.decision.reasons[0]
+
+
+async def _held_btc(sim: SimBroker) -> None:
+    await sim.submit_order(BrokerOrder(symbol=BTC, side="buy", qty=D("1"), type="market"))
+    sim.process_bar(five(30))
+
+
+async def test_exit_goes_through_while_killed(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, tmp_path: Path
+) -> None:
+    await _held_btc(sim)
+    write_kill_file(tmp_path / "KILL", source="cli", reason="test", now=NOW)
+    result = await make_engine_(sim, sessions, gate).exit(ExitRequest(symbol=BTC, reason="kill"))
+    assert result.decision.approved and result.status == "new"
+    (row,) = await orders(sessions)
+    assert (row.side, row.type, row.qty, row.client_order_id) == ("sell", "market", D("1"), None)
+    (dec,) = await decisions(sessions)
+    assert (dec.kind, dec.cycle_id) == ("exit", None)
+
+
+async def test_exit_without_position_is_rejected_and_recorded(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    result = await make_engine_(sim, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert not result.decision.approved
+    assert await orders(sessions) == []
+    (dec,) = await decisions(sessions)
+    assert not dec.approved
+
+
+async def test_exit_state_failure_rejects(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    class NoPositions(SimBroker):
+        async def get_positions(self) -> list[Position]:
+            raise ConnectionError
+
+    broker = NoPositions(
+        cash=D("1000"), fees=FEES, slippage_bps=D(0), asset_rules={BTC: RULES}, timeframe="5m"
+    )
+    result = await make_engine_(broker, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert result.decision.reasons == ("state unavailable: ConnectionError",)
+
+
+async def test_snapshot_tracks_hwm_and_daily_pnl(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    clock = Clock(NOW)
+    engine = make_engine_(sim, sessions, gate, clock=clock)
+    await engine.snapshot_equity()  # baseline 1000
+    await _held_btc(sim)  # 1 BTC @ 100 + fee
+    sim.process_bar(five(31, close=120.0))  # marked up
+    clock.now = NOW + timedelta(minutes=1)
+    await engine.snapshot_equity()
+    sim.process_bar(five(32, close=90.0))
+    clock.now = NOW + timedelta(minutes=2)
+    await engine.snapshot_equity()
+    async with sessions() as s:
+        rows = list(await s.scalars(select(m.EquitySnapshot).order_by(m.EquitySnapshot.ts)))
+    assert [r.hwm for r in rows] == [D("1000"), rows[1].equity, rows[1].equity]
+    assert rows[2].daily_pnl == rows[2].equity - D("1000")
+    assert rows[2].exposure == D("100.0")  # marked at the feed view's last price (100)
