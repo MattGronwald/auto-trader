@@ -136,6 +136,8 @@ def _size_and_finish(
     if intent.take_profit <= entry:
         return _reject(f"take profit {intent.take_profit} not above entry {entry}")
     # 11. fee-adjusted expectancy (G3, D4)
+    # `strategy_win_rate is None` falls back to the prior even when the trade count is high
+    # (cannot happen via the engine, which derives the rate from the count).
     rate = portfolio.strategy_win_rate
     if rate is None or portfolio.strategy_trades_n < profile.learning.min_trades_for_evidence:
         rate = limits.default_win_rate_prior
