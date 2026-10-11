@@ -1,5 +1,7 @@
 """`autotrader run core` (SPEC §12 Phase 0 DoD): connect to the broker, backfill and stream
-bars for the universe, persist 1m bars, respond to the kill-switch.
+bars for the universe, persist 1m bars, respond to the kill-switch. Since WP 1.2 the Signal
+Scanner runs on closed bars and persists `CandidateSignal`s; nothing consumes them until
+the Cycle Runner (WP 1.4).
 
 The broker is only connected to check the account and log it; nothing here keeps a
 reference (SPEC §0.1: only the Risk Engine holds a `Broker`, WP 1.3 hands it over).
@@ -14,8 +16,9 @@ import structlog
 
 from autotrader.core.bus import EventBus
 from autotrader.core.config import AppConfig, Settings, StrategyProfile
-from autotrader.core.feed import BarSource, MarketFeed
+from autotrader.core.feed import BarClosed, BarSource, MarketFeed
 from autotrader.core.kill import ControlGate
+from autotrader.core.scanner import Scanner
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker
 
@@ -58,9 +61,16 @@ async def run_core(
             timeframes=timeframes,
             stale_alert_s=cfg.feed.stale_alert_s,
         )
-        await feed.backfill()
-        stream_task = asyncio.create_task(source.stream(feed.on_bar, feed.on_quote), name="feed")
+        await feed.backfill()  # publishes no events, so the scanner can subscribe after it
         gate = ControlGate(cfg.control.kill_file, sessions)
+        scanner = Scanner(profile, feed, gate, sessions, bus, trading_day_tz=cfg.trading_day_tz)
+        bus.subscribe(BarClosed, scanner.on_bar_closed)
+        log.info(
+            "scanner.subscribed",
+            timeframe=profile.timeframes.signal,
+            rules=[r.id for r in profile.signal_rules],
+        )
+        stream_task = asyncio.create_task(source.stream(feed.on_bar, feed.on_quote), name="feed")
         log.info(
             "core.started",
             mode=cfg.mode,
