@@ -1,7 +1,7 @@
 import asyncio
 import io
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -10,12 +10,14 @@ import pytest
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from structlog.testing import capture_logs
 
-from autotrader.core.bus import BusClosedError, DomainEvent, EventBus
+from autotrader.core.bus import BusClosedError, CommitUncertain, DomainEvent, EventBus
 from autotrader.core.logging import configure_logging
 from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
+from tests.dbhooks import CommitHook, hooked_sessionmaker
 
 T0 = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 
@@ -421,3 +423,263 @@ async def test_queue_growth_past_high_water_is_logged_once(
 
     lines = [json.loads(line) for line in buf.getvalue().splitlines()]
     assert [ln["event"] for ln in lines].count("bus.queue_high_water") == 1
+
+
+# --- publish_tx (WP 1.4, D15) --------------------------------------------------------
+
+
+class Note(DomainEvent):
+    key: str
+
+
+def note_build(
+    key: str,
+    *,
+    skip: bool = False,
+    fail: bool = False,
+    hold: asyncio.Event | None = None,
+    entered: asyncio.Event | None = None,
+) -> Callable[[AsyncSession], Awaitable[DomainEvent | None]]:
+    """Writes a control_state row (stand-in for the cycle row) and returns its event."""
+
+    async def build(session: AsyncSession) -> DomainEvent | None:
+        session.add(m.ControlState(key=key, value=True))
+        await session.flush()
+        if entered is not None:
+            entered.set()
+        if hold is not None:
+            await hold.wait()
+        if fail:
+            raise RuntimeError("build failed")
+        return None if skip else Note(key=key)
+
+    return build
+
+
+async def note_visible(session: AsyncSession, event: DomainEvent) -> bool:
+    return isinstance(event, Note) and await session.get(m.ControlState, event.key) is not None
+
+
+async def note_invisible(session: AsyncSession, event: DomainEvent) -> bool:
+    return False
+
+
+async def has_control(sessions: async_sessionmaker[AsyncSession], key: str) -> bool:
+    async with sessions() as s:
+        return await s.get(m.ControlState, key) is not None
+
+
+@pytest.fixture
+def hook() -> CommitHook:
+    return CommitHook()
+
+
+@pytest.fixture
+async def hbus(db_url: str, hook: CommitHook) -> AsyncIterator[EventBus]:
+    engine = make_engine(db_url)
+    b = EventBus(hooked_sessionmaker(engine, hook))
+    yield b
+    await b.close()
+    await engine.dispose()
+
+
+def collect(bus: EventBus) -> list[str]:
+    seen: list[str] = []
+
+    async def handler(e: DomainEvent) -> None:
+        seen.append(e.key if isinstance(e, Note) else f"{type(e).__name__}")
+
+    bus.subscribe(DomainEvent, handler)
+    return seen
+
+
+async def test_publish_tx_commits_write_and_event_together_and_delivers(
+    bus: EventBus, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    seen = collect(bus)
+    out = await bus.publish_tx(note_build("a"), note_visible)
+    await bus.drain()
+
+    assert isinstance(out, Note) and out.key == "a"
+    assert seen == ["a"]
+    assert await has_control(sessions, "a")
+    assert [r.type for r in await _events(sessions)] == ["Note"]
+
+
+async def test_publish_tx_none_writes_and_delivers_nothing(
+    bus: EventBus, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    seen = collect(bus)
+    assert await bus.publish_tx(note_build("a", skip=True), note_visible) is None
+    await bus.drain()
+    assert seen == []
+    assert not await has_control(sessions, "a")
+    assert await _events(sessions) == []
+
+
+async def test_publish_tx_build_error_rolls_back_and_propagates(
+    bus: EventBus, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    with pytest.raises(RuntimeError, match="build failed"):
+        await bus.publish_tx(note_build("a", fail=True), note_visible)
+    assert not await has_control(sessions, "a")
+    assert await _events(sessions) == []
+
+
+async def test_plain_publish_waits_for_a_transactional_unit_and_order_is_kept(
+    bus: EventBus, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    seen = collect(bus)
+    hold, entered = asyncio.Event(), asyncio.Event()
+    unit = asyncio.create_task(
+        bus.publish_tx(note_build("a", hold=hold, entered=entered), note_visible)
+    )
+    await entered.wait()
+    plain = asyncio.create_task(bus.publish(Ping(n=1)))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not plain.done()  # the unit holds the bus lock
+
+    hold.set()
+    await asyncio.gather(unit, plain)
+    await bus.drain()
+    assert [r.type for r in await _events(sessions)] == ["Note", "Ping"]
+    assert seen == ["a", "Ping"]
+
+
+async def test_cancelled_caller_does_not_stop_the_unit(
+    bus: EventBus, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    seen = collect(bus)
+    hold, entered = asyncio.Event(), asyncio.Event()
+    caller = asyncio.create_task(
+        bus.publish_tx(note_build("a", hold=hold, entered=entered), note_visible)
+    )
+    await entered.wait()
+    caller.cancel()
+    hold.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    await bus.close()  # waits for the unit, then drains
+    assert seen == ["a"]
+    assert await has_control(sessions, "a")
+
+
+async def test_caller_cancelled_after_db_commit_before_confirmation(
+    hbus: EventBus, hook: CommitHook, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    seen = collect(hbus)
+    release = asyncio.Event()
+    hook.block_after = release
+    caller = asyncio.create_task(hbus.publish_tx(note_build("a"), note_visible))
+    await hook.reached.wait()  # the DB has committed; the unit hasn't confirmed yet
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    release.set()
+    await hbus.close()
+    assert seen == ["a"]  # exactly once
+    assert await has_control(sessions, "a")
+    assert [r.type for r in await _events(sessions)] == ["Note"]
+
+
+async def test_commit_error_with_positive_read_back_is_recovered(
+    hbus: EventBus, hook: CommitHook, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    seen = collect(hbus)
+    hook.fail_after = 1
+    with capture_logs() as logs:
+        out = await hbus.publish_tx(note_build("a"), note_visible)
+    await hbus.drain()
+    assert isinstance(out, Note)
+    assert seen == ["a"]
+    assert any(e["event"] == "bus.commit_recovered" for e in logs)
+
+
+@pytest.mark.parametrize("verify_raises", [False, True])
+async def test_commit_error_without_confirmation_is_uncertain(
+    verify_raises: bool,
+    hbus: EventBus,
+    hook: CommitHook,
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    seen = collect(hbus)
+    flagged: list[CommitUncertain] = []
+
+    async def broken(session: AsyncSession, event: DomainEvent) -> bool:
+        raise RuntimeError("read-back failed")
+
+    hook.fail_before = 1  # nothing committed, but the caller can't know that
+    with pytest.raises(CommitUncertain):
+        await hbus.publish_tx(
+            note_build("a"),
+            broken if verify_raises else note_invisible,
+            on_uncertain=flagged.append,
+        )
+    await hbus.drain()
+    assert seen == []
+    assert len(flagged) == 1
+
+
+async def test_on_uncertain_fires_even_when_the_caller_is_gone(
+    hbus: EventBus, hook: CommitHook
+) -> None:
+    flagged: list[CommitUncertain] = []
+    hold, entered = asyncio.Event(), asyncio.Event()
+    hook.fail_before = 1
+    caller = asyncio.create_task(
+        hbus.publish_tx(
+            note_build("a", hold=hold, entered=entered),
+            note_invisible,
+            on_uncertain=flagged.append,
+        )
+    )
+    await entered.wait()
+    caller.cancel()
+    hold.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    await hbus.close()
+    assert len(flagged) == 1
+
+
+async def test_close_finishes_an_in_flight_unit_then_refuses(
+    bus: EventBus, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    seen = collect(bus)
+    hold, entered = asyncio.Event(), asyncio.Event()
+    unit = asyncio.create_task(
+        bus.publish_tx(note_build("a", hold=hold, entered=entered), note_visible)
+    )
+    await entered.wait()
+    closing = asyncio.create_task(bus.close(budget_s=5))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    hold.set()
+    await asyncio.gather(unit, closing)
+    assert seen == ["a"]
+    with pytest.raises(BusClosedError):
+        await bus.publish_tx(note_build("b"), note_visible)
+    with pytest.raises(BusClosedError):
+        await bus.publish(Ping(n=2))
+
+
+async def test_close_is_bounded_and_reports_what_it_abandons(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    bus = EventBus(sessions)
+    hold, entered = asyncio.Event(), asyncio.Event()
+    unit = asyncio.create_task(
+        bus.publish_tx(note_build("a", hold=hold, entered=entered), note_visible)
+    )
+    await entered.wait()
+    with capture_logs() as logs:
+        await bus.close(budget_s=0.01)  # the unit never finishes within the budget
+    assert any(e["event"] == "bus.task_abandoned" for e in logs)
+    # The abandoned unit still holds the bus lock: a late publish must fail fast.
+    with pytest.raises(BusClosedError):
+        await asyncio.wait_for(bus.publish(Ping(n=1)), timeout=5)  # safety net only
+    with pytest.raises(BusClosedError):
+        await asyncio.wait_for(bus.publish_tx(note_build("b"), note_visible), timeout=5)
+    hold.set()  # clean up: let the abandoned unit finish
+    await unit
