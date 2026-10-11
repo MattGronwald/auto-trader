@@ -28,7 +28,9 @@
 2. A gate read that hangs at admission (locked DB) must not stall the bus worker forever. Admission bounds `gate.status()` with `step_timeout_s` and drops with `gate unavailable: TimeoutError`. The test is in Task 6.
 3. A candidate whose `features` contain `None` (NaN in the scanner) must still be stored in `cycles.signal_features` as valid JSON. The test is in Task 3.
 4. Transition details holding Decimals must reach the `events` table as JSON strings that parse back to the same Decimal. The test is in Task 5 (happy path asserts `Decimal(details["stop"])`).
-5. Suspension set while a second admission is already waiting for the lock must still drop that admission (the flag is re-checked inside the lock). The test is in Task 6.
+5. Suspension set while a second admission is already waiting (for the admission lock, or for the bus lock) must still drop that admission. The flag is re-checked inside the admission lock and again inside `build()` under the bus lock. The tests are in Task 6.
+
+**Race tests (all tasks):** reproduce the interleaving step by step. Hold one side on an `asyncio.Event`, assert the other side is parked where the test expects it, then release. Use gate doubles without I/O (`OpenGate`) in race tests, so that `asyncio.sleep(0)` loops reliably reach the parked point. A race test that passes without reaching its intended interleaving proves nothing.
 
 ---
 
@@ -185,7 +187,7 @@ commit=False)`: those run inside `EventBus.publish_tx`, which commits the row to
 its event (WP 1.4, D15).
 ```
 
-Keep the rest of the docstring. Add `from sqlalchemy.engine import CursorResult` and `from typing import Any, cast` to the imports (`Any` is already imported; add `cast`).
+Keep the rest of the docstring. Add `from sqlalchemy.engine import CursorResult`, and change the typing import to `from typing import Any, cast as typing_cast`. **Do not import `typing.cast` as `cast`:** `repo.py` already imports SQLAlchemy's `cast` (`from sqlalchemy import Float, cast, ...`, used for SQL casts), and the second import would shadow it. `transition_cycle` would then call the SQL-expression constructor (`AttributeError: 'CursorResult' object has no attribute '_is_tuple_type'`).
 
 2. Replace `append_event`:
 
@@ -260,7 +262,7 @@ async def transition_cycle(
     values: dict[str, Any] = {"state": to_state}
     if to_state in TERMINAL_CYCLE_STATES:
         values.update(outcome=to_state, finished_at=now, reject_reason=reason)
-    result = cast(
+    result = typing_cast(
         CursorResult[Any],
         await session.execute(
             update(Cycle)
@@ -330,7 +332,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `OnUncertain = Callable[[CommitUncertain], None]`
   - `EventBus.publish_tx(build: Build, verify: Verify, *, on_uncertain: OnUncertain | None = None) -> DomainEvent | None`
   - `EventBus.close(budget_s: float = CLOSE_BUDGET_S) -> None`, with `CLOSE_BUDGET_S = 10.0`
-- Produces (in `tests.dbhooks`): `CommitHook` (attributes `fail_before: int`, `fail_after: int`, `block_after: asyncio.Event | None`, `reached: asyncio.Event`) and `hooked_sessionmaker(engine: AsyncEngine, hook: CommitHook) -> async_sessionmaker[AsyncSession]`.
+- Produces (in `tests.dbhooks`): `CommitHook` (attributes `fail_before: int`, `fail_after: int`, `block_after: asyncio.Event | None`, `block_before: asyncio.Event | None`, `reached: asyncio.Event`) and `hooked_sessionmaker(engine: AsyncEngine, hook: CommitHook) -> async_sessionmaker[AsyncSession]`.
 
 - [ ] **Step 1: Create the fault-injection helper `tests/dbhooks.py`**
 
@@ -342,7 +344,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   still land later, from the caller's point of view);
 - `fail_after = n`: the next n commits *do* commit, then raise (a lost acknowledgement);
 - `block_after = event`: the next commit commits, sets `reached`, then waits for `event`
-  (the caller can be cancelled between the DB commit and its confirmation).
+  (the caller can be cancelled between the DB commit and its confirmation);
+- `block_before = event`: the next commit sets `reached` and waits for `event` *before*
+  committing (holding the bus lock); `fail_before` then applies as usual.
 """
 
 import asyncio
@@ -360,9 +364,14 @@ class CommitHook:
         self.fail_before = 0
         self.fail_after = 0
         self.block_after: asyncio.Event | None = None
+        self.block_before: asyncio.Event | None = None
         self.reached = asyncio.Event()
 
     async def before(self) -> None:
+        if self.block_before is not None:
+            release, self.block_before = self.block_before, None
+            self.reached.set()
+            await release.wait()
         if self.fail_before:
             self.fail_before -= 1
             raise lost_ack()
@@ -645,6 +654,11 @@ async def test_close_is_bounded_and_reports_what_it_abandons(
     with capture_logs() as logs:
         await bus.close(budget_s=0.01)  # the unit never finishes within the budget
     assert any(e["event"] == "bus.task_abandoned" for e in logs)
+    # The abandoned unit still holds the bus lock: a late publish must fail fast.
+    with pytest.raises(BusClosedError):
+        await asyncio.wait_for(bus.publish(Ping(n=1)), timeout=5)  # safety net only
+    with pytest.raises(BusClosedError):
+        await asyncio.wait_for(bus.publish_tx(note_build("b"), note_visible), timeout=5)
     hold.set()  # clean up: let the abandoned unit finish
     await unit
 ```
@@ -703,8 +717,12 @@ CLOSE_BUDGET_S = 10.0
 ```python
     async def publish(self, event: DomainEvent) -> None:
         event_type = type(event).__name__
+        # Checked before the lock too: after a bounded close() an abandoned unit may hold
+        # the lock forever, and a late publish must fail fast, not wait on it.
+        if self._closed:
+            raise BusClosedError("event bus is closed")
         async with self._lock:
-            if self._closed:
+            if self._closed:  # closed while waiting for the lock
                 raise BusClosedError("event bus is closed")
             async with self._sessions() as session:
                 row = await repo.append_event(
@@ -788,7 +806,7 @@ CLOSE_BUDGET_S = 10.0
                     )
 ```
 
-5. Replace `close`:
+5. Replace `close` (the `_closed` pre-check in `publish` above is what keeps a publish after an abandoning `close()` from hanging):
 
 ```python
     async def close(self, budget_s: float = CLOSE_BUDGET_S) -> None:
@@ -2158,6 +2176,14 @@ def dropped(logs: list[dict[str, Any]]) -> list[str]:
     return [e["reason"] for e in logs if e["event"] == "cycle.dropped"]
 
 
+class OpenGate:
+    """Gate double without I/O: race tests need admission to reach its lock in a few
+    event-loop turns, which a DB-backed gate read (aiosqlite thread) doesn't guarantee."""
+
+    async def status(self, now: datetime | None = None) -> ControlStatus:
+        return ControlStatus(killed=False, reasons=())
+
+
 def hold_admission(monkeypatch: pytest.MonkeyPatch) -> tuple[asyncio.Event, asyncio.Event]:
     """The first admission blocks inside its transaction until `release` is set."""
     entered, release = asyncio.Event(), asyncio.Event()
@@ -2193,11 +2219,11 @@ async def test_admitted_candidate_gets_a_row_an_event_and_a_task(
 
 
 async def test_concurrency_cap_holds_for_simultaneous_candidates(
-    sessions: async_sessionmaker[AsyncSession], bus: EventBus, gate: ControlGate,
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus,
     strategy_id: int, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entered, release = hold_admission(monkeypatch)
-    runner = make_runner(sessions, bus, gate, FakeRisk(approved("new")), strategy_id,
+    runner = make_runner(sessions, bus, OpenGate(), FakeRisk(approved("new")), strategy_id,
                          max_cycles=1)
     with capture_logs() as logs:
         first = asyncio.create_task(runner.on_candidate(candidate(BTC)))
@@ -2334,11 +2360,11 @@ async def test_uncertain_admission_suspends_and_a_late_landing_insert_never_brea
 
 
 async def test_suspension_is_checked_inside_the_admission_lock(
-    sessions: async_sessionmaker[AsyncSession], bus: EventBus, gate: ControlGate,
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus,
     strategy_id: int, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entered, release = hold_admission(monkeypatch)
-    runner = make_runner(sessions, bus, gate, FakeRisk(approved("new")), strategy_id)
+    runner = make_runner(sessions, bus, OpenGate(), FakeRisk(approved("new")), strategy_id)
     with capture_logs() as logs:
         first = asyncio.create_task(runner.on_candidate(candidate(BTC)))
         await entered.wait()
@@ -2351,6 +2377,36 @@ async def test_suspension_is_checked_inside_the_admission_lock(
         await runner.join()
     assert [c.symbol for c in await all_cycles(sessions)] == [BTC]
     assert dropped(logs) == ["admission suspended: commit uncertain"]
+
+
+async def test_suspension_by_a_surviving_unit_stops_an_admission_queued_on_the_bus(
+    sessions: async_sessionmaker[AsyncSession], hbus: EventBus, hook: CommitHook,
+    strategy_id: int,
+) -> None:
+    """Review P1 (2026-10-11): an admission that passed the admission-lock check and
+    waits for the bus lock must still see a suspension set by the unit ahead of it."""
+    runner = make_runner(sessions, hbus, OpenGate(), FakeRisk(approved("new")), strategy_id)
+    sol = await new_cycle(sessions, strategy_id, symbol=SOL)
+    release = asyncio.Event()
+    hook.block_before = release  # SOL's NEW -> ENRICHING unit parks holding the bus lock
+    hook.fail_before = 1  # ... and then does not commit; the read-back sees NEW
+    running = asyncio.create_task(runner._run(sol, candidate(SOL)))
+    await hook.reached.wait()
+    running.cancel()  # the publishing caller goes away; the bus-owned unit survives
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    admitting = asyncio.create_task(runner.on_candidate(candidate(BTC)))
+    for _ in range(20):
+        await asyncio.sleep(0)  # BTC passed both flag checks; its unit waits for the bus
+    assert not runner.admission_suspended and not admitting.done()
+
+    with capture_logs() as logs:
+        release.set()
+        await admitting
+    assert runner.admission_suspended
+    assert dropped(logs) == ["admission suspended: commit uncertain"]
+    assert [c.symbol for c in await all_cycles(sessions)] == [SOL]
 
 
 # --- recovery (Task 6) ---------------------------------------------------------------
@@ -2433,6 +2489,12 @@ Expected: FAIL with `AttributeError: 'CycleRunner' object has no attribute 'on_c
             why: list[str] = []
 
             async def build(session: AsyncSession) -> DomainEvent | None:
+                # Runs under the bus lock. A unit that held the lock before us may have
+                # hit CommitUncertain and suspended admission while we waited (the bus
+                # calls on_uncertain under the same lock), so check again here.
+                if (blocked := self._blocked()) is not None:
+                    why.append(blocked)
+                    return None
                 open_symbols = await repo.open_cycle_symbols(session)
                 if len(open_symbols) >= self._profile.scanner.max_concurrent_cycles:
                     why.append("max_concurrent_cycles")
@@ -2593,7 +2655,10 @@ async def test_close_forces_a_check_past_the_drain_deadline(
     assert report.abandoned == ()
     assert any(e["event"] == "cycle.forced_cancel" for e in logs)
     (row,) = await all_cycles(sessions)
-    assert row.state == "RISK_CHECK"  # recover() leaves it for reconciliation
+    assert row.state == "RISK_CHECK"
+    # FakeRisk writes no order row, so this test proves the forced cancel only; that a
+    # forced cycle keeps a durable, recoverable order is proven on the real engine
+    # (Task 8, test_forced_shutdown_after_broker_acceptance_keeps_the_order_recoverable).
 
 
 async def test_close_reports_a_task_that_ignores_cancellation(
@@ -2735,6 +2800,7 @@ SimBroker acks every accepted order `new` (fills happen on a later bar), so an a
 cycle ends in SUBMITTED here; completing it is WP 1.5's reconciliation.
 """
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
@@ -2748,7 +2814,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
-from autotrader.broker.base import AssetRules, FeeSchedule
+from autotrader.broker.base import AssetRules, BrokerOrder, FeeSchedule, OrderAck
 from autotrader.broker.sim import SimBroker
 from autotrader.core.bus import EventBus
 from autotrader.core.config import StrategyProfile, parse_profile
@@ -2808,32 +2874,68 @@ def candidate() -> CandidateSignal:
     )
 
 
+class AcceptThenHang(SimBroker):
+    """The broker accepts the order, but the acknowledgement never comes back."""
+
+    def __init__(self) -> None:
+        super().__init__(cash=D("1000"), fees=FEES, slippage_bps=D("0"),
+                         asset_rules={BTC: RULES}, timeframe="5m")
+        self.accepted = asyncio.Event()
+        self.submits = 0
+
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        self.submits += 1
+        await super().submit_order(order)  # now it exists at the broker
+        self.accepted.set()
+        await asyncio.Event().wait()  # ...but the ack never reaches the engine
+        raise AssertionError("unreachable")
+
+
+def sim_broker() -> SimBroker:
+    sim = SimBroker(cash=D("1000"), fees=FEES, slippage_bps=D("0"),
+                    asset_rules={BTC: RULES}, timeframe="5m")
+    return sim
+
+
 @pytest.fixture
-async def sessions(tmp_path: Path) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+def db_url(tmp_path: Path) -> str:
+    # Sync fixture: Alembic's upgrade runs its own event loop (asyncio.run), which fails
+    # inside an async fixture's running loop.
     url = f"sqlite+aiosqlite:///{tmp_path / 'test.db'}"
     upgrade(url)
-    engine = make_engine(url)
+    return url
+
+
+@pytest.fixture
+async def sessions(db_url: str) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = make_engine(db_url)
     yield make_sessionmaker(engine)
     await engine.dispose()
+
+
+async def wire(
+    tmp_path: Path, sessions: async_sessionmaker[AsyncSession], broker: SimBroker
+) -> tuple[CycleRunner, EventBus]:
+    prof = profile()
+    async with sessions() as s:
+        strategy_id = (await repo.register_strategy(s, prof, "yaml")).id
+    broker.process_bar(five(29))
+    gate = ControlGate(tmp_path / "KILL", sessions)
+    view = View()
+    engine = RiskEngine(broker, profile=prof, strategy_id=strategy_id, mode="paper",
+                        gate=gate, market=view, sessions=sessions, clock=lambda: NOW)
+    bus = EventBus(sessions)
+    runner = CycleRunner(profile=prof, strategy_id=strategy_id, market=view, gate=gate,
+                         risk=engine, bus=bus, sessions=sessions, clock=lambda: NOW)
+    return runner, bus
 
 
 @pytest.fixture
 async def wired(
     tmp_path: Path, sessions: async_sessionmaker[AsyncSession]
 ) -> AsyncIterator[tuple[CycleRunner, SimBroker]]:
-    prof = profile()
-    async with sessions() as s:
-        strategy_id = (await repo.register_strategy(s, prof, "yaml")).id
-    sim = SimBroker(cash=D("1000"), fees=FEES, slippage_bps=D("0"),
-                    asset_rules={BTC: RULES}, timeframe="5m")
-    sim.process_bar(five(29))
-    gate = ControlGate(tmp_path / "KILL", sessions)
-    view = View()
-    engine = RiskEngine(sim, profile=prof, strategy_id=strategy_id, mode="paper", gate=gate,
-                        market=view, sessions=sessions, clock=lambda: NOW)
-    bus = EventBus(sessions)
-    runner = CycleRunner(profile=prof, strategy_id=strategy_id, market=view, gate=gate,
-                         risk=engine, bus=bus, sessions=sessions, clock=lambda: NOW)
+    sim = sim_broker()
+    runner, bus = await wire(tmp_path, sessions, sim)
     yield runner, sim
     await runner.close(budget_s=5)
     await bus.close()
@@ -2885,11 +2987,51 @@ async def test_broker_accepts_then_the_ack_write_fails(
     assert [e["reason"] for e in logs if e["event"] == "cycle.dropped"] == [
         "open entry order on symbol"
     ]
+
+
+async def test_forced_shutdown_after_broker_acceptance_keeps_the_order_recoverable(
+    tmp_path: Path, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Spec §8: forcing check() is safe because the order row is durable before submit."""
+    broker = AcceptThenHang()
+    runner, bus = await wire(tmp_path, sessions, broker)  # engine io budget: 10 s default
+    await runner.on_candidate(candidate())
+    await broker.accepted.wait()  # at the broker; the ack write has not happened
+
+    with capture_logs() as logs:
+        report = await runner.close(budget_s=0.1, cancel_wait_s=0.05)
+    await bus.close()
+    assert report.abandoned == ()
+    assert any(e["event"] == "cycle.forced_cancel" for e in logs)
+
+    async with sessions() as s:
+        (cycle,) = list(await s.scalars(select(m.Cycle)))
+        (order,) = list(await s.scalars(select(m.Order)))
+    assert cycle.state == "RISK_CHECK"
+    assert (order.status, order.client_order_id, order.broker_order_id) == (
+        "pending", f"at-c{cycle.id}-e", None,
+    )
+    assert broker.submits == 1
+    assert (await broker.get_order("sim-1")).status == "new"  # really at the broker
+
+    # Next start: recovery must not end it, and the symbol stays reserved.
+    runner2, bus2 = await wire(tmp_path, sessions, broker)
+    await runner2.recover()
+    async with sessions() as s:
+        assert await repo.cycle_state(s, cycle.id) == "RISK_CHECK"
+    with capture_logs() as logs:
+        await runner2.on_candidate(candidate())
+    assert [e["reason"] for e in logs if e["event"] == "cycle.dropped"] == [
+        "open cycle on symbol"
+    ]
+    assert broker.submits == 1  # no second submission
+    await runner2.close(budget_s=5)
+    await bus2.close()
 ```
 
 - [ ] **Step 2: Run them**
 
-Run: `uv run pytest tests/integration/test_cycle_runner.py -v` → PASS. If the happy path is `REJECTED`, print `cycle.reject_reason`. The stub's numbers (stop 97.1, TP 106.1, confidence 0.5, ATR 2, ask 100) are meant to pass all 11 checks with these fixtures, and the reason names the check that disagrees. Fix the fixture, never the engine.
+Run: `uv run pytest tests/integration/test_cycle_runner.py -v` → PASS (three tests). If the happy path is `REJECTED`, print `cycle.reject_reason`. The stub's numbers (stop 97.1, TP 106.1, confidence 0.5, ATR 2, ask 100) are meant to pass all 11 checks with these fixtures, and the reason names the check that disagrees. Fix the fixture, never the engine.
 
 - [ ] **Step 3: Docs alignment** (this step only changes text; keep the edits exactly to these claims)
 
@@ -2949,3 +3091,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - §11 docs: Task 8.
 - **Known deviation to confirm in review:** admission bounds `gate.status()` with `step_timeout_s` (Review Focus 2). The spec says a raising gate drops the candidate, and a hanging one is treated the same way.
 - **Private access in tests:** Task 5 calls `runner._run()` and Task 6 calls `runner._suspend()` directly. Both are deliberate and documented. The FSM is tested before admission exists, and the suspension-inside-lock test needs the flag set at an exact point.
+- **Revised 2026-10-11 after the plan review** (reviewer ran the snippets on a copy of `main`):
+  - `build()` re-checks suspension under the bus lock, with a test where a cancelled caller's surviving uncertain unit runs ahead of a queued admission (Task 6);
+  - `typing.cast` is imported as `typing_cast` so it doesn't shadow SQLAlchemy's `cast` (Task 1);
+  - `publish()` checks `_closed` before taking the lock, with a test that a publish after an abandoning `close()` fails fast (Task 2);
+  - the integration DB fixture migrates synchronously (Task 8);
+  - forced shutdown is proven with a durable order on the real engine (Task 8);
+  - race tests use the I/O-free `OpenGate`.
