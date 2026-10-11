@@ -219,7 +219,9 @@ drawdown, including after a restart. The early `max_hwm` read is not trusted alo
 check re-reads `max_hwm` in its later journal session (with the counts, baseline and
 stats) and decides with `max(early stored HWM, late stored HWM, live equity)`, so a peak
 the snapshot task commits while the check awaits positions or rules still bounds
-drawdown. `snapshot_equity()` likewise records the account
+drawdown. A peak committed after the late read (during the pre-submit gate check or the
+submit) is not seen by that one check: every input it decides on predates that peak, so
+this is the ordinary check-then-act window; the next check sees it. `snapshot_equity()` likewise records the account
 even when the positions read after it fails (exposure `NULL`, the error is still raised
 and logged). Snapshots are append-only; the HWM is the max over all rows.
 
