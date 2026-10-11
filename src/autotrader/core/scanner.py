@@ -11,9 +11,12 @@ A rule whose evaluation touches a NaN feature (warm-up, zero-variance vol_z, VWA
 window's first day) raises `EvaluationError` in the evaluator. That rule is "not
 evaluable" for this bar: logged at debug, never a hit.
 
-Pre-filters (D13), in order: kill/pause (`ControlGate`, fails closed), stale symbol,
-spread above `max_spread_bps` or unknown, vol_z below `min_vol_z` or undefined, open
-position on the symbol, open cycle on the symbol, open cycles at `max_concurrent_cycles`,
+Pre-filters (D13), in order: obsolete bar (more than one signal period has passed since
+the bar ended; reconnect catch-up announces old bars while the symbol already reads
+fresh, and those must neither become candidates nor use up the rate limit), kill/pause
+(`ControlGate`, fails closed), stale symbol, spread above `max_spread_bps` or unknown,
+vol_z below `min_vol_z` or undefined, open position on the symbol, open cycle on the
+symbol, open cycles at `max_concurrent_cycles`,
 `max_candidates_per_symbol_per_hour` reached in the last 60 min (counted from persisted
 candidates, so a restart doesn't reset it).
 
@@ -38,6 +41,7 @@ from autotrader.core.expr import EvaluationError
 from autotrader.core.feed import BarClosed
 from autotrader.core.indicators import compute_features
 from autotrader.core.kill import ControlStatus
+from autotrader.core.resample import parse_timeframe
 from autotrader.core.types import Bar
 from autotrader.journal import repo
 
@@ -85,6 +89,7 @@ class Scanner:
         self._profile = profile
         self._limits = profile.scanner
         self._timeframe = profile.timeframes.signal
+        self._period = parse_timeframe(self._timeframe)
         self._market = market
         self._gate = gate
         self._sessions = sessions
@@ -108,7 +113,7 @@ class Scanner:
         rule, score = hit
         latest = {k: (v[-1] if math.isfinite(v[-1]) else None) for k, v in env.items()}
         now = self._clock()
-        reason = await self._suppression(symbol, latest, now)
+        reason = await self._suppression(symbol, event.bar_ts, latest, now)
         if reason is not None:
             log.info(
                 "scanner.suppressed", symbol=symbol, rule_id=rule.id, score=score, reason=reason
@@ -147,9 +152,12 @@ class Scanner:
         return best
 
     async def _suppression(
-        self, symbol: str, latest: dict[str, float | None], now: datetime
+        self, symbol: str, bar_ts: datetime, latest: dict[str, float | None], now: datetime
     ) -> str | None:
         """First pre-filter that blocks a candidate, or None."""
+        age = now - (bar_ts + self._period)
+        if age > self._period:
+            return f"obsolete: bar ended {age.total_seconds():.0f} s ago"
         status = await self._gate.status(now)
         if not status.entries_allowed:
             return "control: " + "; ".join(status.reasons)
