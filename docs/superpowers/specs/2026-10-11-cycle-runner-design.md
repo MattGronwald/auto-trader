@@ -6,6 +6,8 @@ the bus contract, bounded shutdown, SimBroker test scope, signal freshness, stub
 and `canceled` ≠ nothing filled. Revised again after the second review: commit-and-enqueue
 survives caller cancellation, with read-back on an uncertain commit; `publish_tx` callbacks
 return their event; shutdown budgets and abandoned tasks; reconciliation-only edges.
+Third review: only a positive read-back confirms a commit, and any uncertain commit
+suspends admission until restart; delivery and edge wording corrected.
 Sources: SPEC §0, §4.3, §4.4, §5, §7, §11; PLAN G14, D13, D14.
 Decisions taken while designing are recorded as PLAN **D15**.
 
@@ -77,14 +79,20 @@ RISK_CHECK → EXPIRED           (signal stale on entry, §5)
 RISK_CHECK → REJECTED          (risk rejection)
 any non-terminal state → ERROR
 
+Shared edge (runner and WP 1.5 reconciliation):
+SUBMITTED  → FILLED            (runner: immediate `filled` ack; reconciliation: broker
+                                filled qty > 0, full or partial)
+
 Reconciliation-only edges (taken by WP 1.5, never by the runner):
-SUBMITTED  → FILLED            (broker filled qty > 0, full or partial)
 SUBMITTED  → EXPIRED           (broker final with filled qty = 0)
 RISK_CHECK → FILLED | EXPIRED  (cycle left in RISK_CHECK with an order row, same rule)
 ```
 
-The transition table is defined in WP 1.4, including these edges, so WP 1.5 uses the same
-`transition_cycle` and audit trail. The runner itself never takes them.
+The transition table is defined in WP 1.4, including the reconciliation-only edges, so
+WP 1.5 uses the same `transition_cycle` and audit trail. The runner never takes the
+reconciliation-only edges. On the shared edge the two sources differ only in `details`:
+the runner's immediate ack carries no filled qty, while reconciliation records
+`filled_qty`, `ordered_qty` and `partial`.
 
 Terminal states are `FILLED`, `REJECTED`, `EXPIRED` and `ERROR` (`repo.TERMINAL_CYCLE_STATES`
 is unchanged). There is no SKIPPED state: a skip is `REJECTED` with a `decision:` reason.
@@ -198,14 +206,19 @@ therefore not proof that nothing persisted. On a commit exception the internal t
 still under the lock, calls `verify` once in a fresh session:
 - `True` → it was committed: enqueue the event and return it as if nothing went wrong
   (logged `bus.commit_recovered`);
-- `False` → it was not committed: raise the original exception;
-- `verify` raises → raise `CommitUncertain` (logged). The caller must assume either
+- `False` or `verify` raises → raise `CommitUncertain` (logged, chained to the original
+  exception). A negative read-back does **not** prove a rollback: after a lost
+  acknowledgement the original `COMMIT` may still be in flight and become visible later.
+  The bus never claims an outcome it can't establish. The caller must assume either
   outcome (§9).
 
-So every event is persisted and enqueued inside the one bus lock. The global order of
-event ids equals the delivery order, and a persisted event is delivered exactly once,
-even if its caller was cancelled after the commit. The internal tasks are tracked by the
-bus; `close()` waits for them within its budget (§8).
+Every event is persisted and enqueued inside the one bus lock, so the global order of
+event ids equals the delivery order. Delivery guarantee: a unit whose commit is
+confirmed (directly, or by a positive read-back) enqueues its event exactly once, even if
+its caller was cancelled after the commit. An uncertain unit (`CommitUncertain`) or one
+abandoned at `close()` may be persisted **without** being delivered. The `events` table
+stays the record, and `recover()` resolves the cycle on the next start. The internal tasks
+are tracked by the bus; `close()` waits for them within its budget (§8).
 
 **Lock order:** runner admission lock, then the bus lock; never the reverse. `build` and
 `verify` only touch the session they are given. They never publish or await other locks.
@@ -335,18 +348,30 @@ a hard process deadline, not a clean in-process stop of every task.
   `ERROR` (`transition write failed`). If that fails too, it logs `cycle.stuck` and the
   row keeps its last committed state; `recover()` resolves it.
 - **Exception: once `check()` has returned or raised, no `ERROR` write is attempted for a
-  failed transition write.** The cycle stays `RISK_CHECK` and logs `cycle.stuck`. The
-  outcome is already in `risk_decisions`/`orders`, so the order row decides what
-  happens. If `check()` itself raised, the transition to `ERROR` is the normal
+  failed transition write.** The cycle keeps its last committed state (`RISK_CHECK`, or
+  `SUBMITTED` when `RISK_CHECK → SUBMITTED` committed but `SUBMITTED → FILLED`/`REJECTED`
+  failed) and logs `cycle.stuck`. The outcome is already in `risk_decisions`/`orders`, so
+  the order row decides what happens. If `check()` itself raised, the transition to `ERROR` is the normal
   transition, not a fallback.
 - **`CommitUncertain`** (§6) counts as a failed transition write. However, the runner
   doesn't know which state is committed. So it never attempts a fallback `ERROR` write
   (the guarded update would hit an unknown `from_`). It logs `cycle.stuck`
   (`commit uncertain`) and ends the task. The row is in either the old state or the new
   one, both consistent with its event. `recover()` resolves it on the next start.
-  At admission, `CommitUncertain` → no task is started; a cycle that did commit stays
-  `NEW`, holds a cycle slot until restart, and `recover()` marks it `ERROR`. That is fail
-  safe: it can only block admissions, never allow extra ones.
+  At admission, `CommitUncertain` → no task is started. If the insert did commit
+  (possibly later), the cycle stays `NEW` until `recover()` marks it `ERROR`.
+- **Any `CommitUncertain`, at admission or on a transition, suspends admission** for the
+  rest of the process: the runner sets `admission_suspended`, logs
+  `cycle.admission_suspended` once at error level, and drops every later candidate
+  (`admission suspended: commit uncertain`). Reason: an uncertain admission insert may
+  become visible only after the next admission has counted the open cycles, which would
+  exceed `max_concurrent_cycles` (G14). Strictly, only admission inserts can make the count
+  too low (a transition that lands late can only make it look higher), but suspending on
+  both is simpler and still conservative. Cycles already running continue, so exits and
+  orders are unaffected. **Resolution is a restart:** `recover()` reads the final state
+  through a fresh connection pool after the old connection is gone. No in-process
+  re-verification with timing heuristics: an outcome-unknown commit is rare, and failing
+  closed on entries is the right trade.
 - A task done-callback removes the task from the runner's set and logs anything that
   escaped. This is a backstop; step code already catches.
 
@@ -388,8 +413,14 @@ are injected; no wall-clock asserts.
   - a failure before `check()` → `ERROR` via the fallback;
   - a failure after `check()` returned → stays `RISK_CHECK`, no `ERROR` write attempted,
     `cycle.stuck` logged;
-  - `CommitUncertain` on a transition → no fallback write, `cycle.stuck`, the task ends;
-    at admission → no task started.
+  - `RISK_CHECK → SUBMITTED` commits, then `SUBMITTED → FILLED` fails (fake engine acks
+    `filled`) → stays `SUBMITTED`, no `ERROR` write attempted, `cycle.stuck` logged;
+  - `CommitUncertain` on a transition → no fallback write, `cycle.stuck`, the task ends,
+    admission suspended; at admission → no task started, admission suspended;
+  - **late-landing admission:** the commit raises, `verify` returns false, then the
+    transaction becomes visible (the fake commits after an event is released) → the next
+    candidate is dropped (`admission suspended`), and the open-cycle count never exceeds
+    the cap; cycles already running still reach their terminal states.
 - **Shutdown:**
   - `close()` while an admission is held inside `build` → `close()` does not wait for the
     admission lock; the admission commits, sees `closing`, starts no task; the cycle
@@ -423,8 +454,8 @@ are injected; no wall-clock asserts.
     and the event are persisted and the event is delivered exactly once;
   - commit raises but the data is committed (fake commit that commits, then raises) →
     `verify` true → delivered once, `bus.commit_recovered` logged;
-  - commit raises and `verify` false → original exception, nothing delivered;
-  - commit raises and `verify` raises → `CommitUncertain`;
+  - commit raises and `verify` false → `CommitUncertain` (chained), nothing delivered;
+  - commit raises and `verify` raises → `CommitUncertain`, nothing delivered;
   - `close(budget)` while a `publish_tx` is in flight → it finishes and delivers within
     the budget; a later publish → `BusClosedError`; a unit blocked past the budget →
     `close()` returns by its deadline, `bus.task_abandoned` logged;
