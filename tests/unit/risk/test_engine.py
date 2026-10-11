@@ -484,6 +484,9 @@ async def test_exit_state_failure_rejects(
     )
     result = await make_engine_(broker, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
     assert result.decision.reasons == ("state unavailable: ConnectionError",)
+    (dec,) = await decisions(sessions)
+    assert (dec.kind, dec.approved, dec.cycle_id) == ("exit", False, None)
+    assert await orders(sessions) == []
 
 
 async def test_snapshot_tracks_hwm_and_daily_pnl(
