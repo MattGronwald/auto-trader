@@ -41,6 +41,7 @@ build-backend = "uv_build"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["docs/superpowers"]  # design docs with illustrative code, not project code
 
 [tool.ruff.lint]
 select = [

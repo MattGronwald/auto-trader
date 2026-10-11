@@ -150,6 +150,8 @@ def _set(data: dict[str, Any], path: str, value: Any) -> None:
         ("signal_rules.0.score", "1e309", "score"),
         ("learning.promote_if", "p_value * 2", "expected a bool"),
         ("risk.min_stop_atr", 3.0, "min_stop_atr"),
+        ("risk.entry_slippage_bps", 100, "entry_slippage_bps"),  # 1 % = max deviation
+        ("risk.entry_slippage_bps", -1, "entry_slippage_bps"),
         ("risk.max_daily_loss_pct", 0, "max_daily_loss_pct"),
         ("risk.max_position_pct", 101, "max_position_pct"),
         ("risk.default_win_rate_prior", 1.0, "default_win_rate_prior"),
@@ -171,6 +173,10 @@ def test_invalid_profile_rejected(
 
     with pytest.raises(ConfigError, match=match):
         parse_profile(profile_data)
+
+
+def test_entry_slippage_loaded_exactly(profile_data: dict[str, Any]) -> None:
+    assert parse_profile(profile_data).risk.entry_slippage_bps == Decimal("10")
 
 
 def test_unquoted_numeric_expression_accepted(profile_data: dict[str, Any]) -> None:
