@@ -94,6 +94,8 @@ An approved decision lists which cap bound the size (`adjusted["bound_by"]`).
    A non-dust held position without a current price (no feed price, or stale) makes the
    sum unknowable and rejects first: `held position <SYM> has no current price` (fail
    closed). Unpriced dust is ignored; priced dust still counts. Exits never need a price.
+   Intended consequence: a held asset outside the feed universe (e.g. bought manually)
+   never has a price, so it blocks every entry until it is sold.
 9. **Order rate.** Entry orders (including failed and unknown submits) in the rolling last
    60 min `< max_orders_per_hour`; since the trading-day start `< max_orders_per_day`.
    Exits never count.
@@ -123,16 +125,20 @@ can therefore never pass check 5 on the same state; together with the Cycle Runn
 
 **Time budget.** Because the lock is held across broker calls, each locked section has
 **one** budget, `RiskEngine(io_timeout_s=10.0)` (`run core` passes the default), measured
-from taking the lock and shared by its broker/gate steps: for an entry the gather, the
-pre-submit gate check and the submit; for an exit the position read and `close_position`.
-Each step gets what is left (`wait_for(..., deadline − now)`). A timeout keeps the
-stage-specific outcome (gather → `state unavailable: TimeoutError`, persisted; gate →
-`not_submitted`; submit or `close_position` → `unknown`). A step whose budget is already
-spent is not called: the gate counts as unavailable (`not_submitted`), and a submit or
-close that was never attempted is `not_submitted`, not `unknown`, because nothing reached
-the broker. So an `exit()` waits for the lock at most ~1 × `io_timeout_s` behind one
-in-flight entry, plus that entry's local journal writes (outside the budget), never
-forever. `asyncio.CancelledError` is never caught. Broker-side request timeouts in
+from taking the lock. Only the network/gate awaits draw on it: `gate.status`,
+`get_account`, `get_positions`, each `asset_rules` and `get_order`, and the submit or
+`close_position`; each gets what is left (`wait_for(..., deadline − now)`). Journal reads
+and writes (every DB session, the peak snapshot write) run outside any `wait_for`, so a
+timeout never cancels a DB session mid-statement or mid-commit — on a pooled Postgres
+connection that could break the next caller, such as an exit's `_persist`. A timeout keeps
+the stage-specific outcome (any gather await → `state unavailable: TimeoutError`,
+persisted; pre-submit gate → `not_submitted`; submit or `close_position` → `unknown`). A
+step whose budget is already spent is not called: the gate counts as unavailable
+(`not_submitted`), and a submit or close that was never attempted is `not_submitted`, not
+`unknown`, because nothing reached the broker. So an `exit()` waits for the lock at most
+~1 × `io_timeout_s` behind one in-flight entry, plus that entry's local journal work, never
+forever. `asyncio.CancelledError` is never caught. `snapshot_equity()` (lock-free) bounds
+its own broker calls with a separate budget. Broker-side request timeouts in
 `AlpacaBroker` remain WP 1.6.
 
 ### `check(intent) -> EntryResult`
@@ -234,7 +240,8 @@ If no snapshot exists at all, the engine takes one before checking.
   close → `unknown`, hung or raising pre-submit gate → `not_submitted`; gather, gate and
   submit share one budget (a check with a slow gather and a hung submit ends after ~1
   budget; a budget spent before the gate or submit skips them → `not_submitted`, no
-  broker order; same for an exit's close); an unpriced or
+  broker order; same for an exit's close; budget assertions use an injected budget clock,
+  never wall time); slow journal work in the gather is never cancelled by the budget; an unpriced or
   stale held position rejects entries but not exits; a retried `unknown` exit never sells
   twice. `run core`: a hung snapshot never delays kill detection at the default interval;
   a dead snapshot task is logged and restarted.

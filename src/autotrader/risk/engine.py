@@ -6,11 +6,14 @@ control gate again right before submitting, then submits. `exit()` is
 reduce-only and ignores kill/pause. Any failure while gathering rejects (fail closed).
 
 Each locked section has ONE budget of `io_timeout_s`, measured from taking the lock and
-shared by its broker/gate steps (entry: gather, pre-submit gate, submit; exit: position
-read, close). So a hung call inside one entry delays an exit by at most ~1 x
-`io_timeout_s` plus the local journal writes, which stay outside the budget. A step whose
-budget is already spent is not called: its timeout outcome applies, and a submit that was
-never attempted is `not_submitted`. `asyncio.CancelledError` is never caught.
+shared by its network/gate awaits only (gate.status, get_account, get_positions, each
+asset_rules and get_order, submit/close); each is wrapped in `_within`. Journal reads and
+writes (every `self._sessions()` block, `_write_snapshot`) run outside any `wait_for`, so
+a timeout never cancels a DB session mid-statement or mid-commit. A hung call inside one
+entry therefore delays an exit by at most ~1 x `io_timeout_s` plus local journal work. A
+step whose budget is already spent is not called: its timeout outcome applies, and a
+submit that was never attempted is `not_submitted`. `asyncio.CancelledError` is never
+caught.
 """
 
 import asyncio
@@ -20,6 +23,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from typing import Protocol, TypeVar
 
 import structlog
@@ -110,9 +114,7 @@ class RiskEngine:
             deadline = self._monotonic() + self._io_timeout
             now = self._clock()
             try:
-                control, portfolio, market = await self._within(
-                    deadline, lambda: self._gather_entry(intent.symbol, now)
-                )
+                control, portfolio, market = await self._gather_entry(intent.symbol, now, deadline)
             except Exception as e:  # fail closed: unknown state must not allow an entry
                 log.exception("risk.state_unavailable", symbol=intent.symbol)
                 decision = RiskDecision(
@@ -164,15 +166,17 @@ class RiskEngine:
             )
 
     async def _gather_entry(
-        self, symbol: str, now: datetime
+        self, symbol: str, now: datetime, deadline: float
     ) -> tuple[ControlStatus, PortfolioState, MarketSnapshot]:
-        control = await self._gate.status(now)
+        """Only the network/gate awaits are budgeted; a timeout raises out of here and
+        `check()` turns it into the persisted `state unavailable` rejection."""
+        control = await self._within(deadline, lambda: self._gate.status(now))
         # Refresh our own entries BEFORE reading positions: a fill the refresh observes
         # is then already in the positions read below (never neither-position-nor-entry).
-        open_rows = await self._refresh_open_entries()
-        account = await self._broker.get_account()
-        held = await self._held_positions()
-        rules = await self._broker.asset_rules(symbol)
+        open_rows = await self._refresh_open_entries(deadline)
+        account = await self._within(deadline, self._broker.get_account)
+        held = await self._held_positions(deadline)
+        rules = await self._within(deadline, lambda: self._broker.asset_rules(symbol))
         fees = self._broker.fee_schedule()
         async with self._sessions() as session:
             entries_hour = await repo.count_entry_orders(session, now - HOUR, inclusive=False)
@@ -223,7 +227,7 @@ class RiskEngine:
         )
         return control, portfolio, market
 
-    async def _refresh_open_entries(self) -> list[Order]:
+    async def _refresh_open_entries(self, deadline: float) -> list[Order]:
         """Order status sync for our own acked entries (WP 1.6 adds the fill stream):
         without it an IOC entry would stay `new` and block its symbol forever. No DB
         session is held open across the broker calls."""
@@ -233,7 +237,8 @@ class RiskEngine:
         changed: list[tuple[int, str]] = []
         for row in rows:
             if row.status == "new" and row.broker_order_id is not None:
-                status = await self._broker.get_order(row.broker_order_id)
+                get_order = partial(self._broker.get_order, row.broker_order_id)
+                status = await self._within(deadline, get_order)
                 if status.status != "new":
                     changed.append((row.id, status.status))
                     continue
@@ -244,17 +249,19 @@ class RiskEngine:
                     await repo.update_order(session, row_id, status=new_status, now=self._clock())
         return still_open
 
-    async def _held_positions(self, symbol: str | None = None) -> tuple[HeldPosition, ...]:
+    async def _held_positions(
+        self, deadline: float, symbol: str | None = None
+    ) -> tuple[HeldPosition, ...]:
         """Held positions with prices and rules. `symbol` narrows the (per-symbol REST)
         lookups to one asset, so an exit depends on nothing unrelated. `market_value` is
         None without a fresh feed price (never the cost basis): check 8 then rejects."""
         held = []
-        for p in await self._broker.get_positions():
+        for p in await self._within(deadline, self._broker.get_positions):
             if symbol is not None and p.symbol != symbol:
                 continue
             price = _dec(self._market.last_price(p.symbol))
             fresh = price is not None and not self._market.is_stale(p.symbol)
-            rules = await self._broker.asset_rules(p.symbol)
+            rules = await self._within(deadline, partial(self._broker.asset_rules, p.symbol))
             held.append(
                 HeldPosition(
                     symbol=p.symbol,
@@ -342,7 +349,7 @@ class RiskEngine:
             deadline = self._monotonic() + self._io_timeout
             now = self._clock()
             try:
-                held = await self._within(deadline, lambda: self._held_positions(request.symbol))
+                held = await self._held_positions(deadline, request.symbol)
             except Exception as e:  # fail closed: unknown positions must not size an exit
                 log.exception("risk.exit_state_unavailable", symbol=request.symbol)
                 decision = RiskDecision(
@@ -380,9 +387,11 @@ class RiskEngine:
     async def snapshot_equity(self) -> None:
         """Called every 60 s by `run core`'s background snapshot task, which bounds it.
         Lock-free on purpose: it must never delay an exit."""
+        deadline = self._monotonic() + self._io_timeout  # its own budget; no lock shared
         now = self._clock()
-        account = await self._broker.get_account()
-        await self._write_snapshot(now, account.equity, account.cash, await self._held_positions())
+        account = await self._within(deadline, self._broker.get_account)
+        held = await self._held_positions(deadline)
+        await self._write_snapshot(now, account.equity, account.cash, held)
 
     async def _write_snapshot(
         self, now: datetime, equity: Decimal, cash: Decimal, held: tuple[HeldPosition, ...]
