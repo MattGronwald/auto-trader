@@ -10,7 +10,9 @@ right away, but not resampled. When a window of the smallest higher timeframe is
 (its end + `grace` has passed), one REST fetch for all symbols covers it. REST is
 authoritative: it adds minutes the stream missed and replaces minutes the stream sent
 differently (persisted, logged as `feed.bar_corrected`, not re-announced). Accepted bars
-from either source update price age. The window is then fed to the resampler in order.
+from either source update price age, and stale symbols are marked fresh *before* the
+recovered bars and aggregates are announced, so subscribers see the final state. The
+window is then fed to the resampler in order.
 Higher timeframes are built from these verified minutes, so they are complete too.
 If REST keeps failing, the window is closed from stream data after `unverified_after`
 and logged as `feed.unverified_close`. While disconnected nothing is finalised (no flat
@@ -214,7 +216,13 @@ class MarketFeed:
                     await repo.upsert_bars(session, [bar])
                 log.warning("feed.late_bar", symbol=bar.symbol, ts=bar.ts.isoformat())
             else:
-                await self._accept(bar)
+                new = await self._accept(bar, announce=False)
+                # Freshness before the announcement, as in finalising: subscribers must
+                # never see a fresh bar while the symbol still reads as stale.
+                await self._mark_fresh(bar.symbol)
+                if new:
+                    await self._announce(bar)
+                return
         await self._mark_fresh(bar.symbol)
 
     async def on_quote(self, quote: Quote) -> None:
@@ -257,14 +265,22 @@ class MarketFeed:
                     "feed.unverified_close", since=start.isoformat(), until=due_end.isoformat()
                 )
                 verified = []
+            # 1. Merge: REST is authoritative within verification. It adds minutes the
+            #    stream missed and corrects minutes the stream delivered differently.
+            #    Persisted and price age updated, but nothing announced yet.
+            recovered: list[Bar] = []
             for b in verified:
-                # REST is authoritative within verification: it adds minutes the stream
-                # missed and corrects minutes the stream delivered differently.
                 old = self._pending[b.symbol].get(b.ts)
                 if old is not None and old != b:
                     log.info("feed.bar_corrected", symbol=b.symbol, ts=b.ts.isoformat())
-                if old != b:
-                    await self._accept(b)
+                if old != b and await self._accept(b, announce=False):
+                    recovered.append(b)
+            # 2. Freshness first, so subscribers of the bars below see the final state.
+            for symbol in self._symbols:
+                await self._mark_fresh(symbol)
+            # 3. Announce recovered minutes, then the verified aggregates.
+            for b in recovered:
+                await self._announce(b)
             for symbol in self._symbols:
                 for ts in sorted(t for t in self._pending[symbol] if t < due_end):
                     b = self._pending[symbol].pop(ts)
@@ -276,22 +292,23 @@ class MarketFeed:
                 self._append(higher)
                 await self._announce(higher)
             self._finalized_until = due_end
-        for symbol in self._symbols:  # recovered bars can make a stale symbol fresh
-            await self._mark_fresh(symbol)
 
     # --- internals -------------------------------------------------------------------
 
-    async def _accept(self, bar: Bar) -> None:
+    async def _accept(self, bar: Bar, *, announce: bool = True) -> bool:
         """New, duplicate or corrected bar for an unfinalised window: keep the latest
-        version, persist it, update price age; announce only the first time."""
-        known = bar.ts in self._pending[bar.symbol]
+        version, persist it, update price age. Returns whether the minute is new; it is
+        announced (if `announce`) only the first time."""
+        new = bar.ts not in self._pending[bar.symbol]
         self._pending[bar.symbol][bar.ts] = bar
         self._observe(bar.symbol, bar.ts + ONE_MINUTE)
         async with self._sessions() as session:
             await repo.upsert_bars(session, [bar])
-        if not known:
+        if new:
             self._density[bar.symbol] += 1
-            await self._announce(bar)
+            if announce:
+                await self._announce(bar)
+        return new
 
     def _append(self, bar: Bar) -> None:
         self._history.setdefault((bar.symbol, bar.timeframe), deque()).append(bar)

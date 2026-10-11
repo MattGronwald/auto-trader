@@ -564,3 +564,67 @@ async def test_recovered_bar_refreshes_price_age(
 
     assert not feed.is_stale(BTC)
     assert "SymbolFresh" in await event_types(sessions)
+
+
+async def test_subscribers_see_fresh_state_when_recovered_bars_arrive(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    # PR #10 third review: _stale was cleared only after the recovered bars had been
+    # announced, so a subscriber (the scanner) saw is_stale() == True for a fresh bar.
+    eth = "ETH/USD"
+    clock = Clock(T0 + M)
+    source = BrokenLatest([bar(0), bar(4, 104), bar(0, symbol=eth), bar(4, 14, symbol=eth)])
+    feed = make_feed(source, sessions, bus, clock, symbols=(BTC, eth))
+    seen: list[tuple[str, str, bool]] = []
+
+    async def on_closed(e: BarClosed) -> None:
+        seen.append((e.symbol, e.timeframe, feed.is_stale(e.symbol)))
+
+    bus.subscribe(BarClosed, on_closed)
+    await feed.on_bar(bar(0))
+    await feed.on_bar(bar(0, symbol=eth))
+    await feed.tick()
+    clock.now = T0 + 2 * M + 2 * S
+    await feed.tick()
+    assert feed.is_stale(BTC) and feed.is_stale(eth)
+    await bus.drain()
+    seen.clear()
+
+    clock.now = T0 + 5 * M + GRACE
+    await feed.tick()
+    await bus.drain()
+
+    assert {(s, tf) for s, tf, _ in seen} >= {(BTC, "5m"), (eth, "5m"), (BTC, "1m"), (eth, "1m")}
+    assert all(not stale for _, _, stale in seen), seen
+    types = await event_types(sessions)
+    last_fresh = max(i for i, t in enumerate(types) if t == "SymbolFresh")
+    first_recovered = min(
+        i for i, t in enumerate(types) if t == "BarClosed" and i > types.index("SymbolStale")
+    )
+    assert last_fresh < first_recovered  # freshness is announced before the recovered bars
+
+
+async def test_subscribers_see_fresh_state_for_a_live_bar_ending_a_stale_spell(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    # Same ordering bug on the stream path: the 1m bar was announced before the symbol
+    # was marked fresh.
+    clock = Clock(T0 + M)
+    feed = make_feed(BrokenLatest(), sessions, bus, clock)
+    seen: list[bool] = []
+
+    async def on_closed(e: BarClosed) -> None:
+        seen.append(feed.is_stale(e.symbol))
+
+    await feed.on_bar(bar(0))
+    await feed.tick()
+    clock.now = T0 + 2 * M + 2 * S
+    await feed.tick()
+    assert feed.is_stale(BTC)
+    bus.subscribe(BarClosed, on_closed)
+
+    clock.now = T0 + 3 * M + 2 * S
+    await feed.on_bar(bar(2))
+    await bus.drain()
+
+    assert seen == [False]
