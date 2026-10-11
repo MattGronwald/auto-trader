@@ -161,6 +161,7 @@ Every agent receives the **Strategy Profile summary** and the **Active Learnings
 Notes:
 - The Context Analyst is skipped (cycle goes straight to DECIDING) if no news source is configured. Do not hallucinate news. In Phase 1 there is no news source.
 - `size_fraction` is a *request*; the Risk Engine computes the actual size. The LLM never sees or sets absolute quantities.
+- Since D14 the Risk Engine prices every entry itself (marketable IOC limit at ask + `entry_slippage_bps`), so the Decision Maker's `entry` price is not used for the order; see PLAN D14.
 - Decision Maker prompt must require `strongest_counter` to be non-empty and `confidence` to be calibrated against the learnings block ("if learnings say setups like this won 35 % of the time, your confidence must reflect that").
 - All prompts live in `prompts/<agent>/<version>.md`, versioned; the version used is stored per call.
 

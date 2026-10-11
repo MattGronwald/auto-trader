@@ -75,8 +75,9 @@ An approved decision lists which cap bound the size (`adjusted["bound_by"]`).
 5. **Positions.** `len(positions ∪ open-entry symbols) < max_positions`; the symbol has
    neither a position nor an open entry order (no pyramiding). A position with `qty <
    asset_rules.min_qty` is **dust** and ignored, so a fee remainder cannot block a symbol.
-6. **Stop.** `stop < entry`; with `d = entry − stop`: `min_stop_atr × atr ≤ d ≤
-   max_stop_atr × atr`. `atr is None` rejects.
+6. **Stop.** `atr is None` rejects (checked first); then `stop < entry`; with `d = entry − stop`:
+   `min_stop_atr × atr ≤ d ≤ max_stop_atr × atr`. Only the persisted reason differs from the
+   reverse order.
 7. **Size (G4 + cash cap, D14).**
    `risk_qty = risk_per_trade_pct × equity / d`,
    `cap_qty = max_position_pct × equity / entry`,
@@ -90,7 +91,9 @@ An approved decision lists which cap bound the size (`adjusted["bound_by"]`).
    60 min `< max_orders_per_hour`; since the trading-day start `< max_orders_per_day`.
    Exits never count.
 10. **Price sanity.** `|limit − last_trade| ≤ max_price_deviation_pct × last_trade`;
-    `stop < limit < take_profit`.
+    `stop < limit < take_profit`. "Last trade" is the close of the feed's newest 1m bar
+    (pending or verified), which can be minutes old on sparse symbols (G13); do not widen
+    `max_price_deviation_pct` to silence those rejections.
 11. **Expectancy (G3, D4).** `win_rate_est = default_win_rate_prior` while
     `strategy_trades_n < learning.min_trades_for_evidence`, else `strategy_win_rate`.
     `p = min(confidence, win_rate_est + 0.10)`.
