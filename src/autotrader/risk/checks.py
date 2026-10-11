@@ -90,7 +90,7 @@ def check_entry(
             f"stop distance {distance} outside {limits.min_stop_atr}-"
             f"{limits.max_stop_atr} x ATR {market.atr}"
         )
-    return _size_and_finish(intent, portfolio, market, profile, entry, distance)
+    return _size_and_finish(intent, portfolio, market, profile, entry, distance, market.last_trade)
 
 
 def _size_and_finish(
@@ -100,6 +100,7 @@ def _size_and_finish(
     profile: StrategyProfile,
     entry: Decimal,
     distance: Decimal,
+    last_trade: Decimal,
 ) -> RiskDecision:
     limits, rules = profile.risk, market.rules
     taker = market.fees.taker_bps / _BPS
@@ -113,6 +114,40 @@ def _size_and_finish(
     qty = _step(intent.size_fraction * caps[bound_by], rules.qty_increment, ROUND_FLOOR)
     if qty < rules.min_qty or qty * entry < rules.min_notional:
         return _reject(f"size {qty} below broker minimum")
+    notional = qty * entry
+    # 8. exposure (reject, never shrink)
+    exposure = (
+        sum((p.market_value for p in portfolio.positions), Decimal(0))
+        + sum((o.notional for o in portfolio.open_entries), Decimal(0))
+        + notional
+    )
+    if exposure > limits.max_gross_exposure_pct / _PCT * portfolio.equity:
+        return _reject(f"exposure {exposure} > {limits.max_gross_exposure_pct} % of equity")
+    # 9. order rate (entries only; exits never count)
+    if portfolio.entries_last_hour >= limits.max_orders_per_hour:
+        return _reject(f"{portfolio.entries_last_hour} entry orders per hour >= limit")
+    if portfolio.entries_today >= limits.max_orders_per_day:
+        return _reject(f"{portfolio.entries_today} entry orders per day >= limit")
+    # 10. price sanity
+    if abs(entry - last_trade) > limits.max_price_deviation_pct / _PCT * last_trade:
+        return _reject(
+            f"entry {entry} deviates > {limits.max_price_deviation_pct} % from {last_trade}"
+        )
+    if intent.take_profit <= entry:
+        return _reject(f"take profit {intent.take_profit} not above entry {entry}")
+    # 11. fee-adjusted expectancy (G3, D4)
+    rate = portfolio.strategy_win_rate
+    if rate is None or portfolio.strategy_trades_n < profile.learning.min_trades_for_evidence:
+        rate = limits.default_win_rate_prior
+    p = min(intent.confidence, rate + WIN_RATE_MARGIN)
+    ev = (
+        qty * (intent.take_profit - entry) * p
+        - qty * distance * (1 - p)
+        - notional * taker
+        - qty * intent.take_profit * taker
+    )
+    if ev <= 0:
+        return _reject(f"expectancy {ev} <= 0 after fees (p = {p})")
     order = BrokerOrder(
         symbol=intent.symbol,
         side="buy",
@@ -125,7 +160,7 @@ def _size_and_finish(
     return RiskDecision(
         approved=True,
         reasons=(f"sized by {bound_by} cap",),
-        adjusted={"entry": str(entry), "bound_by": bound_by},
+        adjusted={"entry": str(entry), "bound_by": bound_by, "expected_value": str(ev)},
         qty=qty,
         order=order,
     )
