@@ -37,7 +37,7 @@ uv run mypy                  # strict, src + tests (paths from pyproject)
 uv run autotrader --help     # CLI; unimplemented commands exit 2
 uv run autotrader check-config  # validate config.yaml + env + profile, print profile hash
 uv run autotrader db upgrade    # apply migrations to config.yaml's database.url
-uv run autotrader run core       # market feed + kill detection against Alpaca paper (Ctrl-C stops)
+uv run autotrader run core       # market feed + scanner + kill detection against Alpaca paper (Ctrl-C stops)
 uv run autotrader kill [--reason ...] / kill --clear  # kill-switch (fallback: touch data/control/KILL)
 uv run alembic revision --autogenerate -m "..."  # new migration after editing journal/models.py
 ```

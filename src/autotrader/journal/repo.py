@@ -1,7 +1,8 @@
 """Journal access. Functions take an `AsyncSession` and commit their own unit of work.
 
-Only Phase 0 needs live here (strategies, bars, events, control state); the other tables
-get their functions in the work package that writes them. There is deliberately no
+Phase 0 needs live here (strategies, bars, events, control state), plus the read-only
+queries the Scanner (WP 1.2) runs on cycles and positions; the other tables get their
+write functions in the work package that writes them. There is deliberately no
 update/delete for events and no delete anywhere (SPEC §4.8: nothing is deleted).
 """
 
@@ -16,7 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from autotrader.core.config import StrategyProfile
 from autotrader.core.types import Bar
-from autotrader.journal.models import BarRow, ControlState, Event, Strategy
+from autotrader.journal.models import BarRow, ControlState, Cycle, Event, Position, Strategy
+
+# SPEC §4.3: a cycle in any other state is still open.
+TERMINAL_CYCLE_STATES = frozenset({"FILLED", "REJECTED", "EXPIRED", "ERROR"})
 
 
 def _now() -> datetime:
@@ -150,6 +154,30 @@ async def events_after(session: AsyncSession, after_id: int, limit: int = 500) -
         select(Event).where(Event.id > after_id).order_by(Event.id).limit(limit)
     )
     return list(rows)
+
+
+async def events_since(session: AsyncSession, type_: str, since: datetime) -> list[Event]:
+    """Events of `type_` with ts > `since`, oldest first."""
+    rows = await session.scalars(
+        select(Event).where(Event.type == type_, Event.ts > since).order_by(Event.id)
+    )
+    return list(rows)
+
+
+# --- cycles / positions (read side) --------------------------------------------------
+
+
+async def open_cycle_symbols(session: AsyncSession) -> list[str]:
+    """Symbol of every open (non-terminal) cycle; one entry per cycle."""
+    rows = await session.scalars(
+        select(Cycle.symbol).where(Cycle.state.not_in(TERMINAL_CYCLE_STATES))
+    )
+    return list(rows)
+
+
+async def open_position_symbols(session: AsyncSession) -> set[str]:
+    rows = await session.scalars(select(Position.symbol).where(Position.closed_at.is_(None)))
+    return set(rows)
 
 
 # --- control state -------------------------------------------------------------------

@@ -135,6 +135,9 @@ async def test_run_core_persists_bars_and_responds_to_kill_file(cfg: AppConfig) 
 
     started = next(ln for ln in _log_lines(buf) if ln["event"] == "core.started")
     assert started["mode"] == "paper"
+    scanner = next(ln for ln in _log_lines(buf) if ln["event"] == "scanner.subscribed")
+    assert scanner["timeframe"] == profile.timeframes.signal
+    assert scanner["rules"] == [r.id for r in profile.signal_rules]
     assert started["profile"] == "fast_momentum_v1"
     assert source.stopped.is_set()  # clean shutdown
     engine = make_engine(cfg.database.url)
