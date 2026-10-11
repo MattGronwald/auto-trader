@@ -151,6 +151,16 @@ async def test_sqlite_uses_wal(session: AsyncSession) -> None:
     assert mode == "wal"
 
 
+async def test_sqlite_busy_timeout_is_explicit(db_url: str) -> None:
+    """A locked database errors after 5 s instead of hanging a journal call forever."""
+    engine = make_engine(db_url)
+    try:
+        async with engine.connect() as conn:
+            assert (await conn.execute(text("PRAGMA busy_timeout"))).scalar() == 5000
+    finally:
+        await engine.dispose()
+
+
 def test_make_engine_creates_sqlite_parent_dir(tmp_path: Path) -> None:
     target = tmp_path / "nested" / "dir" / "x.db"
 
