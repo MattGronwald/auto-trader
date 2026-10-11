@@ -160,6 +160,13 @@ insert the `orders` row (no `client_order_id`: `Broker.close_position(symbol)` t
 so exits are identified by `broker_order_id`), `close_position`, record the outcome as above. The caller retries
 failed exits; a stop that failed must be attempted again.
 
+Retries are safe: every `exit()` re-reads the live position from the broker, and spot
+brokers (Alpaca, `SimBroker`) refuse to sell more than the free quantity. So if an
+accepted close lost its ack (`unknown`), a retry either finds no position (the sell
+filled → rejected by `check_exit`) or is refused by the broker (the sell is still open →
+`rejected`); it never sells twice. An `unknown` exit carries no ids (no
+`client_order_id`, no `broker_order_id`); WP 1.5 reconciles it by symbol and submit time.
+
 ### `snapshot_equity()`
 Called by `run core` every 60 s. Writes `equity_snapshots`: equity (from the broker
 account), cash, exposure (informational only, never used for a limit: an unpriced holding

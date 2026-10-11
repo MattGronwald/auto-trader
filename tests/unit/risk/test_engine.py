@@ -795,3 +795,44 @@ async def test_held_position_without_current_price_fails_entries_closed_not_exit
 
     exited = await engine.exit(ExitRequest(symbol=ETH, reason="stale"))
     assert exited.decision.approved and exited.status == "new"
+
+
+# --- ambiguous exits: a retry re-reads the position and cannot oversell -----------------
+
+
+class LostCloseAck(SimBroker):
+    """The broker accepts the close, but the ack never arrives (timeout after submit)."""
+
+    async def close_position(self, symbol: str) -> OrderAck:
+        await super().close_position(symbol)
+        raise TimeoutError
+
+
+def sells(broker: SimBroker) -> list[str]:
+    return [o.id for o in broker._orders.values() if o.order.side == "sell"]
+
+
+@pytest.mark.parametrize(("filled", "retry_status"), [(True, None), (False, "rejected")])
+async def test_retried_unknown_exit_never_sells_twice(
+    filled: bool,
+    retry_status: str | None,
+    sessions: async_sessionmaker[AsyncSession],
+    gate: ControlGate,
+) -> None:
+    broker = _sim(LostCloseAck)
+    await _held_btc(broker)
+    engine = make_engine_(broker, sessions, gate)
+    request = ExitRequest(symbol=BTC, reason="stop")
+    first = await engine.exit(request)
+    assert first.status == "unknown" and first.broker_order_id is None
+    if filled:
+        broker.process_bar(five(31))  # the lost sell fills: the position is gone
+    retry = await engine.exit(request)
+    if filled:  # the retry re-reads the position and finds nothing to sell
+        assert not retry.decision.approved and "no position" in retry.decision.reasons[0]
+    else:  # still held, but the broker refuses to sell more than the free qty
+        assert retry.decision.approved
+    assert retry.status == retry_status
+    assert len(sells(broker)) == 1
+    rows = [o.status for o in await orders(sessions)]
+    assert rows == (["unknown"] if filled else ["unknown", "rejected"])
