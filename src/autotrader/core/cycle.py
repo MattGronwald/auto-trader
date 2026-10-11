@@ -124,6 +124,8 @@ def signal_features(candidate: CandidateSignal) -> dict[str, Any]:
 
 
 STEP_TIMEOUT_S = 30.0  # SPEC §4.3: e.g. an LLM call > 30 s -> ERROR
+CLOSE_BUDGET_S = 20.0  # whole runner.close(); the hard deadline is process-level (WP 1.5)
+CANCEL_WAIT_S = 3.0  # part of the budget reserved for cancelled tasks to unwind
 NO_ANALYST = {"skipped": "no analyst in phase 1"}
 
 
@@ -351,6 +353,47 @@ class CycleRunner:
                     await self._move(row.id, state, S.ERROR, reason="interrupted")
                 else:
                     log.warning("cycle.awaiting_reconciliation", state=state)
+
+    # --- shutdown --------------------------------------------------------------------
+
+    async def close(
+        self, budget_s: float = CLOSE_BUDGET_S, cancel_wait_s: float = CANCEL_WAIT_S
+    ) -> CloseReport:
+        """Bounded, best-effort stop (§8). The whole call is bounded by `budget_s`.
+
+        Never waits for the admission lock: admission re-checks `closing` after its
+        commit and starts no task. Cycles before check() are cancelled; check() calls
+        are drained until `deadline - cancel_wait_s`, then cancelled (safe: the order
+        row is written before submit). Whatever still runs at the deadline is reported
+        and left to process exit.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + budget_s
+        self._closing = True
+        for cycle_id, task in list(self._tasks.items()):
+            if cycle_id not in self._checks:
+                task.cancel()
+        checks = dict(self._checks)
+        if checks:
+            drain = max(0.0, deadline - cancel_wait_s - loop.time())
+            await asyncio.wait(checks.values(), timeout=drain)
+        for cycle_id, check in checks.items():
+            if not check.done():
+                log.warning("cycle.forced_cancel", cycle_id=cycle_id)
+                check.cancel()
+                if (own := self._tasks.get(cycle_id)) is not None:
+                    own.cancel()
+        pending: list[asyncio.Future[Any]] = [t for t in self._tasks.values() if not t.done()]
+        pending += [c for c in checks.values() if not c.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=max(0.0, deadline - loop.time()))
+        abandoned = sorted(
+            {cid for cid, t in self._tasks.items() if not t.done()}
+            | {cid for cid, c in checks.items() if not c.done()}
+        )
+        for cycle_id in abandoned:
+            log.error("cycle.task_abandoned", cycle_id=cycle_id)
+        return CloseReport(tuple(abandoned))
 
     # --- transitions -----------------------------------------------------------------
 

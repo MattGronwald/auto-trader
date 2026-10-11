@@ -873,3 +873,121 @@ async def test_recover(
     await make_runner(sessions, bus, gate, FakeRisk(), strategy_id).recover()
     row = await cycle_row(sessions, cid)
     assert (row.state, row.reject_reason) == (after, reason)
+
+
+# --- shutdown (Task 7) ---------------------------------------------------------------
+
+
+async def test_close_cancels_a_cycle_before_check_and_recover_ends_it(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    deciding = asyncio.Event()
+
+    async def hang(c: CandidateSignal, snap: CycleSnapshot) -> Decision:
+        deciding.set()
+        await asyncio.Event().wait()
+        return StubSkip("unreachable")
+
+    runner = make_runner(sessions, bus, gate, FakeRisk(), strategy_id, decide=hang)
+    await runner.on_candidate(candidate())
+    await deciding.wait()
+    report = await runner.close(budget_s=5)
+    assert report.abandoned == ()
+    (row,) = await all_cycles(sessions)
+    assert row.state == "DECIDING"
+
+    await make_runner(sessions, bus, gate, FakeRisk(), strategy_id).recover()
+    assert (await cycle_row(sessions, row.id)).state == "ERROR"
+
+
+async def test_close_drains_a_check_that_finishes_in_time(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    risk = FakeRisk(approved("new"))
+    risk.release = asyncio.Event()
+    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    await runner.on_candidate(candidate())
+    await risk.started.wait()
+    closing = asyncio.create_task(runner.close(budget_s=5, cancel_wait_s=1))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not closing.done()  # draining the check
+    risk.release.set()
+    report = await closing
+    assert report.abandoned == ()
+    (row,) = await all_cycles(sessions)
+    assert row.state == "SUBMITTED"
+
+
+async def test_close_forces_a_check_past_the_drain_deadline(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    risk = FakeRisk(approved("new"))
+    risk.release = asyncio.Event()  # never set: check() only ends by cancellation
+    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    await runner.on_candidate(candidate())
+    await risk.started.wait()
+    with capture_logs() as logs:
+        report = await runner.close(budget_s=0.05, cancel_wait_s=0.04)
+    assert report.abandoned == ()
+    assert any(e["event"] == "cycle.forced_cancel" for e in logs)
+    (row,) = await all_cycles(sessions)
+    assert row.state == "RISK_CHECK"
+    # FakeRisk writes no order row, so this test proves the forced cancel only; that a
+    # forced cycle keeps a durable, recoverable order is proven on the real engine
+    # (Task 8, test_forced_shutdown_after_broker_acceptance_keeps_the_order_recoverable).
+
+
+async def test_close_reports_a_task_that_ignores_cancellation(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    risk = FakeRisk(approved("new"))
+    risk.release = asyncio.Event()
+    risk.swallow_cancel = True
+    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    await runner.on_candidate(candidate())
+    await risk.started.wait()
+    with capture_logs() as logs:
+        report = await runner.close(budget_s=0.05, cancel_wait_s=0.04)
+    (cid,) = report.abandoned
+    assert any(e["event"] == "cycle.task_abandoned" and e["cycle_id"] == cid for e in logs)
+    risk.release.set()  # clean up the abandoned check
+    await risk.finished.wait()
+
+
+async def test_close_does_not_wait_for_an_admission_and_that_cycle_never_starts(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered, release = hold_admission(monkeypatch)
+    risk = FakeRisk()
+    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    admitting = asyncio.create_task(runner.on_candidate(candidate(BTC)))
+    await entered.wait()
+    report = await asyncio.wait_for(runner.close(budget_s=5), timeout=5)  # safety net only
+    assert report.abandoned == ()
+    with capture_logs() as logs:
+        release.set()
+        await admitting
+        await runner.on_candidate(candidate(ETH))
+    assert any(e["event"] == "cycle.not_started" for e in logs)
+    assert dropped(logs) == ["shutting down"]
+    (row,) = await all_cycles(sessions)
+    assert row.state == "NEW" and risk.calls == []
+    await make_runner(sessions, bus, gate, FakeRisk(), strategy_id).recover()
+    assert (await cycle_row(sessions, row.id)).state == "ERROR"
