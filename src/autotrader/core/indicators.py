@@ -18,7 +18,8 @@ Definitions (D12):
   RSI is 100 with no losses in the average, 50 with neither gains nor losses.
 - Bollinger n, k: SMA n ± k x population std (ddof 0).
 - Donchian n: rolling max high / min low including the current bar.
-- vol_z n: (volume - SMA n) / population std n; zero std gives NaN, never inf.
+- vol_z n: (volume - SMA n) / population std n; a constant window (zero std, detected
+  exactly) gives NaN, never inf or a rounding artefact.
 - VWAP: typical price (h+l+c)/3 weighted by volume, cumulative from the start of the
   trading day in `trading_day_tz` (D5). The first day in the window may be partial (the
   window can start mid-day), so its VWAP is NaN; it is also NaN until the day has volume.
@@ -77,14 +78,16 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int) -> pd.Series:
 
 
 def _rolling_mean_std(values: pd.Series, n: int) -> tuple[pd.Series, pd.Series]:
-    """Exact two-pass mean/population std per window (a constant window gives exactly 0,
-    unlike pandas' streaming rolling std, which can leave float noise)."""
+    """Two-pass mean/population std per window. A constant window is detected exactly
+    (max == min) and gets its value as mean and std 0: summing e.g. 20 x 0.1 rounds away
+    from 0.1, which would otherwise leave a tiny std and a fake finite z of +-1."""
     mean = np.full(len(values), np.nan)
     std = mean.copy()
     if len(values) >= n:
         windows = sliding_window_view(values.to_numpy(dtype=float), n)
-        mean[n - 1 :] = windows.mean(axis=1)
-        std[n - 1 :] = windows.std(axis=1)
+        constant = windows.max(axis=1) == windows.min(axis=1)
+        mean[n - 1 :] = np.where(constant, windows[:, 0], windows.mean(axis=1))
+        std[n - 1 :] = np.where(constant, 0.0, windows.std(axis=1))
     return pd.Series(mean, index=values.index), pd.Series(std, index=values.index)
 
 
