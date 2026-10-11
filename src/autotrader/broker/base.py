@@ -14,6 +14,7 @@ from pydantic import AwareDatetime, BaseModel, BeforeValidator, ConfigDict, Fiel
 
 Side = Literal["buy", "sell"]
 OrderType = Literal["market", "limit"]
+TimeInForce = Literal["gtc", "ioc"]
 OrderState = Literal["new", "filled", "canceled", "rejected"]
 Mode = Literal["paper", "live"]
 
@@ -41,6 +42,7 @@ class BrokerOrder(_Frozen):
     qty: Dec = Field(gt=0)
     type: OrderType
     limit_price: Dec | None = Field(default=None, gt=0)
+    time_in_force: TimeInForce = "gtc"
     client_order_id: str | None = None
 
     @model_validator(mode="after")
@@ -95,11 +97,12 @@ class FeeSchedule(_Frozen):
 
 
 class AssetRules(_Frozen):
-    """Per-symbol order constraints used by sizing (G4)."""
+    """Per-symbol order constraints used by sizing and entry pricing (G4, D14)."""
 
     min_qty: Dec = Field(gt=0)
     qty_increment: Dec = Field(gt=0)
     min_notional: Dec = Field(ge=0)
+    price_increment: Dec = Field(gt=0)
 
 
 class BrokerError(Exception):

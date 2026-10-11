@@ -1,9 +1,12 @@
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from autotrader.core.config import load_profile, parse_profile
@@ -201,3 +204,172 @@ async def test_control_state_get_set(session: AsyncSession) -> None:
 
     assert await repo.get_control(session, "paused") is False
     assert await repo.get_control(session, "paused_until") == "2026-10-10T00:00:00+00:00"
+
+
+async def _cycle(session: AsyncSession) -> int:
+    strategy = await repo.register_strategy(session, load_profile(PROFILE_PATH), "yaml")
+    row = m.Cycle(
+        strategy_id=strategy.id,
+        symbol="BTC/USD",
+        rule_id="r",
+        signal_features={},
+        state="RISK_CHECK",
+        created_at=T0,
+    )
+    session.add(row)
+    await session.commit()
+    return row.id
+
+
+async def _order(
+    session: AsyncSession,
+    *,
+    status: str,
+    side: str = "buy",
+    at: datetime = T0,
+    cycle_id: int | None = None,
+) -> m.Order:
+    return await repo.insert_order(
+        session,
+        cycle_id=cycle_id,
+        client_order_id=None,
+        symbol="BTC/USD",
+        mode="paper",
+        type_="limit",
+        side=side,
+        qty=Decimal("1"),
+        limit_price=Decimal("100"),
+        stop_price=None,
+        tp_price=None,
+        status=status,
+        now=at,
+    )
+
+
+async def test_risk_decision_roundtrip(session: AsyncSession) -> None:
+    cycle_id = await _cycle(session)
+    row = await repo.record_risk_decision(
+        session,
+        cycle_id=cycle_id,
+        kind="entry",
+        approved=False,
+        reasons=["x"],
+        adjusted={"entry": "100.1"},
+        computed_size=None,
+        ts=T0,
+    )
+    assert (row.kind, row.reasons, row.adjusted) == ("entry", ["x"], {"entry": "100.1"})
+
+
+async def test_client_order_id_is_unique(session: AsyncSession) -> None:
+    cycle_id = await _cycle(session)
+    kw: dict[str, Any] = dict(
+        cycle_id=cycle_id,
+        client_order_id="at-c1-e",
+        symbol="BTC/USD",
+        mode="paper",
+        type_="limit",
+        side="buy",
+        qty=Decimal("1"),
+        limit_price=Decimal("1"),
+        stop_price=None,
+        tp_price=None,
+        status="pending",
+        now=T0,
+    )
+    await repo.insert_order(session, **kw)
+    with pytest.raises(IntegrityError):
+        await repo.insert_order(session, **kw)
+
+
+async def test_open_entry_orders_and_update(session: AsyncSession) -> None:
+    keep = [await _order(session, status=s) for s in ("pending", "new", "unknown")]
+    for s in ("filled", "canceled", "rejected", "not_submitted"):
+        await _order(session, status=s)
+    await _order(session, status="new", side="sell")
+    assert {o.id for o in await repo.open_entry_orders(session)} == {o.id for o in keep}
+    await repo.update_order(session, keep[1].id, status="filled", now=T0, broker_order_id="b1")
+    assert {o.id for o in await repo.open_entry_orders(session)} == {keep[0].id, keep[2].id}
+
+
+async def test_count_entry_orders_window(session: AsyncSession) -> None:
+    await _order(session, status="filled", at=T0)
+    await _order(session, status="rejected", at=T0 + timedelta(minutes=30))
+    await _order(session, status="not_submitted", at=T0 + timedelta(minutes=40))  # never sent
+    await _order(session, status="filled", side="sell", at=T0 + timedelta(minutes=40))  # exit
+    assert await repo.count_entry_orders(session, T0, inclusive=True) == 2
+    assert await repo.count_entry_orders(session, T0, inclusive=False) == 1
+
+
+async def test_snapshots_and_day_start_equity(session: AsyncSession) -> None:
+    assert await repo.latest_snapshot(session) is None
+    assert await repo.day_start_equity(session, T0) is None
+    for minutes, equity in ((-10, "990"), (5, "995")):
+        await repo.insert_equity_snapshot(
+            session,
+            ts=T0 + timedelta(minutes=minutes),
+            equity=Decimal(equity),
+            cash=Decimal(equity),
+            exposure=Decimal(0),
+            hwm=Decimal("1000"),
+            daily_pnl=Decimal(0),
+        )
+    assert await repo.day_start_equity(session, T0) == Decimal("990")  # last at/before
+    before_all = T0 - timedelta(hours=1)
+    assert await repo.day_start_equity(session, before_all) == Decimal("990")  # first after
+    latest = await repo.latest_snapshot(session)
+    assert latest is not None and latest.equity == Decimal("995")
+
+
+async def test_snapshot_exposure_may_be_unknown(session: AsyncSession) -> None:
+    await repo.insert_equity_snapshot(
+        session,
+        ts=T0,
+        equity=Decimal("1200"),
+        cash=Decimal("1000"),
+        exposure=None,  # an account observation without a positions read
+        hwm=Decimal("1200"),
+        daily_pnl=Decimal(0),
+    )
+    latest = await repo.latest_snapshot(session)
+    assert latest is not None and latest.exposure is None
+
+
+async def test_max_hwm_is_the_numeric_maximum_over_all_snapshots(session: AsyncSession) -> None:
+    assert await repo.max_hwm(session) is None
+    # Out of ts order, and "999.5" > "1200.000000000001" as strings (SQLite stores text).
+    for minutes, hwm in ((0, "1200.000000000001"), (1, "999.5"), (2, "1200")):
+        await repo.insert_equity_snapshot(
+            session,
+            ts=T0 + timedelta(minutes=minutes),
+            equity=Decimal("990"),
+            cash=Decimal("990"),
+            exposure=Decimal(0),
+            hwm=Decimal(hwm),
+            daily_pnl=Decimal(0),
+        )
+    assert await repo.max_hwm(session) == Decimal("1200.000000000001")
+
+
+async def test_strategy_trade_stats_counts_closed_trades_of_that_strategy(
+    session: AsyncSession,
+) -> None:
+    cycle_id = await _cycle(session)
+    cycle = await session.get(m.Cycle, cycle_id)
+    assert cycle is not None
+    for pnl, closed in (("5", True), ("-3", True), ("1", True), ("9", False)):
+        session.add(
+            m.Position(
+                cycle_id=cycle_id,
+                symbol="BTC/USD",
+                side="long",
+                qty=Decimal(1),
+                entry_price=Decimal(1),
+                opened_at=T0,
+                closed_at=T0 if closed else None,
+                realized_pnl=Decimal(pnl),
+            )
+        )
+    await session.commit()
+    assert await repo.strategy_trade_stats(session, cycle.strategy_id) == (3, 2)
+    assert await repo.strategy_trade_stats(session, cycle.strategy_id + 1) == (0, 0)

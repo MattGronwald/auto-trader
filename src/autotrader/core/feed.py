@@ -177,6 +177,18 @@ class MarketFeed:
     def history(self, symbol: str, timeframe: str) -> list[Bar]:
         return list(self._history.get((symbol, timeframe), ()))
 
+    def quote(self, symbol: str) -> Quote | None:
+        return self._quotes.get(symbol)
+
+    def last_price(self, symbol: str) -> float | None:
+        """Close of the newest 1m bar, pending (unverified) or verified: the freshest
+        trade price the feed has. Used for marking and price sanity, not for signals."""
+        candidates = list(self._pending.get(symbol, {}).values())
+        history = self._history.get((symbol, "1m"))
+        if history:
+            candidates.append(history[-1])
+        return max(candidates, key=lambda b: b.ts).close if candidates else None
+
     def spread_bps(self, symbol: str) -> float | None:
         q = self._quotes.get(symbol)
         if q is None or q.bid <= 0 or q.ask <= 0:

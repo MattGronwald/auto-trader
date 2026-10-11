@@ -23,6 +23,8 @@ def _sqlite_pragmas(dbapi_conn: Any, _record: Any) -> None:
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")  # off by default in SQLite
     cursor.execute("PRAGMA journal_mode=WAL")  # API reads while core writes
+    # A locked DB errors after 5 s instead of hanging (pinned, not left to the driver).
+    cursor.execute("PRAGMA busy_timeout=5000")
     cursor.close()
 
 

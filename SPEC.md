@@ -161,6 +161,7 @@ Every agent receives the **Strategy Profile summary** and the **Active Learnings
 Notes:
 - The Context Analyst is skipped (cycle goes straight to DECIDING) if no news source is configured. Do not hallucinate news. In Phase 1 there is no news source.
 - `size_fraction` is a *request*; the Risk Engine computes the actual size. The LLM never sees or sets absolute quantities.
+- Since D14 the Risk Engine prices every entry itself (marketable IOC limit at ask + `entry_slippage_bps`), so the Decision Maker's `entry` price is not used for the order; see PLAN D14.
 - Decision Maker prompt must require `strongest_counter` to be non-empty and `confidence` to be calibrated against the learnings block ("if learnings say setups like this won 35 % of the time, your confidence must reflect that").
 - All prompts live in `prompts/<agent>/<version>.md`, versioned; the version used is stored per call.
 
@@ -291,6 +292,8 @@ risk:                                         # HUMAN-EDITABLE ONLY. Learning lo
   max_orders_per_hour: 6
   max_orders_per_day: 30
   max_price_deviation_pct: 1.0
+  entry_slippage_bps: 10                      # D14: marketable IOC limit = ask + this
+  default_win_rate_prior: 0.40                # D4: used until n >= learning.min_trades_for_evidence
   trailing: { enabled: true, trigger_r: 1.0, trail_atr: 1.5 }
 
 budget:

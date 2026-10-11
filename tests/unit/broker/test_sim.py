@@ -21,10 +21,16 @@ T0 = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 BTC = "BTC/USD"
 RULES = {
     BTC: AssetRules(
-        min_qty=Decimal("0.0001"), qty_increment=Decimal("0.0001"), min_notional=Decimal("1")
+        min_qty=Decimal("0.0001"),
+        qty_increment=Decimal("0.0001"),
+        min_notional=Decimal("1"),
+        price_increment=Decimal("0.01"),
     ),
     "ETH/USD": AssetRules(
-        min_qty=Decimal("0.001"), qty_increment=Decimal("0.001"), min_notional=Decimal("1")
+        min_qty=Decimal("0.001"),
+        qty_increment=Decimal("0.001"),
+        min_notional=Decimal("1"),
+        price_increment=Decimal("0.01"),
     ),
 }
 FEES = FeeSchedule(maker_bps=Decimal("15"), taker_bps=Decimal("25"))
@@ -393,7 +399,10 @@ def test_cash_and_positions_never_go_negative_and_cash_is_conserved(
 async def test_min_qty_above_increment_and_unknown_asset_rules() -> None:
     rules = {
         "SOL/USD": AssetRules(
-            min_qty=Decimal("0.1"), qty_increment=Decimal("0.01"), min_notional=Decimal(0)
+            min_qty=Decimal("0.1"),
+            qty_increment=Decimal("0.01"),
+            min_notional=Decimal(0),
+            price_increment=Decimal("0.01"),
         )
     }
     sim = SimBroker(cash=Decimal(1000), fees=FEES, slippage_bps=Decimal(0), asset_rules=rules)
@@ -518,3 +527,44 @@ async def test_clock_never_moves_backwards() -> None:
     ack = await sim.submit_order(market("buy", "1"))
 
     assert ack.submitted_at == T0 + timedelta(minutes=5)
+
+
+def ioc_buy(qty: str, limit: str, symbol: str = BTC) -> BrokerOrder:
+    return BrokerOrder(
+        symbol=symbol,
+        side="buy",
+        qty=Decimal(qty),
+        type="limit",
+        limit_price=Decimal(limit),
+        time_in_force="ioc",
+    )
+
+
+async def test_ioc_limit_fills_through_limit_with_taker_fee() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100))
+    ack = await sim.submit_order(ioc_buy("1", "100.1"))
+    sim.process_bar(bar(1, 100.05, h=100.2, low=99.9))
+    status = await sim.get_order(ack.order_id)
+    assert status.status == "filled"
+    assert status.avg_fill_price == Decimal("100.05")  # better of open and limit
+    fill = await anext(sim.stream_fills())
+    assert fill.fee == Decimal("100.05") * Decimal("25") / Decimal(10_000)  # taker
+
+
+async def test_ioc_limit_not_reached_on_next_bar_is_canceled() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100))
+    ack = await sim.submit_order(ioc_buy("1", "100.1"))
+    sim.process_bar(bar(1, 101, h=101.5, low=100.5))
+    assert (await sim.get_order(ack.order_id)).status == "canceled"
+    sim.process_bar(bar(2, 99, h=99, low=98))  # would have filled a gtc order
+    assert (await sim.get_order(ack.order_id)).status == "canceled"
+    assert sim.cash == Decimal("1000")
+
+
+async def test_ioc_cash_reservation_uses_taker_fee() -> None:
+    sim = make_sim(cash="100.35")  # 100.1 * 1.0025 = 100.35025 > cash
+    sim.process_bar(bar(0, 100))
+    with pytest.raises(OrderRejected, match="insufficient cash"):
+        await sim.submit_order(ioc_buy("1", "100.1"))

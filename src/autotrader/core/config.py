@@ -248,13 +248,17 @@ class RiskLimits(_Frozen):
     max_orders_per_hour: Annotated[int, Field(ge=1)]
     max_orders_per_day: Annotated[int, Field(ge=1)]
     max_price_deviation_pct: Pct
+    entry_slippage_bps: Annotated[Decimal, Field(ge=0)]
     default_win_rate_prior: Annotated[Decimal, Field(gt=0, lt=1)]
     trailing: Trailing
 
     @model_validator(mode="after")
-    def _stop_band(self) -> Self:
+    def _consistent(self) -> Self:
         if self.min_stop_atr >= self.max_stop_atr:
             raise ValueError("min_stop_atr must be below max_stop_atr")
+        # Our own entry allowance must never trip the price-sanity check (D14).
+        if self.entry_slippage_bps / 100 >= self.max_price_deviation_pct:
+            raise ValueError("entry_slippage_bps must stay below max_price_deviation_pct")
         return self
 
 

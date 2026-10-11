@@ -79,6 +79,39 @@ async def test_migration_matches_models(db_url: str) -> None:
     assert changes == []
 
 
+def test_unknown_exposure_survives_downgrade_to_0002_as_zero(db_url: str) -> None:
+    async def insert_unknown() -> None:
+        engine = make_engine(db_url)
+        try:
+            async with make_sessionmaker(engine)() as s:
+                s.add(
+                    m.EquitySnapshot(
+                        ts=T0,
+                        equity=Decimal("1200"),
+                        cash=Decimal("1000"),
+                        exposure=None,
+                        hwm=Decimal("1200"),
+                        daily_pnl=Decimal(0),
+                    )
+                )
+                await s.commit()
+        finally:
+            await engine.dispose()
+
+    async def exposure_after() -> object:
+        engine = make_engine(db_url)
+        try:
+            async with engine.connect() as conn:
+                return (await conn.execute(text("SELECT exposure FROM equity_snapshots"))).scalar()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(insert_unknown())
+    downgrade(db_url, "0002")
+    assert Decimal(str(asyncio.run(exposure_after()))) == 0
+    upgrade(db_url)
+
+
 def test_downgrade_removes_tables(db_url: str) -> None:
     # Sync test: Alembic runs its own event loop.
     downgrade(db_url, "base")
@@ -116,6 +149,16 @@ async def test_sqlite_uses_wal(session: AsyncSession) -> None:
     mode = (await session.execute(text("PRAGMA journal_mode"))).scalar_one()
 
     assert mode == "wal"
+
+
+async def test_sqlite_busy_timeout_is_explicit(db_url: str) -> None:
+    """A locked database errors after 5 s instead of hanging a journal call forever."""
+    engine = make_engine(db_url)
+    try:
+        async with engine.connect() as conn:
+            assert (await conn.execute(text("PRAGMA busy_timeout"))).scalar() == 5000
+    finally:
+        await engine.dispose()
 
 
 def test_make_engine_creates_sqlite_parent_dir(tmp_path: Path) -> None:
