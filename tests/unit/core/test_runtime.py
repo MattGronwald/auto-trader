@@ -69,6 +69,9 @@ class FakeBroker:
     async def get_account(self) -> Account:
         return Account(equity=Decimal("100000"), cash=Decimal("100000"))
 
+    async def get_positions(self) -> list[Any]:
+        return []
+
     def mode(self) -> str:
         return "paper"
 
@@ -121,6 +124,7 @@ async def test_run_core_persists_bars_and_responds_to_kill_file(cfg: AppConfig) 
             connect_broker=fake_connect,
             stop=stop,
             tick_s=0.01,
+            snapshot_s=0.01,
         )
     )
     await _wait_for(lambda: any(ln["event"] == "core.started" for ln in _log_lines(buf)))
@@ -144,6 +148,8 @@ async def test_run_core_persists_bars_and_responds_to_kill_file(cfg: AppConfig) 
     async with make_sessionmaker(engine)() as s:
         assert await s.scalar(select(func.count()).select_from(m.BarRow)) == 2
         assert await s.scalar(select(func.count()).select_from(m.Strategy)) == 1
+        snapshots = await s.scalar(select(func.count()).select_from(m.EquitySnapshot))
+        assert snapshots is not None and snapshots >= 1
         closed = [e.payload for e in await s.scalars(select(m.Event)) if e.type == "BarClosed"]
     await engine.dispose()
     # Only the 1m announcements are deterministic: depending on the wall-clock minute, the

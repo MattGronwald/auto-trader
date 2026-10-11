@@ -61,7 +61,7 @@ def _not_implemented(command: str, wp: str) -> NoReturn:
 
 @run_app.command("core")
 def run_core(config: ConfigOption = Path("config.yaml")) -> None:
-    """Start the trading core: market feed now; scanner and cycles arrive in Phase 1."""
+    """Start the trading core: market feed, scanner, risk engine (equity snapshots)."""
     cfg = _load_config(config)
     settings = Settings()
     try:

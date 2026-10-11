@@ -112,10 +112,13 @@ can therefore never pass check 5 on the same state; together with the Cycle Runn
 (G14) the limits are exact.
 
 ### `check(intent) -> EntryResult`
-1. Gather: `ControlGate.status(now)`; broker account, positions, `asset_rules(symbol)`,
-   `fee_schedule()`; feed view (last trade, quote, staleness; ATR computed by the engine
-   from the signal-timeframe history, never taken from the intent); journal (open entry
-   orders, entry-order timestamps, `day_start_equity`, `hwm`, win rate). **Any failure
+1. Gather: `ControlGate.status(now)`; **first refresh the engine's own `new` entry orders
+   from `broker.get_order()`, holding no DB session across broker calls**, then read broker
+   account, positions, `asset_rules(symbol)`, `fee_schedule()` (refreshing first means a
+   fill between the two reads cannot hide the order from both); feed view (last trade,
+   quote, staleness; ATR computed by the engine from the signal-timeframe history, never
+   taken from the intent); journal (open entry orders, entry-order timestamps,
+   `day_start_equity`, `hwm`, win rate). **Any failure
    rejects** with `state unavailable: <error type>` and is persisted (fail closed).
 2. `check_entry(...)`; persist `risk_decisions` (kind `entry`). On rejection apply the
    `pause` side effect and return.
@@ -134,8 +137,8 @@ can therefore never pass check 5 on the same state; together with the Cycle Runn
 
 ### `exit(request) -> ExitResult`
 No gate check. Gather positions and asset rules, `check_exit`, persist (kind `exit`),
-insert the `orders` row with `client_order_id = "at-o{orders.id}"` (exits from a
-kill or flatten have no cycle), `close_position`, record the outcome as above. The caller retries
+insert the `orders` row (no `client_order_id`: `Broker.close_position(symbol)` takes none,
+so exits are identified by `broker_order_id`), `close_position`, record the outcome as above. The caller retries
 failed exits; a stop that failed must be attempted again.
 
 ### `snapshot_equity()`
@@ -158,7 +161,9 @@ If no snapshot exists at all, the engine takes one before checking.
   fee (it crosses the book); otherwise it is cancelled. `gtc` behaviour is unchanged.
 - **Profile:** `risk.entry_slippage_bps` with the validation in §3; added to
   `strategies/fast_momentum_v1.yaml`.
-- **Journal:** one Alembic migration adding `orders.client_order_id` (unique, nullable).
+- **Journal:** one Alembic migration adding `orders.client_order_id` (unique, nullable; entries only) and
+  `orders.symbol` (SPEC §7 has none; exits from a kill or flatten have no cycle to take it from,
+  and open entry orders must block their symbol).
   Repo functions for risk decisions, orders, equity snapshots, open entry orders, entry
   order timestamps and the strategy's closed-trade win rate (closed `positions` with
   `realized_pnl > 0`, i.e. net of fees, counted as wins; joined to the active strategy via

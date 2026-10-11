@@ -56,7 +56,7 @@ Volume tiers (30-day volume in USD → maker / taker bps):
 - **The docs' BTC example (`0.0001` / `0.0001` / `1`) is outdated.** Use the API values.
 - `min_order_size` differs per asset and looks like **~1 USD at current prices**. This is inferred, not documented, so it likely moves with price. Fetch it at sizing time; don't cache it for long.
 - **No minimum notional is published.** There is a **maximum of $200k notional per order**, irrelevant at PoC size. `AssetRules.min_notional` is therefore `0` for Alpaca.
-- `price_increment` isn't in `AssetRules` yet. Add it when limit-price rounding is needed (Phase 1).
+- `price_increment` is mapped into `AssetRules.price_increment` (WP 1.3) and used to round the marketable entry limit up.
 - **The API returns these as strings.** The `alpaca-py` models turn them into floats, so `AlpacaBroker` uses `raw_data=True` and reads them as exact `Decimal`s.
 
 ## Account

@@ -3,12 +3,15 @@ bars for the universe, persist 1m bars, respond to the kill-switch. Since WP 1.2
 Scanner runs on closed bars and persists `CandidateSignal`s; nothing consumes them until
 the Cycle Runner (WP 1.4).
 
-The broker is only connected to check the account and log it; nothing here keeps a
-reference (SPEC §0.1: only the Risk Engine holds a `Broker`, WP 1.3 hands it over).
+The broker is connected here and handed to the `RiskEngine`, which is its only holder from
+then on (SPEC §0.1); `run core` also snapshots equity every 60 s for the daily-loss and
+drawdown checks. Nothing calls `check()`/`exit()` until the Cycle Runner (WP 1.4) and
+Position Manager (WP 1.5).
 """
 
 import asyncio
 import contextlib
+import math
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -21,6 +24,7 @@ from autotrader.core.kill import ControlGate
 from autotrader.core.scanner import Scanner
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker
+from autotrader.risk.engine import RiskEngine
 
 log = structlog.get_logger(__name__)
 
@@ -37,6 +41,7 @@ async def run_core(
     connect_broker: BrokerConnect,
     stop: asyncio.Event,
     tick_s: float = 1.0,
+    snapshot_s: float = 60.0,
 ) -> None:
     """Run until `stop` is set. Raises if the stream dies or startup checks fail."""
     engine = make_engine(cfg.database.url)
@@ -46,7 +51,7 @@ async def run_core(
     try:
         async with sessions() as session:
             strategy = await repo.register_strategy(session, profile, profile_yaml)
-        await _check_broker(connect_broker, settings)
+        broker = await _check_broker(connect_broker, settings)
 
         timeframes = [
             profile.timeframes.signal,
@@ -70,6 +75,17 @@ async def run_core(
             timeframe=profile.timeframes.signal,
             rules=[r.id for r in profile.signal_rules],
         )
+        risk = RiskEngine(
+            broker,
+            profile=profile,
+            strategy_id=strategy.id,
+            mode=cfg.mode,
+            gate=gate,
+            market=feed,
+            sessions=sessions,
+            trading_day_tz=cfg.trading_day_tz,
+        )
+        log.info("risk.engine_ready", mode=cfg.mode)
         stream_task = asyncio.create_task(source.stream(feed.on_bar, feed.on_quote), name="feed")
         log.info(
             "core.started",
@@ -82,11 +98,19 @@ async def run_core(
         )
 
         killed: bool | None = None
+        loop = asyncio.get_running_loop()
+        last_snapshot = -math.inf  # the first tick snapshots
         while not stop.is_set():
             if stream_task.done():
                 stream_task.result()  # re-raise the stream's failure
                 raise RuntimeError("market data stream ended unexpectedly")
             await feed.tick()
+            if loop.time() - last_snapshot >= snapshot_s:
+                try:
+                    await risk.snapshot_equity()
+                except Exception:
+                    log.exception("risk.snapshot_failed")
+                last_snapshot = loop.time()
             status = await gate.status()
             if status.killed != killed:
                 if status.killed:
@@ -106,7 +130,7 @@ async def run_core(
         await engine.dispose()
 
 
-async def _check_broker(connect_broker: BrokerConnect, settings: Settings) -> None:
+async def _check_broker(connect_broker: BrokerConnect, settings: Settings) -> Any:
     broker = await connect_broker(settings)
     account = await broker.get_account()
     fees = broker.fee_schedule()
@@ -118,3 +142,4 @@ async def _check_broker(connect_broker: BrokerConnect, settings: Settings) -> No
         maker_bps=str(fees.maker_bps),
         taker_bps=str(fees.taker_bps),
     )
+    return broker
