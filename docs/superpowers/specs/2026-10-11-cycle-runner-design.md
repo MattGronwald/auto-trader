@@ -78,22 +78,24 @@ NEW → ENRICHING → ANALYZING → DECIDING → RISK_CHECK → SUBMITTED → FI
                                                                 → REJECTED
 ENRICHING → EXPIRED            (stale symbol, no ask, ATR missing or ≤ 0)
 DECIDING  → REJECTED           (stub skip)
-RISK_CHECK → EXPIRED           (signal stale on entry, §5)
 RISK_CHECK → REJECTED          (risk rejection)
 any non-terminal state → ERROR
 
-Shared edge (runner and WP 1.5 reconciliation):
+Shared edges (runner and WP 1.5 reconciliation):
 SUBMITTED  → FILLED            (runner: immediate `filled` ack; reconciliation: broker
                                 filled qty > 0, full or partial)
+RISK_CHECK → EXPIRED           (runner: signal stale on entry, §5, without calling `check()`;
+                                reconciliation: a cycle left in RISK_CHECK with an order
+                                row whose broker status is final with filled qty = 0)
 
 Reconciliation-only edges (taken by WP 1.5, never by the runner):
 SUBMITTED  → EXPIRED           (broker final with filled qty = 0)
-RISK_CHECK → FILLED | EXPIRED  (cycle left in RISK_CHECK with an order row, same rule)
+RISK_CHECK → FILLED            (cycle left in RISK_CHECK with an order row, filled qty > 0)
 ```
 
 The transition table is defined in WP 1.4, including the reconciliation-only edges, so
 WP 1.5 uses the same `transition_cycle` and audit trail. The runner never takes the
-reconciliation-only edges. On the shared edge the two sources differ only in `details`:
+reconciliation-only edges. On the shared edges the two sources differ only in `details`:
 the runner's immediate ack carries no filled qty, while reconciliation records
 `filled_qty`, `ordered_qty` and `partial`.
 
@@ -290,7 +292,7 @@ order:
 - does **not** hold a cycle slot once its cycle is terminal. The cycle cap limits work in
   flight (agent spend), not exposure.
 
-**Recovery** (`CycleRunner.recover()`, called once before subscribing):
+**Recovery** (`CycleRunner.recover()`, called once before subscribing; it raises `RuntimeError` if admission has started or a cycle task exists, and fails closed: the first failed write aborts it and the caller must then not subscribe the runner):
 - open cycles in `NEW`, `ENRICHING`, `ANALYZING`, `DECIDING` → `ERROR` (`interrupted`).
   Nothing was sent to the broker in those states;
 - `RISK_CHECK` with no `orders` row for the cycle → `ERROR` (`interrupted`). `check()`
@@ -498,7 +500,7 @@ the transition table.
     - process-level hard deadline: second signal or `shutdown.timeout_s` watchdog →
       `os._exit(1)`;
     - complete `SUBMITTED` and `RISK_CHECK`-with-order cycles from the order's broker
-      status via the reconciliation-only edges (`EXPIRED` only on a final status with
+      status via the reconciliation edges (`EXPIRED` only on a final status with
       filled qty 0; any fill, full or partial → `FILLED` + managed position);
     - reconcile open entry orders of any cycle state;
     - SimBroker next-bar fill/cancel integration tests;

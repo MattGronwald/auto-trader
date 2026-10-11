@@ -78,7 +78,7 @@ RUNNER_EDGES: frozenset[tuple[CycleState, CycleState]] = frozenset(
         (S.DECIDING, S.REJECTED),
         (S.RISK_CHECK, S.SUBMITTED),
         (S.RISK_CHECK, S.REJECTED),
-        (S.RISK_CHECK, S.EXPIRED),
+        (S.RISK_CHECK, S.EXPIRED),  # shared with reconciliation
         (S.SUBMITTED, S.FILLED),  # shared with reconciliation
         (S.SUBMITTED, S.REJECTED),
         *((s, S.ERROR) for s in S if s not in TERMINAL),
