@@ -7,7 +7,10 @@ and `canceled` ≠ nothing filled. Revised again after the second review: commit
 survives caller cancellation, with read-back on an uncertain commit; `publish_tx` callbacks
 return their event; shutdown budgets and abandoned tasks; reconciliation-only edges.
 Third review: only a positive read-back confirms a commit, and any uncertain commit
-suspends admission until restart; delivery and edge wording corrected.
+suspends admission until restart; delivery and edge wording corrected. Approved
+2026-10-11 with three implementation notes, folded in: suspension is checked inside the
+admission lock; the bus-owned unit reports `CommitUncertain` itself (`on_uncertain`); the
+Postgres caveat for recovery goes to WP 1.6.
 Sources: SPEC §0, §4.3, §4.4, §5, §7, §11; PLAN G14, D13, D14.
 Decisions taken while designing are recorded as PLAN **D15**.
 
@@ -149,7 +152,9 @@ agent calls, which is where queueing delay matters.
 3. Ask `ControlGate.status()`. Entries not allowed, or the gate raises → drop (the gate
    fails closed).
 4. Under the runner's admission lock:
-   - re-check `closing` → drop (`shutting down`);
+   - re-check `closing` → drop (`shutting down`) and `admission_suspended` → drop
+     (`admission suspended: commit uncertain`). Both flags are checked here, inside the
+     lock, not only before it;
    - `bus.publish_tx(build, verify)` (§6), where `build(session)`:
      - counts the non-terminal cycles. If ≥ `scanner.max_concurrent_cycles` → returns
        `None` (drop, `max_concurrent_cycles`);
@@ -178,7 +183,8 @@ mode; this adds "and one core process".
 
 `EventBus.publish(event)` is unchanged: persist in its own transaction, then deliver.
 
-`EventBus.publish_tx(build, verify) -> DomainEvent | None` is the transactional path:
+`EventBus.publish_tx(build, verify, *, on_uncertain=None) -> DomainEvent | None` is the
+transactional path:
 - `build: Callable[[AsyncSession], Awaitable[DomainEvent | None]]` does its writes in
   the given session without committing (flushing is fine, e.g. to obtain an id). It
   returns the event to persist, or `None`, meaning "nothing to do": the transaction is
@@ -207,7 +213,10 @@ still under the lock, calls `verify` once in a fresh session:
 - `True` → it was committed: enqueue the event and return it as if nothing went wrong
   (logged `bus.commit_recovered`);
 - `False` or `verify` raises → raise `CommitUncertain` (logged, chained to the original
-  exception). A negative read-back does **not** prove a rollback: after a lost
+  exception). **Before raising, the unit itself calls `on_uncertain(error)`** (a plain
+  synchronous callback; the runner passes the method that sets `admission_suspended`).
+  Suspension therefore never depends on the original caller still being there to catch
+  the exception: a cancelled caller never sees it. A negative read-back does **not** prove a rollback: after a lost
   acknowledgement the original `COMMIT` may still be in flight and become visible later.
   The bus never claims an outcome it can't establish. The caller must assume either
   outcome (§9).
@@ -368,8 +377,13 @@ a hard process deadline, not a clean in-process stop of every task.
   exceed `max_concurrent_cycles` (G14). Strictly, only admission inserts can make the count
   too low (a transition that lands late can only make it look higher), but suspending on
   both is simpler and still conservative. Cycles already running continue, so exits and
-  orders are unaffected. **Resolution is a restart:** `recover()` reads the final state
-  through a fresh connection pool after the old connection is gone. No in-process
+  orders are unaffected. The flag is set by the bus-owned unit through `on_uncertain`
+  (§6), not by the caller's `except` clause. **Resolution is a restart:** `recover()`
+  reads the final state through a fresh connection pool. On SQLite (this WP) a fresh
+  process is enough. On Postgres a fresh pool does not prove that the old server-side
+  `COMMIT` has finished. WP 1.6 must make startup recovery establish that the previous
+  process's transactions have resolved (e.g. no backend of the old process left in
+  `pg_stat_activity`, or terminating them first) before admission reopens. No in-process
   re-verification with timing heuristics: an outcome-unknown commit is rare, and failing
   closed on entries is the right trade.
 - A task done-callback removes the task from the runner's set and logs anything that
@@ -488,7 +502,9 @@ the transition table.
       filled qty 0; any fill, full or partial → `FILLED` + managed position);
     - reconcile open entry orders of any cycle state;
     - SimBroker next-bar fill/cancel integration tests;
-  - 1.6 row gains "one core process per journal"; fee-vs-ATR note next to D10.
+  - 1.6 row gains "one core process per journal" and the Postgres recovery caveat (§9:
+    establish that the old process's server-side transactions have resolved before
+    reopening admission); fee-vs-ATR note next to D10.
 - Scanner module docstring: G14 is now enforced by the Cycle Runner.
 - `core/bus.py` docstring: `publish_tx`, bus-owned commit-and-enqueue, uncertain-commit
   read-back, ordering guarantee, bounded `close()`.
