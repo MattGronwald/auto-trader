@@ -1,6 +1,7 @@
 """RiskEngine on SimBroker, a migrated SQLite journal and the real ControlGate."""
 
 import asyncio
+import io
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -32,6 +33,7 @@ from autotrader.core.kill import (
     ControlStatus,
     write_kill_file,
 )
+from autotrader.core.logging import configure_logging
 from autotrader.core.types import Bar, Quote
 from autotrader.journal import models as m
 from autotrader.journal import repo
@@ -144,6 +146,7 @@ def make_engine_(
     clock: Clock | None = None,
     tz: str = "UTC",
     io_timeout_s: float = 10.0,
+    monotonic: "Mono | None" = None,
 ) -> RiskEngine:
     return RiskEngine(
         broker,
@@ -156,6 +159,7 @@ def make_engine_(
         trading_day_tz=tz,
         clock=clock or Clock(NOW),
         io_timeout_s=io_timeout_s,
+        **({} if monotonic is None else {"monotonic": monotonic}),
     )
 
 
@@ -836,3 +840,121 @@ async def test_retried_unknown_exit_never_sells_twice(
     assert len(sells(broker)) == 1
     rows = [o.status for o in await orders(sessions)]
     assert rows == (["unknown"] if filled else ["unknown", "rejected"])
+
+
+# --- one shared deadline per locked section ---------------------------------------------
+
+
+class Mono:
+    """A monotonic clock the test advances (the engine's budget clock)."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class SlowAccountHangingSubmit(SimBroker):
+    delay = 0.0
+
+    async def get_account(self) -> Account:
+        await asyncio.sleep(self.delay)
+        return await super().get_account()
+
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        await hang()
+
+
+async def test_entry_stages_share_one_budget(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    """Gather uses 0.6 of the budget, the submit hangs: the whole check (and so the lock)
+    ends after ~1 budget, not gather + a fresh submit budget."""
+    configure_logging(stream=io.StringIO())  # production JSON logs, not the dev console
+    budget = 0.3
+    broker = _sim(SlowAccountHangingSubmit)
+    assert isinstance(broker, SlowAccountHangingSubmit)
+    broker.delay = 0.6 * budget
+    engine = make_engine_(broker, sessions, gate, io_timeout_s=budget)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await asyncio.wait_for(engine.check(intent(cycle_id)), 5)
+    elapsed = loop.time() - started
+    assert result.status == "unknown"
+    assert elapsed < budget + 0.08, f"check held the lock for {elapsed:.3f} s"
+
+
+class BudgetEatingGate:
+    """Allowed every time; the pre-submit call uses up the whole budget."""
+
+    def __init__(self, mono: Mono) -> None:
+        self.mono = mono
+        self.calls = 0
+
+    async def status(self, now: datetime | None = None) -> ControlStatus:
+        self.calls += 1
+        if self.calls == 2:
+            self.mono.t += 100.0
+        return ControlStatus(killed=False, reasons=())
+
+
+async def test_budget_spent_before_submit_is_not_submitted_and_never_reaches_broker(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], cycle_id: int
+) -> None:
+    mono = Mono()
+    engine = make_engine_(sim, sessions, BudgetEatingGate(mono), io_timeout_s=10, monotonic=mono)
+    result = await engine.check(intent(cycle_id))
+    assert result.decision.approved and result.status == "not_submitted"
+    (row,) = await orders(sessions)
+    assert (row.status, row.broker_order_id) == ("not_submitted", None)
+    assert sim._orders == {}  # nothing reached the broker
+
+
+class BudgetEatingAccount(SimBroker):
+    mono: Mono | None = None
+
+    async def get_account(self) -> Account:
+        assert self.mono is not None
+        self.mono.t += 100.0
+        return await super().get_account()
+
+
+async def test_budget_spent_by_gather_skips_the_gate_and_the_broker(
+    sessions: async_sessionmaker[AsyncSession], cycle_id: int
+) -> None:
+    mono = Mono()
+    broker = _sim(BudgetEatingAccount)
+    assert isinstance(broker, BudgetEatingAccount)
+    broker.mono = mono
+    counting = BudgetEatingGate(Mono())  # its own clock: only counts calls here
+    engine = make_engine_(broker, sessions, counting, io_timeout_s=10, monotonic=mono)
+    result = await engine.check(intent(cycle_id))
+    assert result.status == "not_submitted"
+    assert counting.calls == 1  # gathering only: the pre-submit gate was never asked
+    assert broker._orders == {}
+
+
+class BudgetEatingPositions(SimBroker):
+    mono: Mono | None = None
+
+    async def get_positions(self) -> list[Position]:
+        assert self.mono is not None
+        self.mono.t += 100.0
+        return await super().get_positions()
+
+
+async def test_exit_gather_and_close_share_one_budget(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    mono = Mono()
+    broker = _sim(BudgetEatingPositions)
+    assert isinstance(broker, BudgetEatingPositions)
+    await _held_btc(broker)
+    broker.mono = mono
+    engine = make_engine_(broker, sessions, gate, io_timeout_s=10, monotonic=mono)
+    result = await engine.exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert result.decision.approved and result.status == "not_submitted"
+    assert sells(broker) == []
+    (row,) = await orders(sessions)
+    assert (row.side, row.status) == ("sell", "not_submitted")

@@ -121,13 +121,17 @@ One `asyncio.Lock` serialises every entry and exit, from gathering to submit. Tw
 can therefore never pass check 5 on the same state; together with the Cycle Runner's caps
 (G14) the limits are exact.
 
-**Time budget.** Because the lock is held across broker calls, every broker/gate step
-under it is bounded by `RiskEngine(io_timeout_s=10.0)` (`run core` passes the default):
-the entry gather as a whole, the pre-submit gate check, each submit, and the exit's
-position read. A timeout is handled like any other failure of that step (gather → `state
-unavailable: TimeoutError`; gate → `not_submitted`; submit or `close_position` →
-`unknown`). So an `exit()` waits for the lock at most one in-flight entry's budgets — worst
-case 3 × `io_timeout_s` (gather, gate, submit) plus its local journal writes — never
+**Time budget.** Because the lock is held across broker calls, each locked section has
+**one** budget, `RiskEngine(io_timeout_s=10.0)` (`run core` passes the default), measured
+from taking the lock and shared by its broker/gate steps: for an entry the gather, the
+pre-submit gate check and the submit; for an exit the position read and `close_position`.
+Each step gets what is left (`wait_for(..., deadline − now)`). A timeout keeps the
+stage-specific outcome (gather → `state unavailable: TimeoutError`, persisted; gate →
+`not_submitted`; submit or `close_position` → `unknown`). A step whose budget is already
+spent is not called: the gate counts as unavailable (`not_submitted`), and a submit or
+close that was never attempted is `not_submitted`, not `unknown`, because nothing reached
+the broker. So an `exit()` waits for the lock at most ~1 × `io_timeout_s` behind one
+in-flight entry, plus that entry's local journal writes (outside the budget), never
 forever. `asyncio.CancelledError` is never caught. Broker-side request timeouts in
 `AlpacaBroker` remain WP 1.6.
 
@@ -227,7 +231,10 @@ If no snapshot exists at all, the engine takes one before checking.
   dust ignored; `day_start_equity` / `hwm` from snapshots. PR #13 review additions: a
   peak seen by a rejected check still bounds drawdown (also after a restart) and the HWM
   is the max over all snapshots; a hung entry gather cannot block an exit; hung submit /
-  close → `unknown`, hung or raising pre-submit gate → `not_submitted`; an unpriced or
+  close → `unknown`, hung or raising pre-submit gate → `not_submitted`; gather, gate and
+  submit share one budget (a check with a slow gather and a hung submit ends after ~1
+  budget; a budget spent before the gate or submit skips them → `not_submitted`, no
+  broker order; same for an exit's close); an unpriced or
   stale held position rejects entries but not exits; a retried `unknown` exit never sells
   twice. `run core`: a hung snapshot never delays kill detection at the default interval;
   a dead snapshot task is logged and restarted.

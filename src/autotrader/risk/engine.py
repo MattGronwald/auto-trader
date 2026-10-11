@@ -5,20 +5,22 @@ decision, applies a pause side effect on rejection, writes the order row, asks t
 control gate again right before submitting, then submits. `exit()` is
 reduce-only and ignores kill/pause. Any failure while gathering rejects (fail closed).
 
-Under the lock, each broker/gate step is bounded by `io_timeout_s`: the entry gather as
-a whole, the pre-submit gate check, each submit, the exit's position read. So a hung call
-inside one entry delays an exit by at most those budgets (worst case 3 x `io_timeout_s`
-plus the local journal writes) instead of blocking it forever. `asyncio.CancelledError`
-is never caught.
+Each locked section has ONE budget of `io_timeout_s`, measured from taking the lock and
+shared by its broker/gate steps (entry: gather, pre-submit gate, submit; exit: position
+read, close). So a hung call inside one entry delays an exit by at most ~1 x
+`io_timeout_s` plus the local journal writes, which stay outside the budget. A step whose
+budget is already spent is not called: its timeout outcome applies, and a submit that was
+never attempted is `not_submitted`. `asyncio.CancelledError` is never caught.
 """
 
 import asyncio
 import math
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -45,6 +47,7 @@ from autotrader.risk.types import (
 
 log = structlog.get_logger(__name__)
 HOUR = timedelta(hours=1)
+T = TypeVar("T")
 
 
 class RiskMarketView(Protocol):
@@ -85,6 +88,7 @@ class RiskEngine:
         trading_day_tz: str = "UTC",
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         io_timeout_s: float = 10.0,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._broker = broker
         self._profile = profile
@@ -96,16 +100,18 @@ class RiskEngine:
         self._tz = trading_day_tz
         self._clock = clock
         self._io_timeout = io_timeout_s
+        self._monotonic = monotonic  # the budget clock (injectable for tests)
         self._lock = asyncio.Lock()
 
     # --- entries ---------------------------------------------------------------------
 
     async def check(self, intent: EntryIntent) -> OrderResult:
         async with self._lock:
+            deadline = self._monotonic() + self._io_timeout
             now = self._clock()
             try:
-                control, portfolio, market = await asyncio.wait_for(
-                    self._gather_entry(intent.symbol, now), self._io_timeout
+                control, portfolio, market = await self._within(
+                    deadline, lambda: self._gather_entry(intent.symbol, now)
                 )
             except Exception as e:  # fail closed: unknown state must not allow an entry
                 log.exception("risk.state_unavailable", symbol=intent.symbol)
@@ -145,7 +151,7 @@ class RiskEngine:
                     now=now,
                 )
             try:
-                final = await asyncio.wait_for(self._gate.status(self._clock()), self._io_timeout)
+                final = await self._within(deadline, lambda: self._gate.status(self._clock()))
                 allowed, reasons = final.entries_allowed, list(final.reasons)
             except Exception as e:  # an unanswered gate is not an allowed gate
                 allowed, reasons = False, [f"gate unavailable: {type(e).__name__}"]
@@ -153,7 +159,9 @@ class RiskEngine:
                 await self._set_status(row.id, "not_submitted")
                 log.warning("risk.entry_not_submitted", reasons=reasons)
                 return OrderResult(decision, row.id, "not_submitted")
-            return await self._submit(row.id, decision, lambda: self._broker.submit_order(order))
+            return await self._submit(
+                row.id, decision, deadline, lambda: self._broker.submit_order(order)
+            )
 
     async def _gather_entry(
         self, symbol: str, now: datetime
@@ -258,11 +266,27 @@ class RiskEngine:
             )
         return tuple(held)
 
+    async def _within(self, deadline: float, call: Callable[[], Awaitable[T]]) -> T:
+        """Run `call` in what is left of the section's budget; a spent budget raises
+        TimeoutError without calling it."""
+        left = deadline - self._monotonic()
+        if left <= 0:
+            raise TimeoutError
+        return await asyncio.wait_for(call(), left)
+
     async def _submit(
-        self, row_id: int, decision: RiskDecision, call: Callable[[], Awaitable[OrderAck]]
+        self,
+        row_id: int,
+        decision: RiskDecision,
+        deadline: float,
+        call: Callable[[], Awaitable[OrderAck]],
     ) -> OrderResult:
+        if deadline - self._monotonic() <= 0:  # never attempted: nothing reached the broker
+            log.warning("risk.order_not_submitted", order_row=row_id, reason="budget spent")
+            await self._set_status(row_id, "not_submitted")
+            return OrderResult(decision, row_id, "not_submitted")
         try:
-            ack = await asyncio.wait_for(call(), self._io_timeout)
+            ack = await self._within(deadline, call)
         except OrderRejected as e:
             log.warning("risk.order_rejected", order_row=row_id, reason=str(e))
             await self._set_status(row_id, "rejected")
@@ -315,11 +339,10 @@ class RiskEngine:
         """Reduce-only full exit (G1). No gate check: kill and pause never block it.
         Carries no client_order_id because `Broker.close_position` takes none."""
         async with self._lock:
+            deadline = self._monotonic() + self._io_timeout
             now = self._clock()
             try:
-                held = await asyncio.wait_for(
-                    self._held_positions(request.symbol), self._io_timeout
-                )
+                held = await self._within(deadline, lambda: self._held_positions(request.symbol))
             except Exception as e:  # fail closed: unknown positions must not size an exit
                 log.exception("risk.exit_state_unavailable", symbol=request.symbol)
                 decision = RiskDecision(
@@ -349,7 +372,7 @@ class RiskEngine:
                     now=now,
                 )
             return await self._submit(
-                row.id, decision, lambda: self._broker.close_position(request.symbol)
+                row.id, decision, deadline, lambda: self._broker.close_position(request.symbol)
             )
 
     # --- equity snapshots ------------------------------------------------------------
