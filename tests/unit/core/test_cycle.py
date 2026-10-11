@@ -605,6 +605,7 @@ async def test_concurrency_cap_holds_for_simultaneous_candidates(
         second = asyncio.create_task(runner.on_candidate(candidate(ETH)))
         for _ in range(20):
             await asyncio.sleep(0)
+        assert not second.done()  # parked on the admission lock, not already dropped
         release.set()
         await asyncio.gather(first, second)
         await runner.join()
@@ -767,18 +768,30 @@ async def test_suspension_is_checked_inside_the_admission_lock(
 ) -> None:
     entered, release = hold_admission(monkeypatch)
     runner = make_runner(sessions, bus, OpenGate(), FakeRisk(approved("new")), strategy_id)
+    real_publish = runner._bus.publish_tx
+    publish_calls = 0
+
+    async def counted(*a: Any, **kw: Any) -> Any:
+        nonlocal publish_calls
+        if "_admit" in a[0].__qualname__:  # admission units only, not cycle transitions
+            publish_calls += 1
+        return await real_publish(*a, **kw)
+
+    monkeypatch.setattr(runner._bus, "publish_tx", counted)
     with capture_logs() as logs:
         first = asyncio.create_task(runner.on_candidate(candidate(BTC)))
         await entered.wait()
         second = asyncio.create_task(runner.on_candidate(candidate(ETH)))
         for _ in range(20):
             await asyncio.sleep(0)  # `second` passed the pre-lock checks and waits
+        assert runner._admission_lock.locked() and not second.done()
         runner._suspend(CommitUncertain("elsewhere"))
         release.set()
         await asyncio.gather(first, second)
         await runner.join()
     assert [c.symbol for c in await all_cycles(sessions)] == [BTC]
     assert dropped(logs) == ["admission suspended: commit uncertain"]
+    assert publish_calls == 1  # `second` was stopped by the in-lock check, never reached the bus
 
 
 async def test_suspension_by_a_surviving_unit_stops_an_admission_queued_on_the_bus(
