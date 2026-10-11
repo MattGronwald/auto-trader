@@ -8,7 +8,8 @@ sparse crypto feed, where many minutes have no bar at all.
 A bucket with no 1m bars becomes a flat bar at the previous close with zero volume, so
 higher-timeframe series stay evenly spaced for indicators. Nothing is emitted for a
 symbol before its first bar. A 1m bar arriving for an already closed bucket is counted
-in `late_bars` and ignored (it is still persisted by the feed).
+in `late_bars` and ignored for that timeframe, including as the flat-fill reference
+(it is still persisted by the feed).
 """
 
 import re
@@ -51,7 +52,7 @@ class Resampler:
         self._grace = grace
         self._open: dict[tuple[str, str], _Bucket] = {}  # (symbol, tf) -> current bucket
         self._next: dict[tuple[str, str], datetime] = {}  # first bucket start not yet closed
-        self._last_close: dict[str, float] = {}
+        self._last_close: dict[tuple[str, str], float] = {}  # accepted bars only, per tf
         self.late_bars = 0
 
     def add(self, bar: Bar) -> list[Bar]:
@@ -73,7 +74,7 @@ class Resampler:
             else:
                 b.high, b.low = max(b.high, bar.high), min(b.low, bar.low)
                 b.close, b.volume = bar.close, b.volume + bar.volume
-        self._last_close[bar.symbol] = bar.close
+            self._last_close[key] = bar.close
         closed.sort(key=_end)
         return closed
 
@@ -96,8 +97,9 @@ class Resampler:
         out: list[Bar] = []
         b = self._open.get(key)
         # In add() this runs before the new bar updates _last_close, so it is the close of
-        # the last bar *before* the gap; in close_until() the open bucket is emitted first.
-        prev_close = self._last_close.get(symbol)
+        # the last accepted bar *before* the gap; in close_until() the open bucket is
+        # emitted first. Rejected late bars never touch it.
+        prev_close = self._last_close.get(key)
         while cursor < start:
             if b is not None and b.start == cursor:
                 out.append(_to_bar(symbol, name, b))

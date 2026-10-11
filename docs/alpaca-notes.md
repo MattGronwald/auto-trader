@@ -99,7 +99,7 @@ Owner-approved paper order: market buy, notional $10 BTC/USD, `gtc`.
 - **Quotes only arrive on book changes.** In a 65 s live probe: BTC 0–4 quotes, ETH 5, SOL 0.
 - **Consequences:**
   - "No data for 60 s" can't tell a broken feed from a quiet market. The feed uses split health instead (PLAN D11).
-  - Higher timeframes are closed by time, with flat fills (G5).
+  - **Verify before finalising:** stream bars are only pending until one REST fetch per 5m window (all symbols) confirms the window. Missed minutes are merged in before higher timeframes are built; empty buckets become flat bars (G5).
   - **Strategy concern:** thin volume makes `vol_z`-style signals on this venue suspect. Check in WP 1.7 before relying on ETH/SOL.
 - **Library internals:** the live stream runs via `CryptoDataStream._run_forever()` (private; the public `run()` starts its own loop), and `connected()` reads the private `_running` flag. Re-check both on `alpaca-py` upgrades.
 

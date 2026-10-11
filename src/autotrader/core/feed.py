@@ -1,24 +1,31 @@
-"""Market data feed (SPEC §4.1, PLAN G5/G11/D6).
+"""Market data feed (SPEC §4.1, PLAN G5/G11/G13, D6/D11).
 
 Persists 1m bars, resamples them to the profile's timeframes, keeps rolling in-memory
 history and announces each closed bar as `BarClosed`.
 
-Health is split in two, because Alpaca's crypto feed is sparse (minutes without any
-bar, quotes only on book changes), so "no data" usually means "quiet market":
-- **Feed health** is connection-level (`source.connected()`). Before the first connection
-  the feed is starting up (no event; every symbol counts as stale). While disconnected nothing
-  is closed by time (no flat bars fabricated while blind) and every symbol counts as
-  stale; on reconnect the gap is backfilled first.
-- **Price age** per symbol is the time since the last bar or quote. Past
-  `stale_alert_s` the feed asks REST for the latest bar/quote (at most once per symbol
-  per `stale_alert_s`) before declaring the symbol stale. If REST shows a bar the stream
-  missed, that gap is backfilled.
+**Verify before finalising.** Alpaca's crypto feed is sparse (minutes without any bar
+are normal), so a missing minute in the stream can't be told apart from a minute
+without trades. Stream bars are therefore only *pending*: persisted and announced as 1m
+right away, but not resampled. When a window of the smallest higher timeframe is due
+(its end + `grace` has passed), one REST fetch for all symbols covers it; REST bars are
+merged with the stream's by minute, and the window is fed to the resampler in order.
+Higher timeframes are built from these verified minutes, so they are complete too.
+If REST keeps failing, the window is closed from stream data after `unverified_after`
+and logged as `feed.unverified_close`. While disconnected nothing is finalised (no flat
+bars made up while blind). A lock serialises stream input and finalising, so nothing
+slips in while a REST request is in flight.
 
-Backfilled history warms the in-memory frames but publishes no events, so the scanner
-never fires on old bars at startup. Hourly per-symbol bar counts are logged
-(`feed.density`) to judge how usable each symbol is on this venue.
+**Health is split (D11).** Feed health is the websocket connection; before the first
+connection the feed is starting up (no event). Per symbol, price age is the time since
+the last bar or quote; past `stale_alert_s` the feed asks REST for the latest bar/quote
+(at most once per symbol per `stale_alert_s`) before publishing `SymbolStale`.
+
+Backfill always refetches the full G5 window, so holes left in the DB by an earlier run
+heal on restart; it warms history but publishes no events, so the scanner never fires on
+old bars. Hourly per-symbol bar counts are logged (`feed.density`).
 """
 
+import asyncio
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -117,7 +124,8 @@ class MarketFeed:
         timeframes: list[str],
         stale_alert_s: int,
         lookback: int = MAX_INDICATOR_LOOKBACK,
-        grace: timedelta = timedelta(seconds=10),
+        grace: timedelta = timedelta(seconds=20),
+        unverified_after: timedelta = timedelta(seconds=60),
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._source = source
@@ -125,19 +133,25 @@ class MarketFeed:
         self._bus = bus
         self._symbols = symbols
         self._timeframes = [tf for tf in timeframes if tf != "1m"]
+        self._window = min((parse_timeframe(tf) for tf in self._timeframes), default=ONE_MINUTE)
         self._stale_after = timedelta(seconds=stale_alert_s)
         self._depth = backfill_depth(self._timeframes, lookback)
+        self._grace = grace
+        self._unverified_after = unverified_after
         self._clock = clock
         self._resampler = Resampler(self._timeframes, grace=grace)
         self._history: dict[tuple[str, str], deque[Bar]] = {
             (s, tf): deque(maxlen=2 * lookback) for s in symbols for tf in ["1m", *self._timeframes]
         }
-        self._last_bar_ts: dict[str, datetime] = {}
+        self._lock = asyncio.Lock()
+        self._pending: dict[str, dict[datetime, Bar]] = {s: {} for s in symbols}
+        self._finalized_until = bucket_start(clock(), self._window)
         self._observed: dict[str, datetime] = {}  # latest bar end / quote time per symbol
         self._quotes: dict[str, Quote] = {}
         self._stale: set[str] = set()
         self._rest_checked: dict[str, datetime] = {}
         self._connected: bool | None = None
+        self.late_bars = 0
         self._density: Counter[str] = Counter()
         self._density_hour: datetime | None = None
 
@@ -161,42 +175,44 @@ class MarketFeed:
     # --- startup ---------------------------------------------------------------------
 
     async def backfill(self) -> None:
-        """Fetch what the DB lacks for the G5 window, persist it, warm history. No events."""
+        """Refetch the full G5 window, persist it, warm history. Publishes no events."""
         now = self._clock()
         end = bucket_start(now, ONE_MINUTE)  # exclude the still forming minute
         start = end - self._depth
+        # Same rule as tick(): a window is only final once its end + grace has passed.
+        self._finalized_until = bucket_start(now - self._grace, self._window)
+        fetched = await self._source.history(self._symbols, start, end)
+        async with self._sessions() as session:
+            await repo.upsert_bars(session, fetched)
         for symbol in self._symbols:
-            async with self._sessions() as session:
-                latest = await repo.latest_bar_ts(session, symbol, "1m")
-            fetch_from = max(start, latest + ONE_MINUTE) if latest else start
-            if fetch_from < end:
-                bars = await self._source.history([symbol], fetch_from, end)
-                async with self._sessions() as session:
-                    await repo.upsert_bars(session, bars)
             async with self._sessions() as session:
                 stored = await repo.get_bars(session, symbol, "1m", since=start, until=end)
             for b in stored:
-                self._remember(b)
+                self._observe(symbol, b.ts + ONE_MINUTE)
+                if b.ts >= self._finalized_until:
+                    self._pending[symbol][b.ts] = b  # current window: verified on finalise
+                    continue
+                self._append(b)
                 for higher in self._resampler.add(b):
                     self._append(higher)
             log.info("feed.backfilled", symbol=symbol, bars=len(stored), since=start.isoformat())
-        for higher in self._resampler.close_until(now):
+        for higher in self._resampler.close_until(self._finalized_until + self._grace):
             self._append(higher)
 
     # --- live input ------------------------------------------------------------------
 
     async def on_bar(self, bar: Bar) -> None:
-        last = self._last_bar_ts.get(bar.symbol)
-        if last is not None and bar.ts <= last:
-            return  # duplicate or older (backfill overlap, reconnect replay)
-        async with self._sessions() as session:
-            await repo.upsert_bars(session, [bar])
-        self._remember(bar)
-        self._density[bar.symbol] += 1
-        await self._announce(bar)
-        for higher in self._resampler.add(bar):
-            self._append(higher)
-            await self._announce(higher)
+        async with self._lock:
+            self._observe(bar.symbol, bar.ts + ONE_MINUTE)
+            if bar.ts < self._finalized_until:
+                # Arrived after its window was verified and finalised: keep the DB right,
+                # but the aggregates are already published.
+                self.late_bars += 1
+                async with self._sessions() as session:
+                    await repo.upsert_bars(session, [bar])
+                log.warning("feed.late_bar", symbol=bar.symbol, ts=bar.ts.isoformat())
+            else:
+                await self._accept(bar)
         await self._mark_fresh(bar.symbol)
 
     async def on_quote(self, quote: Quote) -> None:
@@ -205,33 +221,66 @@ class MarketFeed:
         await self._mark_fresh(quote.symbol)
 
     async def tick(self) -> None:
-        """Run every ~second: connection state, time-based closes, staleness, density."""
+        """Run every ~second: connection state, verified finalising, staleness, density."""
         now = self._clock()
         connected = self._source.connected()
         if not connected and self._connected is None:
             return  # still starting up: never connected yet is not an outage
         if connected != self._connected:
-            was = self._connected
             self._connected = connected
             await self._bus.publish(FeedConnected() if connected else FeedDisconnected())
             log.warning("feed.connected" if connected else "feed.disconnected")
-            if connected and was is False:
-                await self._fill_gaps(now)
         if not connected:
             return
-        for higher in self._resampler.close_until(now):
-            self._append(higher)
-            await self._announce(higher)
+        await self._finalize_due(now)
         for symbol in self._symbols:
             await self._check_age(symbol, now)
         self._log_density(now)
 
+    # --- verified finalising ---------------------------------------------------------
+
+    async def _finalize_due(self, now: datetime) -> None:
+        due_end = bucket_start(now - self._grace, self._window)
+        if due_end <= self._finalized_until:
+            return
+        async with self._lock:
+            start = self._finalized_until
+            try:
+                verified = await self._source.history(self._symbols, start, due_end)
+            except Exception:
+                if now - (due_end + self._grace) < self._unverified_after:
+                    log.warning("feed.verify_failed_retrying", since=start.isoformat())
+                    return  # retry on the next tick
+                log.exception(
+                    "feed.unverified_close", since=start.isoformat(), until=due_end.isoformat()
+                )
+                verified = []
+            for b in verified:
+                if b.ts not in self._pending[b.symbol]:
+                    await self._accept(b)  # a minute the stream missed
+            for symbol in self._symbols:
+                for ts in sorted(t for t in self._pending[symbol] if t < due_end):
+                    b = self._pending[symbol].pop(ts)
+                    self._append(b)
+                    for higher in self._resampler.add(b):
+                        self._append(higher)
+                        await self._announce(higher)
+            for higher in self._resampler.close_until(due_end + self._grace):
+                self._append(higher)
+                await self._announce(higher)
+            self._finalized_until = due_end
+
     # --- internals -------------------------------------------------------------------
 
-    def _remember(self, bar: Bar) -> None:
-        self._append(bar)
-        self._last_bar_ts[bar.symbol] = bar.ts
-        self._observe(bar.symbol, bar.ts + ONE_MINUTE)
+    async def _accept(self, bar: Bar) -> None:
+        """New or duplicate bar for an unfinalised window: persist, announce if new."""
+        known = bar.ts in self._pending[bar.symbol]
+        self._pending[bar.symbol][bar.ts] = bar
+        async with self._sessions() as session:
+            await repo.upsert_bars(session, [bar])
+        if not known:
+            self._density[bar.symbol] += 1
+            await self._announce(bar)
 
     def _append(self, bar: Bar) -> None:
         self._history.setdefault((bar.symbol, bar.timeframe), deque()).append(bar)
@@ -261,7 +310,7 @@ class MarketFeed:
         checked = self._rest_checked.get(symbol)
         if checked is None or now - checked >= self._stale_after:
             self._rest_checked[symbol] = now
-            await self._refresh_from_rest(symbol, now)
+            await self._refresh_from_rest(symbol)
             if not self._too_old(symbol, now):
                 await self._mark_fresh(symbol)
                 return
@@ -272,36 +321,16 @@ class MarketFeed:
             await self._bus.publish(SymbolStale(symbol=symbol, age_s=age))
             log.warning("feed.symbol_stale", symbol=symbol, age_s=age)
 
-    async def _refresh_from_rest(self, symbol: str, now: datetime) -> None:
+    async def _refresh_from_rest(self, symbol: str) -> None:
+        """Price freshness only; missed bars are recovered when their window finalises."""
         try:
             latest = await self._source.latest(symbol)
         except Exception:
             log.exception("feed.rest_refresh_failed", symbol=symbol)
             return
-        last = self._last_bar_ts.get(symbol)
-        if latest.bar_end is not None and (last is None or latest.bar_end > last + ONE_MINUTE):
-            await self._fill_gap(symbol, now)  # the stream missed at least one bar
-        if latest.quote_ts is not None:
-            self._observe(symbol, latest.quote_ts)
-
-    async def _fill_gaps(self, now: datetime) -> None:
-        for symbol in self._symbols:
-            await self._fill_gap(symbol, now)
-
-    async def _fill_gap(self, symbol: str, now: datetime) -> None:
-        last = self._last_bar_ts.get(symbol)
-        start = last + ONE_MINUTE if last else bucket_start(now, ONE_MINUTE) - self._depth
-        end = bucket_start(now, ONE_MINUTE)
-        if start >= end:
-            return
-        try:
-            bars = await self._source.history([symbol], start, end)
-        except Exception:
-            log.exception("feed.gap_fill_failed", symbol=symbol)
-            return
-        for b in bars:
-            await self.on_bar(b)
-        log.info("feed.gap_filled", symbol=symbol, bars=len(bars), since=start.isoformat())
+        for ts in (latest.bar_end, latest.quote_ts):
+            if ts is not None:
+                self._observe(symbol, ts)
 
     def _log_density(self, now: datetime) -> None:
         hour = now.replace(minute=0, second=0, microsecond=0)
