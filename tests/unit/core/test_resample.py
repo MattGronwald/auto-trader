@@ -208,3 +208,30 @@ def test_matches_brute_force_on_sparse_minutes(
     got = [(b.ts, b.open, b.high, b.low, b.close, b.volume) for b in out]
     assert [g[:5] for g in got] == [e[:5] for e in expected]
     assert [g[5] for g in got] == pytest.approx([e[5] for e in expected])
+
+
+def test_rejected_late_bar_does_not_move_the_fill_price() -> None:
+    # PR #10 review: a late bar was ignored but still became the flat-fill reference.
+    r = Resampler(["5m"], grace=GRACE)
+    r.add(flat(0, 100))
+    r.close_until(T0 + 5 * M + GRACE)
+
+    assert r.add(flat(4, 900)) == []  # late for the closed bucket
+    (empty,) = r.close_until(T0 + 10 * M + GRACE)
+
+    assert empty.close == 100
+
+
+def test_fill_price_is_tracked_per_timeframe() -> None:
+    # Late for 5m but still accepted by the open 1h bucket: each keeps its own reference.
+    r = Resampler(["5m", "1h"], grace=GRACE)
+    r.add(flat(0, 100))
+    r.close_until(T0 + 5 * M + GRACE)
+    r.add(flat(4, 900))  # rejected by 5m, accepted by 1h
+
+    bars = r.close_until(T0 + 60 * M + GRACE)
+
+    five = [b for b in bars if b.timeframe == "5m"]
+    hour = [b for b in bars if b.timeframe == "1h"]
+    assert {b.close for b in five} == {100}
+    assert hour[0].close == 900

@@ -2,7 +2,7 @@ import asyncio
 import io
 import json
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -20,7 +20,6 @@ from autotrader.journal import models as m
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
 
 REPO = Path(__file__).resolve().parents[3]
-NOW = datetime.now(UTC).replace(second=0, microsecond=0)
 
 
 class StreamingSource:
@@ -41,11 +40,13 @@ class StreamingSource:
     ) -> None:
         if self.fail_stream:
             raise ConnectionError("stream died")
-        for i in (2, 1):
-            ts = NOW - timedelta(minutes=i)
+        # The current minute, computed now: never inside an already finalised window
+        # (windows before `now - grace` are final at startup; late bars aren't announced).
+        ts = datetime.now(UTC).replace(second=0, microsecond=0)
+        for symbol in ("BTC/USD", "ETH/USD"):
             await on_bar(
                 Bar(
-                    symbol="BTC/USD",
+                    symbol=symbol,
                     timeframe="1m",
                     ts=ts,
                     open=1,
