@@ -1,8 +1,10 @@
 # Auto Trader — Specification
 
-**Status:** Draft v1 · 2026-10-09
+**Status:** Draft v2 · reviewed against WP 0.1–0.8 and 1.1–1.4 · 2026-10-11
 **Owner:** Matthias
-**Purpose:** PoC for a fully automated, agent-based crypto trading system. Paper trading first, live trading with a ~1,000 EUR account later. This document is the single source of truth for implementation by Claude Code.
+**Purpose:** PoC for a fully automated, agent-based crypto trading system. Paper trading first, live trading with a ~1,000 EUR account later. This document defines the product requirements. `PLAN.md` records implementation status, work packages, and owner decisions. Accepted decisions must be reflected here; historical design notes are supporting context, not a separate source of conflicting requirements.
+
+**Implementation boundary:** WP 0.1–0.8 and 1.1–1.4 are implemented. `run core` currently feeds the Scanner and snapshots equity; it does **not** subscribe the Cycle Runner or trade. Position management, recovery of broker orders, and Alpaca order execution remain WP 1.5–1.6. Later-phase requirements below are targets, not claims of existing functionality. See [review findings](docs/spec-plan-review-2026-10-11.md).
 
 ---
 
@@ -12,10 +14,10 @@ These constraints override anything else in this document. If an implementation 
 
 1. **No order reaches a broker without passing the deterministic Risk Engine.** The Risk Engine is plain Python, has no LLM in its call path, and cannot be bypassed by any agent, config flag, or dashboard action. It is the only component with a reference to the broker's `submit_order`.
 2. **Every LLM call is metered and attributed.** Token count, model, USD cost, cycle id, agent name. Cost is a first-class P&L line item. A cycle that costs more than its expected edge is a bug.
-3. **Agents are called on signal, not on schedule.** The deterministic Signal Scanner runs continuously and cheaply; LLM agents run only when a candidate signal exists. There is no "call all agents every 15 minutes" loop.
+3. **Entry-decision agents are called on signal, not on schedule.** The deterministic Signal Scanner runs continuously and cheaply; Technical, Context, and Decision agents run only for admitted candidate signals. The Journal Reviewer is the explicit scheduled/on-demand exception (§8); it uses the same daily cost budget. Optional exit reviews are position-event driven and disabled by default. There is no "call all agents every 15 minutes" loop.
 4. **Learning is hypothesis-driven, gated, and reversible.** The system never silently rewrites its own strategy. Proposed changes are versioned, evaluated against a baseline, and promoted only by explicit rule (or human approval in the first phases).
 5. **Live mode requires a passed gate** (see §12). Paper → live is a deliberate, logged transition with a checklist, not a config change.
-6. **Kill-switch is a file and an API call**, independent of the LLM, the scheduler, and the dashboard backend. `touch KILL` stops all trading within one scanner tick.
+6. **Kill-switch has an independent file trigger and a control API.** The configured `control.kill_file` (locally `data/control/KILL`) or DB kill state blocks **new entries** within one healthy core tick and is rechecked before submission. Reduce-only exits remain available while killed or paused. Detection cannot recall an in-flight broker request or prevent a late fill: WP 1.5 must cancel outstanding entries and manage/flatten late fills according to `kill.flatten`. The CLI/file path works without the dashboard; the API arrives in Phase 3.
 
 ---
 
@@ -46,7 +48,7 @@ These constraints override anything else in this document. If an implementation 
 
 | Decision | Choice | Why | Rejected alternatives |
 |---|---|---|---|
-| Asset class | Crypto spot | 24/7 market, no US PDT rule (3 day-trades / 5 days under 25k USD kills a "fast" equities strategy), high volatility suits short horizon | US equities swing (slower), equities intraday (illegal at this account size) |
+| Asset class | Crypto spot | 24/7 spot market, small-account experimentation, volatility suits the proposed short horizon; broker/account/jurisdiction eligibility is checked separately before live | US equities swing (slower), equities intraday (different broker/account restrictions) |
 | Broker | Alpaca (paper + live), behind a `Broker` interface | One API for paper and live, Python SDK (`alpaca-py`), crypto + equities for later | IBKR (best EU API but Gateway setup overhead), Kraken (fallback — see risk below) |
 | Language | Python 3.12 | Ecosystem: alpaca-py, pandas, pydantic, backtesting libs | TypeScript (thin quant ecosystem) |
 | LLM | Anthropic API directly, thin custom agent loop | Full cost control, no framework abstraction in the debugging path | Agent SDK, LangGraph, CrewAI |
@@ -128,24 +130,25 @@ Target design: scanner finds ~5–20 candidate signals/day; each triggers 2–3 
 
 ### 4.1 Market Data Feed
 - Alpaca crypto WebSocket for trades/quotes/bars on the configured universe; REST backfill of historical bars on startup.
-- Maintains rolling in-memory OHLCV frames per symbol per timeframe (1m, 5m, 15m, 1h) with computed indicators (EMA 9/21/50, RSI 14, ATR 14, VWAP, volume z-score, Bollinger, Donchian 20).
+- Maintains rolling OHLCV frames from 1m bars for **every timeframe in the profile**, including the 4h trend frame. Computes EMA 9/21/50, RSI 14, ATR 14, VWAP, volume z-score, Bollinger and Donchian 20 using PLAN D12 definitions. Backfill covers the largest indicator lookback/timeframe and a complete trading day for anchored VWAP (PLAN G5/D12).
 - Persists 1m bars to DB for backtesting and journal replay.
 - Emits `BarClosed(symbol, timeframe)` events.
-- Health: if no data for a symbol for > N seconds, mark symbol stale → scanner ignores it, position manager still runs on last known price with stale flag, dashboard shows warning.
+- Health separates stream connectivity from per-symbol price age (PLAN D11). Refresh latest bar/quote via REST before declaring a symbol stale; Scanner suppresses stale symbols. The Position Manager alerts for stale held symbols and applies `feed.stale_exit_s` / `feed.stale_exit_enabled` (default off in paper, on in live); a stale price is not proof that a stop is safe.
+- Higher-timeframe windows normally use REST-verified bars; empty buckets are flat-filled. The current feed can close a window unverified after 60 s of REST failures. WP 1.7 must report missing/synthetic/unverified data limitations rather than interpret every bucket as an observed trade. The current Scanner rejects a 1m signal timeframe (PLAN D13).
 
 ### 4.2 Signal Scanner (deterministic, no LLM)
 - Subscribes to `BarClosed`. Runs the strategy profile's **signal rules** (see §6) on every closed bar.
 - Emits `CandidateSignal(symbol, direction, rule_id, features: dict, score: float)`.
-- Rate limit: max N candidates per symbol per hour, max M concurrent open cycles (both from strategy profile). This is the primary LLM cost control.
+- Candidate rate limit: max N per symbol in a rolling 60 minutes, counted from persisted candidate events. Scanner cycle/position checks are soft pre-filters; the Cycle Runner authoritatively enforces max M open cycles and one open cycle per symbol at admission (PLAN G14). Daily/per-cycle LLM budgets are enforced separately in Phase 2.
 - Pre-filters: no signal if symbol stale, if spread > max_spread_bps, if volume z-score < threshold, if symbol already has an open position or open cycle, if daily loss limit hit, if kill-switch set.
 
 ### 4.3 Cycle Runner (deterministic FSM)
 States: `NEW → ENRICHING → ANALYZING → DECIDING → RISK_CHECK → SUBMITTED → (FILLED | REJECTED | EXPIRED | ERROR)`.
 
-- One cycle per `CandidateSignal`. Every state transition is persisted with timestamp and payload (full audit trail).
-- Timeouts per state (e.g. LLM call > 30 s → `ERROR`, logged, cycle discarded; no retry storms).
-- Budget check before each LLM call: if daily LLM budget exceeded → cycle `EXPIRED` with reason `budget`.
-- *Note 2026-10-11 (WP 1.4, PLAN D15):* a stub/agent skip ends the cycle `REJECTED` (no SKIPPED state). `RISK_CHECK` and `SUBMITTED` have no timeout; only a bounded forced shutdown cancels `check()`, which is safe because the order row is written before submit. After submission only proven outcomes are mapped (`filled` → `FILLED`; `rejected`/`not_submitted` → `REJECTED`); `new`/`unknown`/`canceled` stay `SUBMITTED` until reconciliation (WP 1.5), which will set `EXPIRED` only on a filled qty of 0 and `FILLED` on any fill. Orders are reconciled by order row, not by cycle state.
+- At most one cycle per delivered, admitted `CandidateSignal`; stale, gated, or excess candidates are dropped with a reason. This depends on the current in-process, non-replaying event bus. Durable replay would require a unique candidate identity before it can be enabled. Every state transition and its `CycleTransitioned` event are committed atomically; event-specific data lives in `details` inside the persisted event payload.
+- Pre-order enrichment/agent steps have bounded timeouts (default 30 s → `ERROR`). `RISK_CHECK` has no outer per-step timeout or automatic retry: the engine bounds broker/gate I/O, and an interrupted submission may already exist at the broker. Shutdown and reconciliation follow PLAN D15.
+- Phase 2 reserves a conservative maximum call cost **before** each request, atomically against both remaining daily and per-cycle budgets, including concurrent calls. Insufficient budget → cycle `EXPIRED` with reason `budget`. Set a bounded output-token limit, account for all billable token classes/retries, settle actual usage afterward, and retain uncertain charges until resolved. Merely checking spend so far cannot enforce a hard cap.
+- *Note 2026-10-11 (WP 1.4, PLAN D15):* a stub/agent skip ends the cycle `REJECTED` (no SKIPPED state). `RISK_CHECK` and `SUBMITTED` have no timeout; only a bounded forced shutdown cancels `check()`, preserving recovery evidence because the order row is written before submit; this does not prove broker execution stopped. After submission only proven outcomes are mapped (`filled` → `FILLED`; `rejected`/`not_submitted` → `REJECTED`); `new`/`unknown`/`canceled` stay `SUBMITTED` until reconciliation (WP 1.5), which will set `EXPIRED` only on a filled qty of 0 and `FILLED` on any fill. Orders are reconciled by order row, not by cycle state.
 
 ### 4.4 Agents
 All agents share a common runner: build prompt from template + context → call Anthropic API with tool-use/structured output → validate with pydantic → persist request/response/tokens/cost → return typed object. No agent has side effects on the broker or DB beyond its own log.
@@ -156,33 +159,40 @@ Every agent receives the **Strategy Profile summary** and the **Active Learnings
 |---|---|---|---|---|
 | **Technical Analyst** | Haiku-class | Signal features, last 50 bars (compact table), indicators, regime stats | `TechnicalAssessment{setup_quality: 0–1, trend_alignment: enum, volatility_regime: enum, key_levels: [..], invalidation_price, notes}` | < 0.005 USD |
 | **Context Analyst** | Haiku-class | Headlines last 24 h for the asset (if a news source is configured), funding rate, BTC correlation, time-of-day/weekend flags, upcoming known events | `ContextAssessment{sentiment: -1..1, event_risk: enum, notable_items: [..], confidence}` | < 0.005 USD |
-| **Decision Maker** | Sonnet-class | Both assessments + portfolio state + risk context + active learnings | `OrderIntent{action: BUY/SELL/SKIP, symbol, side, size_fraction: 0–1 of max allowed, entry: MARKET/LIMIT@price, stop_price, take_profit_price, time_limit_min, confidence: 0–1, thesis: str, strongest_counter: str, learnings_applied: [ids]}` | < 0.03 USD |
+| **Decision Maker** | Sonnet-class | Both assessments + portfolio state + risk context + active learnings | `OrderIntent{action: BUY/SKIP, symbol, size_fraction: (0,1] for BUY, stop_price, take_profit_price, time_limit_min, confidence: 0–1, thesis: str, strongest_counter: str, learnings_applied: [ids]}` | < 0.03 USD |
 | **Journal Reviewer** | Sonnet/Opus-class | Closed trades since last review, outcomes vs. thesis, equity vs. benchmark, cost, current hypotheses | `ReviewReport{trade_postmortems: [..], new_hypotheses: [..], hypothesis_evidence_updates: [..], promote: [ids], retire: [ids], summary}` | < 0.50 USD/day |
 
 Notes:
-- The Context Analyst is skipped (cycle goes straight to DECIDING) if no news source is configured. Do not hallucinate news. In Phase 1 there is no news source.
+- Phase 1 uses the deterministic stub only; `ANALYZING` is recorded as skipped. Phase 2 runs the Technical Analyst and Decision Maker. The Context Analyst remains disabled without a configured news source; skipping it does not skip the Technical Analyst. Funding/news inputs require a real configured source; do not invent them.
 - `size_fraction` is a *request*; the Risk Engine computes the actual size. The LLM never sees or sets absolute quantities.
-- Since D14 the Risk Engine prices every entry itself (marketable IOC limit at ask + `entry_slippage_bps`), so the Decision Maker's `entry` price is not used for the order; see PLAN D14.
+- The Phase 2 agent schema is mapped to the implemented `EntryIntent(cycle_id, symbol, stop, take_profit, confidence, size_fraction)`; SKIP never calls the Risk Engine. The engine owns quantity and entry price (marketable IOC limit, PLAN D14). Hold time/thesis/learnings are durable position-management and journal metadata, not broker instructions. Long-only entries and full reduce-only exits are the PoC scope; optional exit proposals use the Position Manager → `exit()` path.
 - Decision Maker prompt must require `strongest_counter` to be non-empty and `confidence` to be calibrated against the learnings block ("if learnings say setups like this won 35 % of the time, your confidence must reflect that").
 - All prompts live in `prompts/<agent>/<version>.md`, versioned; the version used is stored per call.
 
 ### 4.5 Risk Engine (deterministic)
-Pure function `check(intent: OrderIntent, portfolio: PortfolioState, market: MarketSnapshot, limits: RiskLimits) -> RiskDecision{approved: bool, order: BrokerOrder | None, reasons: [str], adjusted_fields: dict}`.
+The implemented `RiskEngine` in `risk/engine.py` owns the broker, state reads, persistence and submission. Its `check(EntryIntent)` and `exit(ExitRequest)` return an `OrderResult` containing the decision and any order status/ids. The deterministic functions `check_entry` / `check_exit` in `risk/checks.py` are pure; the engine is not. No LLM appears in either path.
 
-Checks, in order (all must pass):
-1. Kill-switch not set; trading not paused; mode (paper/live) matches broker adapter.
-2. Symbol in allowed universe; symbol not stale; spread ≤ `max_spread_bps`.
-3. Daily realized+unrealized loss < `max_daily_loss_pct` of start-of-day equity. If hit: reject and set `trading_paused_until = next_day`.
-4. Drawdown from high-water mark < `max_drawdown_pct`. If hit: reject and set `trading_paused = true` (manual resume only).
-5. Open positions < `max_positions`; no existing position in symbol (no pyramiding in PoC).
-6. Stop price present and on the correct side; distance to stop between `min_stop_atr` and `max_stop_atr` × ATR.
-7. **Position size = min(** `risk_per_trade_pct × equity / stop_distance`, `max_position_pct × equity / price`, `size_fraction × that`, broker min/max notional **)**. Round to broker lot size. Reject if below broker minimum.
-8. Total exposure after order ≤ `max_gross_exposure_pct`.
-9. Order rate: ≤ `max_orders_per_hour`, ≤ `max_orders_per_day`.
-10. Price sanity: limit price within ±`max_price_deviation_pct` of last trade; stop/TP form a valid bracket.
-11. Fee-adjusted expectancy: `(tp_distance × p_win_est − stop_distance × (1−p_win_est)) − 2×fee > 0` with `p_win_est` = decision confidence capped at the strategy's historical win rate + 10 pp. Reject if ≤ 0 (prevents trades that can't beat fees).
+Entry checks run in order and persist the first rejection reason. Percentage settings are percentage points (`1.0` means 1%, divided by 100 in formulas); fees in bps are divided by 10,000. Let `e = ceil_to_price_step(ask × (1 + entry_slippage_bps / 10_000))`, `d = e − stop`, `f = taker_bps / 10_000`.
 
-Output is a bracket order (entry + stop + TP) when the broker supports it; otherwise entry order + Position Manager-enforced stops.
+1. Kill not set, entries not paused, mode matches the broker. Recheck the gate immediately before submitting.
+2. Symbol allowed, price fresh, quote/last trade available, spread ≤ `scanner.max_spread_bps`.
+3. `day_start_equity − equity < max_daily_loss_pct / 100 × day_start_equity`; otherwise pause until the next trading day. Day boundary is 00:00 in `trading_day_tz` (default UTC). Baseline is the last snapshot at/before that boundary, or the first afterward on the first day; without history the current account equity seeds the baseline.
+4. `hwm − equity < max_drawdown_pct / 100 × hwm`; otherwise manual-resume pause. HWM is the maximum persisted peak, not merely the latest snapshot. Observed new peaks are persisted even when the entry subsequently fails.
+5. Count non-dust held symbols **and unresolved entry-order symbols** against `max_positions`; no pyramiding. A terminal/error cycle does not release an unresolved order's reservation. Dust means qty below the broker's current minimum; it remains recorded.
+6. `stop < e` and `min_stop_atr × ATR ≤ d ≤ max_stop_atr × ATR`; missing ATR rejects.
+7. `qty = floor_to_qty_step(size_fraction × min((risk_per_trade_pct / 100) × equity / d, (max_position_pct / 100) × equity / e, cash / (e × (1 + f))))`. Reject below broker min qty/notional. This is the WP 1.3 formula; WP 1.6 must use crypto-available `non_marginable_buying_power` rather than raw cash. The broker maximum notional is not currently modelled in `AssetRules` (PLAN G4).
+8. Held market value + unresolved entry notional + proposed notional ≤ `max_gross_exposure_pct / 100 × equity`. Excess exposure rejects, never shrinks. Unpriced/stale non-dust holdings reject; cost basis is not a substitute for current value.
+9. Entry-order rows in the rolling last 60 min / current trading day stay within `max_orders_per_hour` / `max_orders_per_day`. Failed and uncertain attempts count conservatively; proven `not_submitted` rows and exits do not count.
+10. `abs(e − last_trade) ≤ max_price_deviation_pct / 100 × last_trade` and `stop < e < take_profit`.
+11. `p = min(confidence, win_rate_est + 0.10)`, using `risk.default_win_rate_prior` until `learning.min_trades_for_evidence` closed trades exist for the strategy. Require `qty × (tp − e) × p − qty × d × (1 − p) − qty × e × f − qty × tp × f > 0` (quote currency). The current estimate uses taker fees on both legs and the TP notional for the exit fee. It does not guarantee positive realized P&L or include stop gaps/LLM cost; WP 1.7 must evaluate those separately.
+
+Entries are **IOC marketable limits without brackets**. Alpaca crypto has no bracket/OCO support in the recorded WP 0.7 verification. The Position Manager owns stop/TP/time/trailing enforcement (WP 1.5); it must be active before entry admission is enabled.
+
+`exit(ExitRequest(symbol, reason, cycle_id?))` is a full, reduce-only close of the broker-reported non-dust position. It checks position/mode and persists the decision, but never applies entry gates, loss pauses or order-rate limits. Separate entry and exit locks keep an entry from holding up an exit. Cancellation/reconciliation broker operations introduced in WP 1.5 must also remain behind the Risk Engine; neither dashboard nor Position Manager gets a broker reference.
+
+The engine journals `pending` **before** submit/close, records ambiguous outcomes as `unknown`, and records `not_submitted` only when the request is known not to have been sent. A timeout or lost acknowledgement is not proof of failure. WP 1.5–1.6 must reconcile orders independently of cycle state before releasing reservations or retrying exits; see PLAN §3.2.
+
+**Review follow-up (not yet implemented):** PLAN 1.R1/1.R5 require independent validation of bid/ask order and timestamped market inputs at the Risk Engine boundary. `exit()` must gather only position/mode/rules needed for a close, without consulting the market feed: today its shared `_held_positions()` still calls feed accessors, and a raised feed exception can reject a protective exit. 1.R3/1.R5 must also block re-entry into a symbol with an unresolved close that could affect a new position. The current `risk_per_trade_pct` formula limits nominal price-distance loss only; fees and gaps can exceed it. The owner has approved including estimated entry/exit fees and a human-configured adverse exit-slippage allowance in that sizing budget (PLAN D16/1.R5). The new net-loss formula must respect fee denomination, round down and preserve the cash/position/exposure caps; actual gaps can still exceed the estimate. This is a required follow-up, not the behavior of WP 1.3 today.
 
 `RiskLimits` is loaded from the strategy profile and **cannot be changed by the Learning Loop**. Only a human edits it (dashboard with confirmation, or config file + restart).
 
@@ -190,29 +200,34 @@ Output is a bracket order (entry + stop + TP) when the broker supports it; other
 Interface:
 ```python
 class Broker(Protocol):
-    async def get_account() -> Account
-    async def get_positions() -> list[Position]
-    async def submit_order(order: BrokerOrder) -> OrderAck
-    async def cancel_order(order_id) -> None
-    async def get_order(order_id) -> OrderStatus
-    async def close_position(symbol) -> OrderAck
-    async def close_all() -> list[OrderAck]
-    async def stream_fills() -> AsyncIterator[Fill]
-    def mode() -> Literal["paper", "live"]
+    async def get_account(self) -> Account: ...
+    async def get_positions(self) -> list[Position]: ...
+    async def submit_order(self, order: BrokerOrder) -> OrderAck: ...
+    async def cancel_order(self, order_id: str) -> None: ...
+    async def get_order(self, order_id: str) -> OrderStatus: ...
+    async def close_position(self, symbol: str) -> OrderAck: ...
+    async def close_all(self) -> list[OrderAck]: ...
+    def stream_fills(self) -> AsyncIterator[Fill]: ...
+    def mode(self) -> Literal["paper", "live"]: ...
+    def fee_schedule(self) -> FeeSchedule: ...
+    async def asset_rules(self, symbol: str) -> AssetRules: ...
 ```
 Implementations: `AlpacaBroker(paper=True|False)`, `SimBroker` (in-process, for backtests and tests; fills at next bar open + slippage model + fee model).
+
+The existing protocol is `broker/base.py`; client-order-id and order-history lookups, durable fill identities and broker I/O deadlines are WP 1.5–1.6 additions. `close_all()` is not an alternate control path: flatten must go through audited Risk Engine exits. `AlpacaBroker` is currently read-only; its order methods are stubs.
 
 Fees and slippage: adapter exposes `fee_schedule()` so the Risk Engine's expectancy check uses real numbers. **Verify Alpaca's current crypto maker/taker tiers before implementing; do not hard-code from memory.**
 
 ### 4.7 Position Manager (deterministic)
 - Tracks open positions with their stop, TP, time limit, and entry thesis.
-- Enforces: hard stop (if bracket not supported or broker stop fails → market close), time-based exit (`time_limit_min` from intent, capped by strategy profile), trailing stop once position is +`trail_trigger_r` R in profit (if enabled in profile).
+- Enforces hard stop, **take profit**, time-based exit (`time_limit_min` from the eventual agent intent, capped by `risk.max_hold_min`), and trailing stop once profit reaches `risk.trailing.trigger_r`, using `risk.trailing.trail_atr`. Full closes go through `RiskEngine.exit()`. Client-side stops are the required path; a broker stop-limit backup is optional and cannot guarantee a fill. WP 1.5 must specify trigger price, same-bar stop/TP ambiguity, and durable hold-time/initial-risk metadata before implementation.
 - On fill events: updates position state, writes `TradeEvent`s.
 - Optional LLM exit review (`exit_review.enabled`, default **off** in PoC): at +1R or −0.5R, asks the Decision Maker whether the thesis still holds. Costs money; measure before enabling.
-- Reconciliation every 60 s against broker positions; any mismatch → alert + pause new entries.
+- Reconcile on startup **before admission** and at least every 60 s thereafter. Recover every potentially submitted order, including those attached to terminal/error cycles, and adopt positive partial fills immediately into position management. Duplicate/out-of-order fill delivery must not double-count qty, fees or P&L.
+- Compare broker positions against fills with an explicit, bounded allowance for documented fee deductions and rounding. Unexplained discrepancies → alert + pause new entries; do not hide missing trades by blindly overwriting local qty. Preserve unresolved order reservations. Apply overdue exits and handle late fills after kill/flatten. PLAN §3.2 defines the remaining acceptance cases.
 
 ### 4.8 Journal
-Tables (see §7): every cycle, every agent call, every order, every fill, every position, every review, every hypothesis. Nothing is deleted.
+Tables (see §7): every admitted cycle, every agent call, every order, every fill, every position, every review, every hypothesis. Nothing is deleted.
 
 Derived views: closed trades with R-multiple, MAE/MFE, holding time, fee, LLM cost attributed to the cycle, benchmark return over the same holding window, "thesis vs. outcome" tags from the reviewer.
 
@@ -223,9 +238,9 @@ See §8.
 See §9.
 
 ### 4.11 Cross-cutting
-- **Event bus:** in-process asyncio pub/sub; every event also persisted to `events` table (append-only). Dashboard tails it via WebSocket.
+- **Event bus:** in-process asyncio pub/sub with append-only persistence before delivery. It is not a durable replay queue. WP 1.4 `publish_tx` commits cycle state and event together; uncertain commits suspend admission until restart/recovery. Database evidence can exist without in-process delivery. The future dashboard tails persisted events by durable id, independently of core subscriptions.
 - **Cost meter:** wraps the Anthropic client; per-call tokens and USD (price table in config, versioned); daily and per-cycle aggregates; hard daily budget → scanner stops emitting candidates when exceeded.
-- **Kill-switch:** `KILL` file in working dir checked each scanner tick and before every broker call; `POST /control/kill` writes it; dashboard button. On kill: cancel open orders, optionally flatten (config `kill.flatten = true|false`, default true in live, false in paper).
+- **Kill-switch:** configured `control.kill_file`, resolved relative to `config.yaml` (default `data/control/KILL`), plus DB kill state. Core and API share this path/volume in Compose. Check before **entry** submission; allow cancellations and protective exits while killed. On kill, WP 1.5 cancels outstanding entry orders and optionally flattens (`kill.flatten`, default true in live, false in paper); API/dashboard controls arrive in Phase 3.
 - **Config:** `config.yaml` (infra, API keys via env) + `strategies/<name>.yaml` (strategy profile, §6). Secrets only via environment / `.env` (git-ignored).
 - **Logging:** structured JSON (structlog), one line per event, cycle_id in every line.
 
@@ -233,14 +248,16 @@ See §9.
 
 ## 5. Cycle walkthrough (happy path)
 
+This is the target Phase 2+ flow. Phase 1 substitutes the deterministic stub and has no LLM cost. WP 1.4 tests reach `SUBMITTED` with SimBroker; fill completion and position management arrive in WP 1.5–1.6.
+
 1. `BarClosed(BTC/USD, 5m)` → Scanner evaluates rules → rule `breakout_donchian20_volspike` fires, score 0.72 → checks rate limits, no open position → emits `CandidateSignal`.
 2. Cycle Runner creates cycle `c_0142`, state `ENRICHING`: builds `MarketSnapshot` (last 50 bars compact, indicators, ATR, spread, regime), `PortfolioState`, `RiskContext` (remaining daily budget, remaining risk budget, correlation of open positions to BTC).
-3. `ANALYZING`: Technical Analyst (Haiku) → `TechnicalAssessment(setup_quality=0.65, invalidation=…)`. Context Analyst skipped (no news source in Phase 1).
+3. `ANALYZING`: Technical Analyst (Haiku) → `TechnicalAssessment(setup_quality=0.65, invalidation=…)`. Context Analyst skipped (no news source configured).
 4. `DECIDING`: Decision Maker (Sonnet) with assessments + active learnings → `OrderIntent(BUY, size_fraction=0.6, stop=…, tp=…, time_limit=240, confidence=0.58, thesis=…, strongest_counter=…, learnings_applied=[H-007])`.
-5. `RISK_CHECK`: Risk Engine computes size = 0.6 × min(risk-based, cap-based) → 0.0041 BTC; expectancy after fees positive → approved bracket order.
+5. `RISK_CHECK`: Risk Engine computes size = 0.6 × min(risk-based, position-cap-based, cash-based), rounded down; expectancy after fees positive → approved IOC limit entry with client-side stop/TP metadata.
 6. `SUBMITTED` → Alpaca paper → fill stream → `FILLED`; Position Manager takes over.
 7. Position closes 3 h later at TP (+1.8R). Journal records trade with fee, LLM cost (0.021 USD), benchmark (BTC +0.4 % over window), thesis, learnings applied.
-8. Nightly review (03:00 Europe/Berlin, low-volume hour): Journal Reviewer reads the day's trades, updates evidence on H-007 (now 9 wins / 5 losses, avg +0.6R), proposes H-012 ("breakouts during 14:00–16:00 UTC have lower follow-through"), flags nothing for promotion yet (sample too small).
+8. Nightly review (03:00 Europe/Berlin; schedule is independent of the UTC accounting day): Journal Reviewer reads the day's trades, updates evidence on active H-007 (now 16 wins / 9 losses, avg +0.6R), proposes H-012 ("breakouts during 14:00–16:00 UTC have lower follow-through"), flags nothing for promotion yet (sample too small).
 
 ---
 
@@ -274,14 +291,14 @@ scanner:
   max_spread_bps: 15
 
 agents:
-  technical: { model: claude-haiku-latest, prompt_version: v1 }
+  technical: { model: claude-haiku-5-5, prompt_version: v1 }
   context:   { enabled: false }
-  decision:  { model: claude-sonnet-latest, prompt_version: v1, mode: single }   # single | debate
-  reviewer:  { model: claude-sonnet-latest, prompt_version: v1, schedule: "0 3 * * *", tz: Europe/Berlin }
+  decision:  { model: claude-sonnet-5-5, prompt_version: v1, mode: single }   # single | debate
+  reviewer:  { model: claude-sonnet-5-5, prompt_version: v1, schedule: "0 3 * * *", tz: Europe/Berlin }
   exit_review: { enabled: false }
 
 risk:                                         # HUMAN-EDITABLE ONLY. Learning loop cannot touch this block.
-  risk_per_trade_pct: 1.0                     # of equity, at stop
+  risk_per_trade_pct: 1.0                     # current nominal price-loss budget; see 1.R5
   max_position_pct: 30
   max_positions: 2
   max_gross_exposure_pct: 60
@@ -310,7 +327,9 @@ learning:
 benchmark: { symbol: BTC/USD, type: buy_and_hold }
 ```
 
-**Why "fast" is constrained here:** 5m signals, ≤ 8 h holds, 2 concurrent positions, 1 % risk per trade. That is as fast as is sane at 1,000 EUR with ~1 s latency and LLM-in-the-loop. Anything faster is competing with market makers on their terms.
+The example matches the current profile schema; its pinned model IDs are repository configuration, not a fresh verification of provider availability. Reverify exact IDs, token accounting and prices before Phase 2. `latest` aliases are rejected.
+
+**Current baseline:** 5m signals, ≤ 8 h holds, 2 concurrent positions and a 1% nominal per-trade risk setting. These are initial parameters, not demonstrated viable economics. PLAN §3.3 evaluates fee friction and SPEC §16.1 proposes alternatives; observed latency and executable prices must be measured rather than assumed.
 
 ---
 
@@ -321,8 +340,8 @@ strategies        (id, name, yaml, hash, active_from, active_to)
 cycles            (id, strategy_id, symbol, rule_id, signal_features json, state, created_at, finished_at, outcome, reject_reason)
 agent_calls       (id, cycle_id, agent, model, prompt_version, prompt_hash, input json, output json, tokens_in, tokens_out, cost_usd, latency_ms, ts)
 order_intents     (id, cycle_id, json, confidence, thesis, strongest_counter, learnings_applied json)
-risk_decisions    (id, cycle_id, approved, reasons json, adjusted json, computed_size, ts)
-orders            (id, cycle_id, broker_order_id, mode, type, side, qty, limit_price, stop_price, tp_price, status, submitted_at, updated_at)
+risk_decisions    (id, cycle_id, kind, approved, reasons json, adjusted json, computed_size, ts)
+orders            (id, cycle_id, broker_order_id, client_order_id, symbol, mode, type, side, qty, limit_price, stop_price, tp_price, status, submitted_at, updated_at)
 fills             (id, order_id, qty, price, fee, ts)
 positions         (id, cycle_id, symbol, side, qty, entry_price, stop, tp, time_limit_at, opened_at, closed_at, exit_reason, realized_pnl, fees, mae, mfe, r_multiple, llm_cost_usd, benchmark_return)
 bars              (symbol, timeframe, ts, o, h, l, c, v)   -- 1m persisted; others derived
@@ -332,6 +351,8 @@ hypotheses        (id, strategy_id, text, kind, status: proposed|active|retired|
 reviews           (id, strategy_id, period_start, period_end, report json, cost_usd, ts)
 control_state     (key, value)   -- paused, paused_until, kill, mode
 ```
+
+This is a logical schema summary; `journal/models.py` and migrations define the installed schema (head `0003` at this review). `cycle_id` is nullable for reviewer calls and control-driven exits; broker/client order ids are unique when present. `equity_snapshots.exposure = NULL` means unknown, not zero. WP 1.4 stores stub intent fields in transition details; it does not yet populate the `order_intents` table. WP 1.5 must preserve position exit metadata; WP 1.6 adds durable broker fill identity; WP 3.1 adds fee-activity provenance/reconciliation. Schema presence alone does not mean a component writes it.
 
 Indexes on `cycles(created_at)`, `positions(closed_at)`, `events(ts)`, `agent_calls(cycle_id)`.
 
@@ -348,8 +369,8 @@ proposed ──(evidence ≥ min_trades, passes promote_if)──► active ─�
     └──(evidence contradicts)──► rejected
 ```
 - **Proposed:** created by the Journal Reviewer (or manually in the dashboard). Has `text`, `kind` (`filter` | `sizing_bias` | `timing` | `exit` | `regime`), and a machine-checkable `applies_to` predicate over signal features where possible (e.g. `hour_utc in 14..16 and rule_id == breakout_*`).
-- **Evidence accrual:** nightly, for each hypothesis, the Journal computes outcomes of trades matching `applies_to` vs. non-matching (or vs. the same trades in a baseline window). Stores n, win rate, avg R, a simple significance test (bootstrap on R-multiples is fine; no need for rigor beyond "not obviously noise").
-- **Promotion:** in `propose_only` mode (Phases 1–3) a human promotes via dashboard. In `auto_promote` the rule in the profile decides. Either way, promotion is an event with evidence snapshot attached.
+- **Evidence accrual (Phase 4):** pin the strategy hash, predicate version and evaluation window before measuring; separate the trades that suggested a hypothesis from later evaluation trades. Store the baseline definition and eligible/missing counts. Descriptive matching-vs-nonmatching differences are not proof of causal improvement. Nightly, for each hypothesis, the Journal computes outcomes of trades matching `applies_to` vs. non-matching (or vs. the same trades in a baseline window). Stores n, win rate, avg R, a simple significance test (bootstrap on R-multiples is fine; no need for rigor beyond "not obviously noise").
+- **Promotion:** in `propose_only` mode (the initial Phase 4 rollout) a human promotes via dashboard. In `auto_promote` the rule in the profile decides. Either way, promotion is an event with evidence snapshot attached.
 - **Retirement:** active hypotheses are re-evaluated nightly; if evidence drops below threshold for 2 consecutive reviews → retired (not deleted; can be re-proposed).
 - **Cap:** `max_active_learnings` to keep prompts short and prevent contradiction pile-up. The reviewer is asked to merge/condense when near the cap.
 
@@ -358,17 +379,20 @@ proposed ──(evidence ≥ min_trades, passes promote_if)──► active ─�
 - May not: change risk limits, change signal rules, change models, change prompts, place orders. Its output is data, consumed by code that enforces these boundaries.
 
 ### 8.4 Active Learnings block (injected into prompts)
+
+Illustrative formatting only; real active entries require a promotion evidence snapshot meeting the sample-size and promotion rules, not merely the summary numbers shown here.
+
 ```
 ACTIVE LEARNINGS (strategy fast_momentum_v1, as of 2026-10-09):
-H-007 [filter, n=14, win 64%, avg +0.6R] Breakouts with vol_z > 2.5 on BTC follow through better than ETH/SOL; prefer BTC when multiple fire.
+H-007 [filter, n=25, win 64%, avg +0.6R] Breakouts with vol_z > 2.5 on BTC follow through better than ETH/SOL; prefer BTC when multiple fire.
 H-009 [timing, n=22, win 31%, avg -0.2R] Signals in 00:00–04:00 UTC underperform; reduce size_fraction to ≤ 0.4.
-H-011 [exit, n=18] Trades reaching +1R but closed by time limit average +0.3R; thesis-based early exits not yet validated.
+H-011 [exit, n=24] Trades reaching +1R but closed by time limit average +0.3R; thesis-based early exits not yet validated.
 Baseline (last 30d): 41 trades, win 46%, avg +0.21R, expectancy after fees +0.12R.
 ```
 
 ### 8.5 Guardrails against overfitting
 - Minimum sample sizes; evidence windows of fixed length; no hypothesis may reference a single trade.
-- Every nightly review also reports the **counterfactual**: equity curve if no learnings had been applied (approximated by re-scoring the Decision Maker's confidence without the learnings block on a sample — Phase 4 feature, optional).
+- An optional Phase 4 diagnostic may re-score recorded contexts without the learnings block using the metered client. Label it a **decision sensitivity analysis**, not a counterfactual equity curve: changed entries, sizes and exits would create a different portfolio path that re-scoring confidence cannot reconstruct. A true portfolio counterfactual requires a separately specified replay experiment and is outside the required PoC.
 - Benchmark comparison is mandatory in every review: strategy vs. buy-and-hold BTC over the same period, net of fees and LLM cost.
 
 ---
@@ -379,7 +403,7 @@ Baseline (last 30d): 41 trades, win 46%, avg +0.21R, expectancy after fees +0.12
 1. **Overview:** equity curve vs. benchmark (net of fees and LLM cost as a separate line), today's P&L, drawdown from HWM, open positions with live R, mode badge (PAPER / LIVE, unmistakable colour), system health (feed, broker, last cycle), LLM spend today vs. budget.
 2. **Cycles:** live feed of cycles with state; click → full timeline (signal → assessments → intent → risk decision → order → fills), raw agent inputs/outputs, cost, latency.
 3. **Positions & Trades:** open positions (with stop/TP/time-left, manual close button), closed trade table with R, MAE/MFE, fees, cost, thesis, outcome tags, filters.
-4. **Learning:** hypothesis registry (status, evidence, n, win rate, avg R, p), promote/retire buttons (confirmation), review reports with postmortems, counterfactual equity (if enabled).
+4. **Learning:** hypothesis registry (status, evidence, n, win rate, avg R, p), promote/retire buttons (confirmation), review reports with postmortems, decision sensitivity analysis (if enabled).
 5. **Strategy & Risk:** active profile (read-only YAML view), risk limits with edit form (confirmation + reason + logged), signal rule hit stats.
 6. **Control:** pause/resume new entries, flatten all, kill-switch (two-step confirm), switch profile, trigger review now, mode switch (paper/live — gated, see §12).
 
@@ -405,8 +429,8 @@ Replaying *with* live LLM calls over history is possible but costs money and lea
 
 ```
 auto-trader/
-  spec.md                      # this file
-  pyproject.toml               # uv / hatch; python 3.12; ruff, mypy, pytest
+  SPEC.md                      # this file; PLAN.md tracks delivery
+  pyproject.toml               # uv / uv_build; python 3.12; ruff, mypy, pytest
   docker-compose.yml           # core, api, db (postgres), dashboard (nginx static)
   .env.example
   config.yaml
@@ -428,31 +452,31 @@ auto-trader/
 
 ## 12. Phases
 
-Each phase has a definition of done. Do not start the next phase before the current one's DoD is met.
+Each phase has a definition of done. Do not start the next phase before the current one's DoD is met. A merged WP is not evidence of its phase's paper observation gate: record the commit/profile hash, configuration, dates and validation artifacts. Current phase status is in PLAN §3.
 
-### Phase 0 — Skeleton (1–2 days)
+### Phase 0 — Skeleton
 - Repo, tooling, config loading, DB schema + migrations (alembic), event bus, structured logging, kill-switch, `SimBroker`, Alpaca paper adapter with account/positions read.
 - DoD: `cli run core` starts, connects to Alpaca paper, streams bars for the universe, persists 1m bars, responds to `KILL` file. Tests green.
 
-### Phase 1 — Deterministic loop without LLM (2–3 days)
+### Phase 1 — Deterministic loop without LLM
 - Indicators, Scanner with rule engine, Risk Engine, Position Manager, Cycle Runner with a **stub Decision Maker** (rule-based: BUY with fixed stop/TP if score > threshold).
-- DoD: paper trades flow end to end; every cycle fully audited in DB; signal backtest CLI reports forward returns per rule; Risk Engine has 100 % branch coverage in unit tests; reconciliation works.
+- DoD: paper entries, partial fills and full exits flow end to end with durable stop/TP/time metadata; every cycle/order is audited; restart, kill/late-fill and duplicate-fill recovery pass; signal backtest CLI reports returns and fee/data-quality diagnostics per rule; Risk Engine retains 100 % branch coverage; unresolved reconciliation discrepancies block new entries. Broker-writing smoke tests require an explicitly selected paper account. WP 1.4 alone does not satisfy this gate.
 
-### Phase 2 — Agents (2–3 days)
+### Phase 2 — Agents
 - Agent runner with structured outputs, cost meter, Technical Analyst + Decision Maker, prompts v1, budget enforcement, recorded-fixture tests.
-- DoD: real LLM decisions in paper mode; per-cycle cost visible; daily cost < budget over 3 consecutive days; no cycle exceeds `llm_usd_per_cycle_max`.
+- DoD: real LLM decisions in paper mode; per-call/per-cycle costs visible, including rejected/no-trade cycles; daily cost stays within budget over 3 consecutive days; no cycle exceeds `llm_usd_per_cycle_max`. Concurrent-call, retry, timeout/unknown-usage and restart tests prove reservations cannot overspend the cap.
 
-### Phase 3 — Journal & Dashboard (3–5 days)
+### Phase 3 — Journal & Dashboard
 - Metrics (R, MAE/MFE, benchmark, cost attribution), equity snapshots, API, dashboard views 1–3 and 6, WebSocket live feed.
 - DoD: you can watch a cycle happen live, see cost and P&L, pause/flatten/kill from the UI, from your phone.
 
-### Phase 4 — Learning Loop (3–5 days)
+### Phase 4 — Learning Loop
 - Journal Reviewer, hypothesis registry, evidence computation, active-learnings injection, dashboard views 4–5, `propose_only` mode.
 - DoD: 2 weeks of nightly reviews; at least one hypothesis with n ≥ 20; promote/retire works and is reflected in the next day's prompts; `learnings_applied` is populated and attributable.
 
 ### Phase 5 — Live gate
 Preconditions, all required:
-- ≥ 4 weeks paper trading on the final profile with zero Risk Engine bypasses and zero reconciliation mismatches lasting > 5 min.
+- ≥ 4 weeks paper trading on the final profile with zero Risk Engine bypasses and zero reconciliation mismatches lasting > 5 min. Record profile hash, code/prompt/model versions, active-learning versions, account scale and observation dates. Material changes to strategy parameters, prompts/models, execution or cost policy require a fresh qualifying window; ordinary learning updates under an unchanged approved policy are versioned observations within it. Test economics at the intended ~1,000 EUR scale in the account's quote currency: fixed LLM spend against a $100,000 paper balance does not establish viability for that account.
 - Paper expectancy after fees **and LLM cost** > 0 over the window (not required to beat benchmark — but if it loses to buy-and-hold by a wide margin, reconsider the whole thing honestly).
 - LLM cost < 1 % of equity per day.
 - Alpaca live crypto verified available for German residents and account funded; otherwise Kraken adapter implemented and paper-tested for ≥ 2 weeks.
@@ -476,13 +500,14 @@ Preconditions, all required:
 - Dashboard not internet-exposed (localhost / Tailscale). Bearer token.
 - Prompt injection: the Context Analyst (when enabled) consumes third-party text. Its output schema is narrow (numbers + enums + short strings) and it has no tool access; the Decision Maker treats it as data. No agent output is ever executed or used to construct prompts for other agents without schema validation.
 - Dependency pinning, `pip-audit` in CI.
+- One core process per journal and one journal per broker account/mode. Enforce ownership/account binding before broker-writing operation (WP 1.5–1.6); on restart resolve the previous writer's transactions before admitting entries. Postgres locking, query deadlines and recovery need real Postgres tests in WP 3.5, not only SQLite tests or DDL compilation.
 
 ---
 
 ## 15. Testing
 
 - Unit: indicators (against known values), rule engine, Risk Engine (every branch, property-based tests for sizing invariants: size never exceeds caps, never negative, stop always on correct side), Position Manager (stop/time/trail), cost meter, hypothesis evidence math.
-- Integration: full cycle with `SimBroker` and recorded agent fixtures; kill-switch mid-cycle; broker error mid-submit; reconciliation mismatch.
+- Integration: full cycle with `SimBroker` (stub in Phase 1, recorded agent fixtures from Phase 2); crash before/after broker acceptance, partial IOC cancellation, duplicate/out-of-order fills, late fill after kill, uncertain DB commit and restart recovery. Verify broker holdings, durable order/position rows and exposure reservations, not only cycle terminal states.
 - Contract: pydantic schemas for every agent output; a malformed LLM response must fail the cycle cleanly, never crash the process.
 - Smoke (manual, per phase): Alpaca paper connectivity.
 
@@ -495,6 +520,21 @@ Preconditions, all required:
 - Exit review by LLM (default off). Same: measure.
 - Shorts: not possible on Alpaca crypto spot. If the strategy needs them, that is a broker change (Kraken margin) and a Risk Engine extension — not a PoC concern.
 - Tax: German private crypto sales are taxable if held < 1 year (§23 EStG, 1,000 EUR exemption limit on total private sale gains per year). The journal's fill export must be sufficient for a tax tool. Not legal advice — verify.
+
+### 16.1 Proposed strategy revision for owner review
+
+Requested by the owner during the 2026-10-11 review. **These are candidate requirements for evaluation, not changes to the active YAML profile.** Current evidence establishes high fee friction and uneven venue coverage, not which strategy will earn a profit. Keep `fast_momentum_v1` as the comparison baseline; create a separately versioned candidate only after approval.
+
+| Setting | Current baseline | Proposed candidate | Rationale / evaluation needed |
+|---|---|---|---|
+| Universe | BTC/USD, ETH/USD, SOL/USD | BTC/USD initially | Recorded venue coverage is strongest for BTC. Reintroduce ETH/SOL only with adequate quote/bar coverage and executable net results, assessed separately. Concentrating in BTC is not diversification. |
+| Signal timeframe | 5m | Compare 15m against 5m; retain 1h context / 4h trend | Larger price moves may better absorb roughly 50 bps round-trip fees. It is a hypothesis, not a reason to assume 15m ATR or trade frequency is sufficient. |
+| Nominal per-trade risk setting | 1.0% | 0.5%, with the fee/slippage sizing decision in PLAN 1.R5 | Lower paper/live pilot exposure while execution and recovery mature. Report both nominal and estimated net loss; market gaps cannot be capped by a client-side stop. |
+| Position / gross exposure | 2 positions; 30% each; 60% gross | 1 position; 25% each/gross | Simpler initial operating envelope; assess return and fixed-cost burden at the smaller notional. |
+| LLM spend | $3/day; $0.10/cycle | Evaluate $0.50/day; $0.05/cycle | At roughly $1,000, $3/day consumes about 9% of equity per 30 days before trading fees; $0.50/day still consumes about 1.5%. Provider-price verification must establish whether the intended calls fit; if not, reduce call scope/frequency and report the trade-off rather than silently exceed limits. |
+| Volume filter | Global `min_vol_z: 0.5` plus rule conditions | Compare the existing filter with a rule-specific filter for pullbacks | The current global filter also suppresses the pullback rule even though that rule has no volume clause. Any variant requires a schema/Scanner change in its own WP, and a recorded ablation; do not assume removing the filter improves results. |
+
+Keep spread limits, loss/drawdown protections and the expectancy rejection intact during comparisons. Compare universe/timeframe/filter variants separately before combining them, using PLAN §3.3's held-out data and explicit execution assumptions. Current 1m OHLCV alone cannot verify historical spreads or IOC fills. Stop/TP/hold-time changes require an additional named experiment; do not widen stops merely to pass the fee check. A result with too few eligible trades remains inconclusive. No positive-expectancy or live-readiness claim follows from these proposals.
 
 ---
 
