@@ -121,7 +121,7 @@ can therefore never pass check 5 on the same state; together with the Cycle Runn
    fill between the two reads cannot hide the order from both); feed view (last trade,
    quote, staleness; ATR computed by the engine from the signal-timeframe history, never
    taken from the intent); journal (open entry orders, entry-order timestamps,
-   `day_start_equity`, `hwm`, win rate). **Any failure
+   `day_start_equity`, the highest stored `hwm`, win rate). **Any failure
    rejects** with `state unavailable: <error type>` and is persisted (fail closed).
 2. `check_entry(...)`; persist `risk_decisions` (kind `entry`). On rejection apply the
    `pause` side effect and return.
@@ -146,9 +146,13 @@ failed exits; a stop that failed must be attempted again.
 
 ### `snapshot_equity()`
 Called by `run core` every 60 s. Writes `equity_snapshots`: equity, cash, exposure,
-`hwm = max(previous hwm, equity)`, `daily_pnl = equity − day_start_equity`. Failure is
-logged and retried on the next tick. `check()` also folds live equity into the `hwm` it
-uses, so a spike between snapshots is not missed.
+`hwm = max(highest stored hwm, equity)`, `daily_pnl = equity − day_start_equity`. The
+previous HWM is the maximum over **all** snapshot rows (`repo.max_hwm`), never the latest
+row's value, so writers that interleave (the snapshot task and a `check()`) can never lower
+it. Failure is logged and retried on the next tick. `check()` folds live equity into the
+`hwm` it uses and, when live equity exceeds the stored maximum, writes a snapshot at once,
+also when the check then rejects: a spike between two periodic snapshots that falls back
+before the next one still bounds drawdown, including after a restart.
 
 `day_start_equity` = equity of the last snapshot at or before the current trading-day
 start (D5). If none exists (first day of operation) the first snapshot of the day is used.
