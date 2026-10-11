@@ -1,7 +1,7 @@
 """Cycle Runner (WP 1.4; spec 2026-10-11-cycle-runner-design.md)."""
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
@@ -11,14 +11,15 @@ from typing import Any
 import pytest
 import yaml
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
 from autotrader.agents.stub import StubBuy, StubSkip
-from autotrader.core.bus import EventBus
+from autotrader.core.bus import CommitUncertain, EventBus
 from autotrader.core.config import StrategyProfile, parse_profile
 from autotrader.core.cycle import CycleRunner, CycleSnapshot, Decision
-from autotrader.core.kill import ControlGate
+from autotrader.core.kill import ControlGate, ControlStatus, write_kill_file
 from autotrader.core.scanner import CandidateSignal
 from autotrader.core.types import Bar, Quote
 from autotrader.journal import models as m
@@ -530,3 +531,332 @@ async def test_uncertain_commit_on_a_transition_suspends_admission_without_fallb
     assert runner.admission_suspended
     assert (await cycle_row(sessions, cid)).state == "NEW"
     assert await transitions(sessions, cid) == []  # no fallback ERROR write
+
+
+# --- admission (Task 6) --------------------------------------------------------------
+
+
+async def all_cycles(sessions: async_sessionmaker[AsyncSession]) -> list[m.Cycle]:
+    async with sessions() as s:
+        return list(await s.scalars(select(m.Cycle).order_by(m.Cycle.id)))
+
+
+def dropped(logs: Sequence[Mapping[str, Any]]) -> list[str]:
+    return [e["reason"] for e in logs if e["event"] == "cycle.dropped"]
+
+
+class OpenGate:
+    """Gate double without I/O: race tests need admission to reach its lock in a few
+    event-loop turns, which a DB-backed gate read (aiosqlite thread) doesn't guarantee."""
+
+    async def status(self, now: datetime | None = None) -> ControlStatus:
+        return ControlStatus(killed=False, reasons=())
+
+
+def hold_admission(monkeypatch: pytest.MonkeyPatch) -> tuple[asyncio.Event, asyncio.Event]:
+    """The first admission blocks inside its transaction until `release` is set."""
+    entered, release = asyncio.Event(), asyncio.Event()
+    real = repo.open_cycle_symbols
+    first = True
+
+    async def held(session: AsyncSession) -> list[str]:
+        nonlocal first
+        if first:
+            first = False
+            entered.set()
+            await release.wait()
+        return await real(session)
+
+    monkeypatch.setattr(repo, "open_cycle_symbols", held)
+    return entered, release
+
+
+async def test_admitted_candidate_gets_a_row_an_event_and_a_task(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    runner = make_runner(sessions, bus, gate, FakeRisk(approved("new")), strategy_id)
+    await runner.on_candidate(candidate())
+    await runner.join()
+
+    (row,) = await all_cycles(sessions)
+    assert (row.symbol, row.rule_id, row.state) == (BTC, "r1", "SUBMITTED")
+    assert row.signal_features["_timeframe"] == "5m"
+    assert row.signal_features["_bar_ts"] == (NOW - FIVE).isoformat()
+    first = (await transitions(sessions, row.id))[0]
+    assert (first["from_state"], first["to_state"]) == (None, "NEW")
+
+
+async def test_concurrency_cap_holds_for_simultaneous_candidates(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    strategy_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered, release = hold_admission(monkeypatch)
+    runner = make_runner(
+        sessions, bus, OpenGate(), FakeRisk(approved("new")), strategy_id, max_cycles=1
+    )
+    with capture_logs() as logs:
+        first = asyncio.create_task(runner.on_candidate(candidate(BTC)))
+        await entered.wait()
+        second = asyncio.create_task(runner.on_candidate(candidate(ETH)))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+        await runner.join()
+    assert [c.symbol for c in await all_cycles(sessions)] == [BTC]
+    assert dropped(logs) == ["max_concurrent_cycles"]
+
+
+async def test_one_open_cycle_per_symbol(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    runner = make_runner(sessions, bus, gate, FakeRisk(approved("new")), strategy_id)
+    with capture_logs() as logs:
+        await runner.on_candidate(candidate(BTC))
+        await runner.on_candidate(candidate(BTC))
+        await runner.join()
+    assert len(await all_cycles(sessions)) == 1
+    assert dropped(logs) == ["open cycle on symbol"]
+
+
+async def test_open_entry_order_of_an_error_cycle_blocks_its_symbol(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    cid = await new_cycle(sessions, strategy_id, state="ERROR")
+    async with sessions() as s:
+        await repo.insert_order(
+            s,
+            cycle_id=cid,
+            client_order_id=f"at-c{cid}-e",
+            symbol=BTC,
+            mode="paper",
+            type_="limit",
+            side="buy",
+            qty=D("1"),
+            limit_price=D("100.1"),
+            stop_price=None,
+            tp_price=None,
+            status="pending",
+            now=NOW,
+        )
+    runner = make_runner(sessions, bus, gate, FakeRisk(), strategy_id)
+    with capture_logs() as logs:
+        await runner.on_candidate(candidate(BTC))
+    assert dropped(logs) == ["open entry order on symbol"]
+    assert len(await all_cycles(sessions)) == 1
+
+
+async def test_stale_candidate_is_dropped(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    runner = make_runner(sessions, bus, gate, FakeRisk(), strategy_id)
+    with capture_logs() as logs:
+        await runner.on_candidate(candidate(bar_ts=NOW - 3 * FIVE))
+    assert dropped(logs) == ["signal stale"]
+    assert await all_cycles(sessions) == []
+
+
+class BrokenGate:
+    def __init__(self, hang: bool) -> None:
+        self.hang = hang
+
+    async def status(self, now: datetime | None = None) -> ControlStatus:
+        if self.hang:
+            await asyncio.Event().wait()
+        raise RuntimeError("control state unreadable")
+
+
+@pytest.mark.parametrize(
+    ("gate_kind", "reason_prefix"),
+    [
+        ("killed", "entries blocked"),
+        ("raises", "gate unavailable: RuntimeError"),
+        ("hangs", "gate unavailable: TimeoutError"),
+    ],
+)
+async def test_gate_blocks_admission_fail_closed(
+    gate_kind: str,
+    reason_prefix: str,
+    tmp_path: Path,
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    use: Any = gate
+    if gate_kind == "killed":
+        write_kill_file(tmp_path / "KILL", source="cli", reason="test", now=NOW)
+    else:
+        use = BrokenGate(hang=gate_kind == "hangs")
+    runner = make_runner(sessions, bus, use, FakeRisk(), strategy_id, step_timeout_s=0.01)
+    with capture_logs() as logs:
+        await runner.on_candidate(candidate())
+    (reason,) = dropped(logs)
+    assert reason.startswith(reason_prefix)
+    assert await all_cycles(sessions) == []
+
+
+async def test_db_error_at_admission_is_logged_not_raised(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def broken(*a: Any, **kw: Any) -> m.Cycle:
+        raise OperationalError("INSERT", None, Exception("database is locked"))
+
+    monkeypatch.setattr(repo, "insert_cycle", broken)
+    runner = make_runner(sessions, bus, gate, FakeRisk(), strategy_id)
+    with capture_logs() as logs:
+        await runner.on_candidate(candidate())  # must not raise
+    assert any(e["event"] == "cycle.admission_failed" for e in logs)
+    assert await all_cycles(sessions) == []
+
+
+async def test_uncertain_admission_suspends_and_a_late_landing_insert_never_breaks_the_cap(
+    sessions: async_sessionmaker[AsyncSession],
+    hbus: EventBus,
+    hook: CommitHook,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    risk = FakeRisk(approved("filled"))
+    risk.release = asyncio.Event()
+    runner = make_runner(sessions, hbus, gate, risk, strategy_id, max_cycles=2)
+
+    await runner.on_candidate(candidate(SOL))  # a running cycle, held inside check()
+    await risk.started.wait()
+
+    hook.fail_before = 1  # BTC's insert does not commit; the read-back sees nothing
+    with capture_logs() as logs:
+        await runner.on_candidate(candidate(BTC))
+        assert runner.admission_suspended
+        await runner.on_candidate(candidate(ETH))  # would be admitted without suspension
+    assert dropped(logs) == ["admission suspended: commit uncertain"]
+
+    await new_cycle(sessions, strategy_id, symbol=BTC)  # the uncertain insert "lands"
+    open_ = [c for c in await all_cycles(sessions) if c.state not in repo.TERMINAL_CYCLE_STATES]
+    assert len(open_) <= 2
+
+    risk.release.set()  # cycles already running are unaffected
+    await runner.join()
+    sol = next(c for c in await all_cycles(sessions) if c.symbol == SOL)
+    assert sol.state == "FILLED"
+
+
+async def test_suspension_is_checked_inside_the_admission_lock(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    strategy_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered, release = hold_admission(monkeypatch)
+    runner = make_runner(sessions, bus, OpenGate(), FakeRisk(approved("new")), strategy_id)
+    with capture_logs() as logs:
+        first = asyncio.create_task(runner.on_candidate(candidate(BTC)))
+        await entered.wait()
+        second = asyncio.create_task(runner.on_candidate(candidate(ETH)))
+        for _ in range(20):
+            await asyncio.sleep(0)  # `second` passed the pre-lock checks and waits
+        runner._suspend(CommitUncertain("elsewhere"))
+        release.set()
+        await asyncio.gather(first, second)
+        await runner.join()
+    assert [c.symbol for c in await all_cycles(sessions)] == [BTC]
+    assert dropped(logs) == ["admission suspended: commit uncertain"]
+
+
+async def test_suspension_by_a_surviving_unit_stops_an_admission_queued_on_the_bus(
+    sessions: async_sessionmaker[AsyncSession],
+    hbus: EventBus,
+    hook: CommitHook,
+    strategy_id: int,
+) -> None:
+    """Review P1 (2026-10-11): an admission that passed the admission-lock check and
+    waits for the bus lock must still see a suspension set by the unit ahead of it."""
+    runner = make_runner(sessions, hbus, OpenGate(), FakeRisk(approved("new")), strategy_id)
+    sol = await new_cycle(sessions, strategy_id, symbol=SOL)
+    release = asyncio.Event()
+    hook.block_before = release  # SOL's NEW -> ENRICHING unit parks holding the bus lock
+    hook.fail_before = 1  # ... and then does not commit; the read-back sees NEW
+    running = asyncio.create_task(runner._run(sol, candidate(SOL)))
+    await hook.reached.wait()
+    running.cancel()  # the publishing caller goes away; the bus-owned unit survives
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    admitting = asyncio.create_task(runner.on_candidate(candidate(BTC)))
+    for _ in range(20):
+        await asyncio.sleep(0)  # BTC passed both flag checks; its unit waits for the bus
+    assert not runner.admission_suspended and not admitting.done()
+
+    with capture_logs() as logs:
+        release.set()
+        await admitting
+    assert runner.admission_suspended
+    assert dropped(logs) == ["admission suspended: commit uncertain"]
+    assert [c.symbol for c in await all_cycles(sessions)] == [SOL]
+
+
+# --- recovery (Task 6) ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("state", "with_order", "after", "reason"),
+    [
+        ("NEW", False, "ERROR", "interrupted"),
+        ("ENRICHING", False, "ERROR", "interrupted"),
+        ("ANALYZING", False, "ERROR", "interrupted"),
+        ("DECIDING", False, "ERROR", "interrupted"),
+        ("RISK_CHECK", False, "ERROR", "interrupted"),
+        ("RISK_CHECK", True, "RISK_CHECK", None),
+        ("SUBMITTED", True, "SUBMITTED", None),
+        ("FILLED", True, "FILLED", None),
+    ],
+)
+async def test_recover(
+    state: str,
+    with_order: bool,
+    after: str,
+    reason: str | None,
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    cid = await new_cycle(sessions, strategy_id, state=state)
+    if with_order:
+        async with sessions() as s:
+            await repo.insert_order(
+                s,
+                cycle_id=cid,
+                client_order_id=f"at-c{cid}-e",
+                symbol=BTC,
+                mode="paper",
+                type_="limit",
+                side="buy",
+                qty=D("1"),
+                limit_price=D("100.1"),
+                stop_price=None,
+                tp_price=None,
+                status="pending",
+                now=NOW,
+            )
+    await make_runner(sessions, bus, gate, FakeRisk(), strategy_id).recover()
+    row = await cycle_row(sessions, cid)
+    assert (row.state, row.reject_reason) == (after, reason)

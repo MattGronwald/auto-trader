@@ -19,6 +19,7 @@ the next start resolves the uncertain rows (§9).
 """
 
 import asyncio
+import functools
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -240,6 +241,116 @@ class CycleRunner:
         while self._tasks:
             await asyncio.gather(*list(self._tasks.values()), return_exceptions=True)
             await asyncio.sleep(0)  # let done-callbacks drop finished tasks
+
+    # --- admission (G14) -------------------------------------------------------------
+
+    async def on_candidate(self, event: CandidateSignal) -> None:
+        """Bus handler. Never raises: a failed admission drops the candidate."""
+        try:
+            await self._admit(event)
+        except Exception:
+            log.exception("cycle.admission_failed", symbol=event.symbol, rule_id=event.rule_id)
+
+    def _blocked(self) -> str | None:
+        if self._closing:
+            return "shutting down"
+        if self._suspended:
+            return "admission suspended: commit uncertain"
+        return None
+
+    @staticmethod
+    def _drop(event: CandidateSignal, reason: str) -> None:
+        log.info("cycle.dropped", symbol=event.symbol, rule_id=event.rule_id, reason=reason)
+
+    async def _admit(self, event: CandidateSignal) -> None:
+        if (reason := self._blocked()) is not None:
+            self._drop(event, reason)
+            return
+        now = self._clock()
+        if signal_is_stale(event.bar_ts, event.timeframe, now):
+            self._drop(event, "signal stale")
+            return
+        try:
+            status = await self._timed(self._gate.status(now))
+        except Exception as e:  # an unanswered gate is not an allowed gate
+            self._drop(event, f"gate unavailable: {type(e).__name__}")
+            return
+        if not status.entries_allowed:
+            self._drop(event, f"entries blocked: {', '.join(status.reasons)}")
+            return
+        async with self._admission_lock:
+            if (reason := self._blocked()) is not None:  # re-checked inside the lock
+                self._drop(event, reason)
+                return
+            why: list[str] = []
+
+            async def build(session: AsyncSession) -> DomainEvent | None:
+                # Runs under the bus lock. A unit that held the lock before us may have
+                # hit CommitUncertain and suspended admission while we waited (the bus
+                # calls on_uncertain under the same lock), so check again here.
+                if (blocked := self._blocked()) is not None:
+                    why.append(blocked)
+                    return None
+                open_symbols = await repo.open_cycle_symbols(session)
+                if len(open_symbols) >= self._profile.scanner.max_concurrent_cycles:
+                    why.append("max_concurrent_cycles")
+                    return None
+                if event.symbol in open_symbols:
+                    why.append("open cycle on symbol")
+                    return None
+                if any(o.symbol == event.symbol for o in await repo.open_entry_orders(session)):
+                    why.append("open entry order on symbol")
+                    return None
+                row = await repo.insert_cycle(
+                    session,
+                    strategy_id=self._strategy_id,
+                    symbol=event.symbol,
+                    rule_id=event.rule_id,
+                    signal_features=signal_features(event),
+                    state=S.NEW,
+                    now=now,
+                )
+                return CycleTransitioned(
+                    ts=now,
+                    cycle_id=row.id,
+                    from_state=None,
+                    to_state=S.NEW,
+                    details={"rule_id": event.rule_id, "score": event.score},
+                )
+
+            published = await self._bus.publish_tx(build, _verify, on_uncertain=self._suspend)
+            if published is None or published.cycle_id is None:
+                self._drop(event, why[0] if why else "not admitted")
+                return
+            cycle_id = published.cycle_id
+            if self._closing:  # committed after close() began: recover() ends it
+                log.warning("cycle.not_started", cycle_id=cycle_id, reason="shutting down")
+                return None
+            task = asyncio.create_task(self._run(cycle_id, event), name=f"cycle-{cycle_id}")
+            self._tasks[cycle_id] = task
+            task.add_done_callback(functools.partial(self._task_done, cycle_id))
+        log.info("cycle.admitted", cycle_id=cycle_id, symbol=event.symbol, rule_id=event.rule_id)
+        return None
+
+    def _task_done(self, cycle_id: int, task: asyncio.Task[None]) -> None:
+        self._tasks.pop(cycle_id, None)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            log.error("cycle.task_crashed", cycle_id=cycle_id, error=repr(exc))
+
+    # --- recovery --------------------------------------------------------------------
+
+    async def recover(self) -> None:
+        """Startup: end cycles that provably sent nothing; leave the rest to WP 1.5."""
+        async with self._sessions() as session:
+            rows = await repo.open_cycles(session)
+            with_order = {r.id for r in rows if await repo.has_order_for_cycle(session, r.id)}
+        for row in rows:
+            state = CycleState(row.state)
+            with bind_cycle(row.id):
+                if state in BEFORE_CHECK or (state is S.RISK_CHECK and row.id not in with_order):
+                    await self._move(row.id, state, S.ERROR, reason="interrupted")
+                else:
+                    log.warning("cycle.awaiting_reconciliation", state=state)
 
     # --- transitions -----------------------------------------------------------------
 
