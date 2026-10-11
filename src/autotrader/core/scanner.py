@@ -21,9 +21,9 @@ symbol, open cycles at `max_concurrent_cycles`,
 candidates, so a restart doesn't reset it).
 
 The concurrency checks are soft: bars of all symbols close together, so several
-candidates can go out before any cycle row exists. The Cycle Runner (WP 1.4) enforces
-both caps when it creates a cycle (G14). The daily loss limit needs no check here: the
-Risk Engine sets `paused_until` (WP 1.3), which the gate reports.
+candidates can go out before any cycle row exists. The Cycle Runner (`core/cycle.py`)
+enforces both caps authoritatively when it admits a cycle (G14, D15). The daily loss limit
+needs no check here: the Risk Engine sets `paused_until` (WP 1.3), which the gate reports.
 """
 
 import math

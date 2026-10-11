@@ -21,7 +21,7 @@ Automated, agent-based crypto trading PoC (Alpaca paper first, live later with ~
 - pydantic v2 domain types; `Decimal` for money/qty outside indicator math. DB columns: `Money` / `UTCDateTime` from `journal/types.py` (floats and naive datetimes are rejected on write).
 - SQLAlchemy 2 async + Alembic (`render_as_batch=True`); SQLite dev, Postgres prod.
 - structlog JSON logs (`core/logging.py`); wrap cycle work in `bind_cycle(cycle_id)` so every line carries it. Never log secrets.
-- Events subclass `DomainEvent` (`core/bus.py`) and go through `EventBus.publish()`, which persists before delivering. Don't write the `events` table directly.
+- Events subclass `DomainEvent` (`core/bus.py`) and go through `EventBus.publish()`, which persists before delivering, or `EventBus.publish_tx(build, verify)` when a row write must commit atomically with its event (cycle transitions). Don't write the `events` table directly.
 - ruff + mypy (strict on `core/`, `risk/`, `broker/`) + pytest/hypothesis. `risk/` requires 100 % branch coverage.
 - Tests never hit Alpaca or Anthropic; use `SimBroker` and recorded agent fixtures. Real-API smoke tests are opt-in (marker `smoke`).
 - Verify broker/LLM facts (order types, fees, model IDs, prices) against current docs — don't hard-code from memory.
