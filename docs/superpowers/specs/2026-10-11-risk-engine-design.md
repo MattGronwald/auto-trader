@@ -114,6 +114,16 @@ One `asyncio.Lock` serialises every entry and exit, from gathering to submit. Tw
 can therefore never pass check 5 on the same state; together with the Cycle Runner's caps
 (G14) the limits are exact.
 
+**Time budget.** Because the lock is held across broker calls, every broker/gate step
+under it is bounded by `RiskEngine(io_timeout_s=10.0)` (`run core` passes the default):
+the entry gather as a whole, the pre-submit gate check, each submit, and the exit's
+position read. A timeout is handled like any other failure of that step (gather → `state
+unavailable: TimeoutError`; gate → `not_submitted`; submit or `close_position` →
+`unknown`). So an `exit()` waits for the lock at most one in-flight entry's budgets — worst
+case 3 × `io_timeout_s` (gather, gate, submit) plus its local journal writes — never
+forever. `asyncio.CancelledError` is never caught. Broker-side request timeouts in
+`AlpacaBroker` remain WP 1.6.
+
 ### `check(intent) -> EntryResult`
 1. Gather: `ControlGate.status(now)`; **first refresh the engine's own `new` entry orders
    from `broker.get_order()`, holding no DB session across broker calls**, then read broker
@@ -129,7 +139,8 @@ can therefore never pass check 5 on the same state; together with the Cycle Runn
    `client_order_id = "at-c{cycle_id}-e"`. The unique column means a cycle can never
    submit a second entry, even if the Cycle Runner retries.
 4. Ask the gate again immediately before submitting; a kill or pause that arrived during
-   gathering marks the order `not_submitted` and returns. (Status values fit the
+   gathering marks the order `not_submitted` and returns. A gate that raises or times out
+   counts as "not allowed" (`not_submitted`, reason `gate unavailable: <error type>`). (Status values fit the
    16-character `orders.status` column, which Postgres enforces.)
 5. Submit:
    - ack → store `broker_order_id` and the ack status;
