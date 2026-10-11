@@ -6,12 +6,17 @@ API; see docs/alpaca-notes.md for sources, raw values and open questions.
 - The client runs with `raw_data=True`: the API returns decimals as strings, while the
   alpaca-py models turn asset sizes into floats. Strings go straight into `Decimal`.
 - alpaca-py is synchronous; calls run in a worker thread (`asyncio.to_thread`).
+- One error contract at this boundary: any SDK, transport or API failure (connection,
+  auth, rate limit) and any malformed response becomes `BrokerError`, with the original
+  exception as `__cause__`. Messages carry only the exception type, never the SDK's
+  message. Cancellation is not an `Exception` and passes through untouched.
 - Fees are volume-tiered; `fee_schedule()` follows the account's `crypto_tier`.
 - No minimum notional is published (only a $200k maximum per order).
 """
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any, NoReturn, Protocol
 
@@ -84,7 +89,7 @@ class AlpacaBroker:
             raise BrokerError("live Alpaca account requested but ALLOW_LIVE=1 is not set")
         if client is None:
             client = _make_client(settings, paper)
-        account = await asyncio.to_thread(client.get_account)
+        account = await _call("get_account", client.get_account)
         if str(account.get("crypto_status")).upper() != "ACTIVE":
             raise BrokerError(
                 f"crypto trading not active on this account: {account.get('crypto_status')}"
@@ -97,31 +102,31 @@ class AlpacaBroker:
     # --- read side -------------------------------------------------------------------
 
     async def get_account(self) -> Account:
-        raw = await asyncio.to_thread(self._client.get_account)
-        return Account(equity=Decimal(raw["equity"]), cash=Decimal(raw["cash"]))
+        raw = await _call("get_account", self._client.get_account)
+        with _parsing("account"):
+            return Account(equity=Decimal(raw["equity"]), cash=Decimal(raw["cash"]))
 
     async def get_positions(self) -> list[Position]:
-        raw = await asyncio.to_thread(self._client.get_all_positions)
-        return [
-            Position(
-                symbol=_slash_symbol(p["symbol"]),
-                qty=Decimal(p["qty"]),
-                avg_entry_price=Decimal(p["avg_entry_price"]),
-            )
-            for p in raw
-            if p.get("asset_class") == "crypto"
-        ]
+        raw = await _call("get_all_positions", self._client.get_all_positions)
+        with _parsing("positions"):
+            return [
+                Position(
+                    symbol=_slash_symbol(p["symbol"]),
+                    qty=Decimal(p["qty"]),
+                    avg_entry_price=Decimal(p["avg_entry_price"]),
+                )
+                for p in raw
+                if p.get("asset_class") == "crypto"
+            ]
 
     async def asset_rules(self, symbol: str) -> AssetRules:
-        try:
-            raw = await asyncio.to_thread(self._client.get_asset, symbol)
-        except Exception as e:
-            raise BrokerError(f"cannot load asset {symbol}: {type(e).__name__}") from e
-        return AssetRules(
-            min_qty=Decimal(raw["min_order_size"]),
-            qty_increment=Decimal(raw["min_trade_increment"]),
-            min_notional=Decimal(0),
-        )
+        raw = await _call(f"get_asset {symbol}", self._client.get_asset, symbol)
+        with _parsing(f"asset {symbol}"):
+            return AssetRules(
+                min_qty=Decimal(raw["min_order_size"]),
+                qty_increment=Decimal(raw["min_trade_increment"]),
+                min_notional=Decimal(0),
+            )
 
     def fee_schedule(self) -> FeeSchedule:
         return self._fees
@@ -148,6 +153,25 @@ class AlpacaBroker:
 
     def stream_fills(self) -> AsyncIterator[Fill]:
         _not_yet("stream_fills")
+
+
+async def _call[T](what: str, fn: Callable[..., T], *args: Any) -> T:
+    """Run a sync SDK call in a thread; any failure becomes a `BrokerError`."""
+    try:
+        return await asyncio.to_thread(fn, *args)
+    except Exception as e:  # CancelledError is a BaseException and propagates
+        raise BrokerError(f"alpaca {what} failed: {type(e).__name__}") from e
+
+
+@contextmanager
+def _parsing(what: str) -> Iterator[None]:
+    """A response with missing or non-numeric fields is a broker failure, not a crash."""
+    try:
+        yield
+    except BrokerError:
+        raise
+    except (KeyError, TypeError, ArithmeticError, ValueError) as e:
+        raise BrokerError(f"unexpected alpaca {what} response: {type(e).__name__}") from e
 
 
 def _not_yet(method: str) -> NoReturn:
