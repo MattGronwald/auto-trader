@@ -167,7 +167,13 @@ is estimated at `qty × avg_entry_price`),
 `hwm = max(highest stored hwm, equity)`, `daily_pnl = equity − day_start_equity`. The
 previous HWM is the maximum over **all** snapshot rows (`repo.max_hwm`), never the latest
 row's value, so writers that interleave (the snapshot task and a `check()`) can never lower
-it. Failure is logged and retried on the next tick. `check()` folds live equity into the
+it. `run core` runs it in one supervised background task (`_snapshot_loop`): the first
+snapshot immediately, then every `snapshot_s` (60); each attempt bounded by
+`snapshot_timeout_s` (default `min(snapshot_s / 2, 30)`); a failure or timeout is logged as
+`risk.snapshot_failed` (`timeout=True` for a timeout) and the next attempt follows on
+schedule; a success logs `risk.snapshot_written`. The core loop never awaits a snapshot, so
+a hung REST call cannot delay kill detection or feed ticks; if the task ever ends it is
+logged as `risk.snapshot_task_died` and restarted on the next tick. `check()` folds live equity into the
 `hwm` it uses and, when live equity exceeds the stored maximum, writes a snapshot at once,
 also when the check then rejects: a spike between two periodic snapshots that falls back
 before the next one still bounds drawdown, including after a restart.
@@ -194,7 +200,7 @@ If no snapshot exists at all, the engine takes one before checking.
   `realized_pnl > 0`, i.e. net of fees, counted as wins; joined to the active strategy via
   `cycles`).
 - **`run core`:** keeps the broker it connects at startup, hands it to `RiskEngine`, calls
-  `snapshot_equity()` every 60 s. Nothing calls `check()`/`exit()` until WP 1.4/1.5.
+  `snapshot_equity()` every 60 s from a supervised background task (§6). Nothing calls `check()`/`exit()` until WP 1.4/1.5.
 - **CI:** `coverage report --include='src/autotrader/risk/*' --fail-under=100` (branch).
 
 ## 8. Tests

@@ -355,8 +355,8 @@ class RiskEngine:
     # --- equity snapshots ------------------------------------------------------------
 
     async def snapshot_equity(self) -> None:
-        """Called every 60 s by `run core`. Lock-free on purpose: it must never delay
-        an exit."""
+        """Called every 60 s by `run core`'s background snapshot task, which bounds it.
+        Lock-free on purpose: it must never delay an exit."""
         now = self._clock()
         account = await self._broker.get_account()
         await self._write_snapshot(now, account.equity, account.cash, await self._held_positions())
