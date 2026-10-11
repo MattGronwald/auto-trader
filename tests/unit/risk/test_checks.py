@@ -77,8 +77,14 @@ def run(
     )
 
 
-def held(symbol: str, qty: str = "1", value: str = "100") -> HeldPosition:
-    return HeldPosition(symbol=symbol, qty=D(qty), market_value=D(value), min_qty=D("0.001"))
+def held(symbol: str, qty: str = "1", value: str | None = "100") -> HeldPosition:
+    return HeldPosition(
+        symbol=symbol,
+        qty=D(qty),
+        market_value=None if value is None else D(value),
+        avg_entry_price=D("100"),
+        min_qty=D("0.001"),
+    )
 
 
 def test_entry_limit_rounds_up_to_price_increment() -> None:
@@ -244,6 +250,27 @@ def test_entry_rejections_checks_7_to_11(kwargs: dict[str, Any], reason: str) ->
 )
 def test_entry_boundaries_pass_checks_7_to_11(kwargs: dict[str, Any]) -> None:
     assert run(**kwargs).approved
+
+
+def test_unpriced_held_position_rejects_at_the_exposure_check() -> None:
+    """Check 8 cannot be computed without a current price; cost basis would undercount."""
+    d = run(portfolio={"positions": (held(ETH, value=None),)})
+    assert not d.approved
+    assert d.reasons == (f"held position {ETH} has no current price",)
+
+
+def test_unpriced_dust_is_ignored_and_priced_dust_still_counts() -> None:
+    assert run(portfolio={"positions": (held(ETH, qty="0.0005", value=None),)}).approved
+    # 300.01 of priced dust + 2.997 x 100.1 > 600: dust is skipped by check 5 only
+    d = run(portfolio={"positions": (held(ETH, qty="0.0005", value="300.01"),)})
+    assert not d.approved and "exposure" in d.reasons[0]
+
+
+def test_exit_does_not_need_a_price() -> None:
+    d = check_exit(
+        ExitRequest(symbol=BTC, reason="stale"), [held(BTC, value=None)], mode_matches=True
+    )
+    assert d.approved and d.qty == D("1")
 
 
 def test_open_entry_notional_counts_toward_exposure() -> None:
