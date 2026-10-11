@@ -160,8 +160,16 @@ def _unique[T](items: tuple[T, ...]) -> tuple[T, ...]:
 # --- strategy profile (SPEC §6) ------------------------------------------------------
 
 
+def _above_one_minute(value: str) -> str:
+    # The feed announces live 1m bars before they are verified and in history (pending
+    # until their window is checked against REST), so a 1m signal would never fire.
+    if value == "1m":
+        raise ValueError("signal timeframe must be above 1m (1m bars are unverified)")
+    return value
+
+
 class Timeframes(_Frozen):
-    signal: Timeframe
+    signal: Annotated[Timeframe, AfterValidator(_above_one_minute)]
     context: tuple[Timeframe, ...]
     trend: Timeframe
 
