@@ -5,6 +5,7 @@ never mistakes an unimplemented `kill` or `flatten` for a successful one.
 """
 
 import asyncio
+import signal
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -12,8 +13,18 @@ from typing import Annotated, NoReturn
 
 import typer
 
+from autotrader.broker.alpaca import AlpacaBroker
+from autotrader.broker.alpaca_data import AlpacaBarSource
+from autotrader.core import runtime as core_runtime
 from autotrader.core.bus import EventBus
-from autotrader.core.config import AppConfig, ConfigError, Settings, load_config, load_profile
+from autotrader.core.config import (
+    AppConfig,
+    ConfigError,
+    Settings,
+    StrategyProfile,
+    load_config,
+    load_profile,
+)
 from autotrader.core.kill import ClearResult, clear_kill, record_kill, write_kill_file
 from autotrader.core.logging import configure_logging
 from autotrader.journal import db
@@ -49,9 +60,40 @@ def _not_implemented(command: str, wp: str) -> NoReturn:
 
 
 @run_app.command("core")
-def run_core() -> None:
-    """Start the trading core: feed, scanner, cycle runner, position manager."""
-    _not_implemented("run core", "0.8")
+def run_core(config: ConfigOption = Path("config.yaml")) -> None:
+    """Start the trading core: market feed now; scanner and cycles arrive in Phase 1."""
+    cfg = _load_config(config)
+    settings = Settings()
+    try:
+        profile = load_profile(cfg.strategy)
+    except ConfigError as e:
+        typer.echo(f"invalid config: {e}", err=True)
+        raise typer.Exit(code=1) from None
+    db.upgrade(cfg.database.url)
+    source = AlpacaBarSource.from_settings(settings, list(profile.universe))
+    asyncio.run(_run_core_until_signal(cfg, settings, profile, cfg.strategy.read_text(), source))
+
+
+async def _run_core_until_signal(
+    cfg: AppConfig,
+    settings: Settings,
+    profile: StrategyProfile,
+    profile_yaml: str,
+    source: AlpacaBarSource,
+) -> None:
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+    await core_runtime.run_core(
+        cfg,
+        settings,
+        profile,
+        profile_yaml,
+        source=source,
+        connect_broker=AlpacaBroker.connect,
+        stop=stop,
+    )
 
 
 @run_app.command("api")

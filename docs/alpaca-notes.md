@@ -64,17 +64,56 @@ Volume tiers (30-day volume in USD → maker / taker bps):
 - Paper account: `status` ACTIVE, `crypto_status` ACTIVE, currency USD, $100,000 paper cash.
 - No margin and no shorting for crypto (`marginable`/`shortable` false). Buys are checked against `non_marginable_buying_power`.
 
+## Empirical fee check — step 1 (2026-10-11, paper)
+
+Owner-approved paper order: market buy, notional $10 BTC/USD, `gtc`.
+
+| | Value |
+|---|---|
+| Fill | 0.000118113 BTC @ 82,994.20 (`filled_avg_price`) |
+| Cash debited | 9.80 USD (= fill qty × price, rounded to cents) |
+| Position qty / `qty_available` | **0.000117817** = fill qty − **25.06 bps** |
+| Position symbol | **`BTCUSD`** (FILL activity: `BTC/USD`) |
+| Fee fields on order | none |
+| `CFEE`/`FEE` activity | none yet (same day) |
+
+- **The buy fee comes out of the coin at fill time.** The position is short by the taker fee right away; it isn't deducted at end of day. Only the `CFEE` *record* is posted later.
+- **The cash side carries no fee on a buy.** It's exactly the fill value.
+- **A $10 notional market order used only ~$9.80.** That's probably a buffer for crypto notional orders (inference). The Risk Engine submits `qty` orders, so this doesn't affect us.
+- **Crypto positions report the symbol without a slash.** `AlpacaBroker`'s normalisation is required.
+
+**Step 2 (due 2026-10-12 or later):** re-read the position and the `CFEE` activity, then sell the full position qty and record the USD fee and its posting.
+
+## Market data (2026-10-11)
+
+- **REST bars** (`raw_data=True`): `{symbol: [{"t": "…Z", "o", "h", "l", "c", "v", "n", "vw"}]}`, prices as floats. Fine for bars, which are indicator input.
+- **The stream** sends msgpack payloads: `"S"` (symbol) and `"t"` as a msgpack `Timestamp`, not a string.
+- **The feed is sparse.** Over 2 days:
+
+  | Symbol | 1m bars missing |
+  |---|---|
+  | BTC/USD | 475 of 2,880 (16 %) |
+  | SOL/USD | 1,454 of 2,880 (**50 %**) |
+
+  Over an 8.5-day backfill there were 11,009 BTC, 5,303 ETH and 6,893 SOL bars (of ~12,240 minutes). Some bars have zero trades (`n: 0`). BTC volume per minute is tiny (e.g. 0.00015 BTC).
+- **Density depends strongly on time.** Share of minutes with a 1m bar, from the 8.5-day backfill (Fri 2026-10-02 22:00 → Sun 2026-10-11 10:00 UTC):
+
+  | Symbol | Weekday | Weekend | Best UTC hour |
+  |---|---|---|---|
+  | BTC/USD | 98 % | 78 % | 15:00 (96 %) |
+  | ETH/USD | 55 % | 26 % | 14:00 (68 %) |
+  | SOL/USD | 67 % | 40 % | 14:00 (80 %) |
+
+  The peak is 13:00–16:00 UTC (US open overlapping Europe), the low 20:00–23:00 UTC. Weekends are roughly half as dense. BTC is fine on weekdays; ETH stays thin even at peak. The two-day figures above include a weekend, so they understate weekday quality.
+- **Quotes only arrive on book changes.** In a 65 s live probe: BTC 0–4 quotes, ETH 5, SOL 0.
+- **Consequences:**
+  - "No data for 60 s" can't tell a broken feed from a quiet market. The feed uses split health instead (PLAN D11).
+  - **Verify before finalising:** stream bars are only pending until one REST fetch per 5m window (all symbols) confirms the window. Missed minutes are merged in before higher timeframes are built; empty buckets become flat bars (G5).
+  - **Strategy concern:** thin volume makes `vol_z`-style signals on this venue suspect. Check in WP 1.7 before relying on ETH/SOL.
+- **Library internals:** the live stream runs via `CryptoDataStream._run_forever()` (private; the public `run()` starts its own loop), and `connected()` reads the private `_running` flag. Re-check both on `alpaca-py` upgrades.
+
 ## Not verified yet
 
-- **Position symbol format.** Alpaca may report crypto positions as `BTCUSD` rather than `BTC/USD`. With no positions there was nothing to check. `AlpacaBroker` accepts both and normalises to `BASE/QUOTE`; confirm with the first paper fill.
-- **Fee deduction in practice.** Whether the position qty shrinks at the fill or at the end-of-day posting, and what `CFEE` looks like. Needs one tiny paper order, checked again the next day (see below).
+- **`CFEE` posting and the sell-side fee:** fee check step 2.
 - **Stop-limit behaviour** on crypto (trigger price source, gaps). Paper-test in WP 1.5 if a broker-side backup stop is wanted.
 - **Live availability for German residents** (SPEC §2, open risk). Unchanged; not checkable from a paper account.
-
-## Proposed empirical check (needs owner approval)
-
-1. Buy ~$10 of BTC/USD on **paper** at market and record the fill qty, fill price, position qty and `qty_available`.
-2. Next day: record the position qty again plus the `CFEE` activity.
-3. Sell the position. Record the USD fee and the end-of-day posting.
-
-This settles the position-symbol and fee-timing questions above, and gives recorded fixtures for WP 1.6.
