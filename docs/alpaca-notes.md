@@ -96,6 +96,15 @@ Owner-approved paper order: market buy, notional $10 BTC/USD, `gtc`.
   | SOL/USD | 1,454 of 2,880 (**50 %**) |
 
   Over an 8.5-day backfill there were 11,009 BTC, 5,303 ETH and 6,893 SOL bars (of ~12,240 minutes). Some bars have zero trades (`n: 0`). BTC volume per minute is tiny (e.g. 0.00015 BTC).
+- **Density depends strongly on time.** Share of minutes with a 1m bar, from the 8.5-day backfill (Fri 2026-10-02 22:00 → Sun 2026-10-11 10:00 UTC):
+
+  | Symbol | Weekday | Weekend | Best UTC hour |
+  |---|---|---|---|
+  | BTC/USD | 98 % | 78 % | 15:00 (96 %) |
+  | ETH/USD | 55 % | 26 % | 14:00 (68 %) |
+  | SOL/USD | 67 % | 40 % | 14:00 (80 %) |
+
+  The peak is 13:00–16:00 UTC (US open overlapping Europe), the low 20:00–23:00 UTC. Weekends are roughly half as dense. BTC is fine on weekdays; ETH stays thin even at peak. The two-day figures above include a weekend, so they understate weekday quality.
 - **Quotes only arrive on book changes.** In a 65 s live probe: BTC 0–4 quotes, ETH 5, SOL 0.
 - **Consequences:**
   - "No data for 60 s" can't tell a broken feed from a quiet market. The feed uses split health instead (PLAN D11).
