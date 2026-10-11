@@ -672,3 +672,19 @@ async def test_subscribers_see_fresh_state_for_a_live_bar_ending_a_stale_spell(
     await bus.drain()
 
     assert seen == [False]
+
+
+async def test_quote_and_last_price_include_pending_minutes(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    clock = Clock(T0 + 30 * M + GRACE)
+    feed = make_feed(FakeSource([bar(i, 100 + i) for i in range(30)]), sessions, bus, clock)
+    await feed.backfill()
+    assert feed.last_price(BTC) == 129
+    assert feed.quote(BTC) is None
+    await feed.on_bar(bar(30, 150))  # live: pending, not in history yet
+    q = Quote(symbol=BTC, ts=clock.now, bid=149.9, ask=150.1)
+    await feed.on_quote(q)
+    assert feed.last_price(BTC) == 150
+    assert feed.quote(BTC) == q
+    assert feed.last_price("ETH/USD") is None
