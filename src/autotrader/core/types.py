@@ -16,3 +16,14 @@ class Bar(BaseModel):
     low: float
     close: float
     volume: float
+
+
+class Quote(BaseModel):
+    """Top of book. Floats: used for spread/liveness, not money accounting."""
+
+    model_config = ConfigDict(frozen=True)
+
+    symbol: str
+    ts: AwareDatetime
+    bid: float
+    ask: float

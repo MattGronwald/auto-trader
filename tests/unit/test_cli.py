@@ -28,7 +28,6 @@ def test_run_help_lists_core_and_api() -> None:
 @pytest.mark.parametrize(
     "args",
     [
-        ["run", "core"],
         ["run", "api"],
         ["review-now"],
         ["backtest-signals"],
@@ -216,3 +215,13 @@ def test_kill_fails_loudly_if_the_file_cannot_be_written(tmp_path: Path) -> None
 
     assert result.exit_code == 1
     assert "NOT" in result.output
+
+
+def test_run_core_with_invalid_config_exits_1(tmp_path: Path) -> None:
+    bad = tmp_path / "config.yaml"
+    bad.write_text("mode: sideways\n")
+
+    result = runner.invoke(app, ["run", "core", "-c", str(bad)])
+
+    assert result.exit_code == 1
+    assert "invalid config" in result.output
