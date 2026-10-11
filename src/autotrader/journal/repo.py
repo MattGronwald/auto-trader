@@ -1,4 +1,7 @@
-"""Journal access. Functions take an `AsyncSession` and commit their own unit of work.
+"""Journal access. Functions take an `AsyncSession` and commit their own unit of work,
+except the cycle writes (`insert_cycle`, `transition_cycle`) and `append_event(...,
+commit=False)`: those run inside `EventBus.publish_tx`, which commits the row together with
+its event (WP 1.4, D15).
 
 Phase 0 needs live here (strategies, bars, events, control state), plus the read-only
 queries the Scanner (WP 1.2) runs on cycles and positions; WP 1.3 adds the risk-decision,
@@ -11,10 +14,12 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
+from typing import cast as typing_cast
 
 from sqlalchemy import Float, cast, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from autotrader.core.config import StrategyProfile
@@ -153,10 +158,15 @@ async def append_event(
     *,
     cycle_id: int | None = None,
     ts: datetime | None = None,
+    commit: bool = True,
 ) -> Event:
+    """Append one event. `commit=False` only flushes: the caller's transaction decides."""
     row = Event(ts=ts or _now(), type=type_, cycle_id=cycle_id, payload=payload)
     session.add(row)
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     return row
 
 
@@ -190,6 +200,85 @@ async def open_cycle_symbols(session: AsyncSession) -> list[str]:
 async def open_position_symbols(session: AsyncSession) -> set[str]:
     rows = await session.scalars(select(Position.symbol).where(Position.closed_at.is_(None)))
     return set(rows)
+
+
+# --- cycles (WP 1.4) -----------------------------------------------------------------
+# The two writes below never commit: they run inside `EventBus.publish_tx`, which
+# commits the cycle row together with its `CycleTransitioned` event (D15).
+
+
+class StaleTransition(RuntimeError):
+    """The guarded update matched no row: the cycle is not in the expected state."""
+
+
+async def insert_cycle(
+    session: AsyncSession,
+    *,
+    strategy_id: int,
+    symbol: str,
+    rule_id: str,
+    signal_features: dict[str, Any],
+    state: str,
+    now: datetime,
+) -> Cycle:
+    row = Cycle(
+        strategy_id=strategy_id,
+        symbol=symbol,
+        rule_id=rule_id,
+        signal_features=signal_features,
+        state=state,
+        created_at=now,
+    )
+    session.add(row)
+    await session.flush()  # assigns row.id
+    return row
+
+
+async def transition_cycle(
+    session: AsyncSession,
+    cycle_id: int,
+    *,
+    from_state: str,
+    to_state: str,
+    now: datetime,
+    reason: str | None = None,
+) -> None:
+    """`from_state -> to_state` only if the row is still in `from_state`.
+
+    Terminal states also set `outcome`, `finished_at` and `reject_reason`.
+    """
+    values: dict[str, Any] = {"state": to_state}
+    if to_state in TERMINAL_CYCLE_STATES:
+        values.update(outcome=to_state, finished_at=now, reject_reason=reason)
+    result = typing_cast(
+        CursorResult[Any],
+        await session.execute(
+            update(Cycle).where(Cycle.id == cycle_id, Cycle.state == from_state).values(**values)
+        ),
+    )
+    if result.rowcount != 1:
+        raise StaleTransition(f"cycle {cycle_id} is not in state {from_state}")
+
+
+async def cycle_state(session: AsyncSession, cycle_id: int) -> str | None:
+    return await session.scalar(select(Cycle.state).where(Cycle.id == cycle_id))
+
+
+async def open_cycles(session: AsyncSession) -> list[Cycle]:
+    rows = await session.scalars(
+        select(Cycle)
+        .where(Cycle.state.not_in(TERMINAL_CYCLE_STATES))
+        .order_by(Cycle.id)
+        .execution_options(populate_existing=True)
+    )
+    return list(rows)
+
+
+async def has_order_for_cycle(session: AsyncSession, cycle_id: int) -> bool:
+    n = await session.scalar(
+        select(func.count()).select_from(Order).where(Order.cycle_id == cycle_id)
+    )
+    return bool(n)
 
 
 # --- control state -------------------------------------------------------------------
