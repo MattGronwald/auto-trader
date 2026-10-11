@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -90,6 +90,12 @@ async def upsert_bars(session: AsyncSession, bars: Sequence[Bar]) -> None:
         )
         await session.execute(stmt)
     await session.commit()  # one transaction for the whole batch
+
+
+async def latest_bar_ts(session: AsyncSession, symbol: str, timeframe: str) -> datetime | None:
+    return await session.scalar(
+        select(func.max(BarRow.ts)).where(BarRow.symbol == symbol, BarRow.timeframe == timeframe)
+    )
 
 
 async def get_bars(
