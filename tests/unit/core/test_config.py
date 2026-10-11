@@ -157,6 +157,9 @@ def _set(data: dict[str, Any], path: str, value: Any) -> None:
         ("universe", ["BTC/USD", "BTC/USD"], "universe"),
         ("universe", ["btcusd"], "universe"),
         ("timeframes.signal", "5x", "signal"),
+        # PR #12 review: live 1m bars are announced before they reach history (pending
+        # until verified), so the scanner could never see them.
+        ("timeframes.signal", "1m", "above 1m"),
         ("learning.promote_if", "win_rat > 0.5", "unknown name 'win_rat'"),
         ("benchmark.type", "index", "type"),
     ],

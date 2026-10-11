@@ -46,7 +46,11 @@ def make_profile(
 
 
 def series(
-    symbol: str = BTC, n: int = N_BARS, last_close: float = 110.0, last_volume: float = 10.0
+    symbol: str = BTC,
+    n: int = N_BARS,
+    last_close: float = 110.0,
+    last_volume: float = 10.0,
+    end: datetime = T0 + N_BARS * FIVE,
 ) -> list[Bar]:
     """5m bars with varying volume; the last one spikes (vol_z well above 0.5)."""
     bars = []
@@ -57,7 +61,7 @@ def series(
             Bar(
                 symbol=symbol,
                 timeframe="5m",
-                ts=T0 + i * FIVE,
+                ts=end - (n - i) * FIVE,
                 open=close,
                 high=close,
                 low=close,
@@ -299,6 +303,24 @@ async def test_missing_history_for_the_bar_emits_nothing(
 # --- pre-filters ---------------------------------------------------------------------
 
 
+async def test_bar_older_than_one_signal_period_is_obsolete(
+    scanner: Factory,
+    market: FakeMarket,
+    bus: EventBus,
+    emitted: list[CandidateSignal],
+    clock: Clock,
+) -> None:
+    # PR #12 review: reconnect catch-up announces old bars while the symbol reads fresh.
+    event = market.add(series())
+    bar_end = event.bar_ts + FIVE
+    clock.now = bar_end + FIVE + timedelta(seconds=1)
+    await scan(scanner(), bus, event)
+    assert emitted == []
+    clock.now = bar_end + FIVE  # boundary: still actionable
+    await scan(scanner(), bus, event)
+    assert len(emitted) == 1
+
+
 async def test_kill_switch_suppresses(
     scanner: Factory,
     market: FakeMarket,
@@ -412,15 +434,17 @@ async def test_rate_limit_is_a_rolling_hour_and_survives_restart(
     emitted: list[CandidateSignal],
     clock: Clock,
 ) -> None:
-    event = market.add(series())
-    await scan(scanner(), bus, event)
+    async def scan_now() -> None:  # a fresh bar that has just closed, as the feed delivers
+        await scan(scanner(), bus, market.add(series(end=clock.now)))  # new instance each time
+
+    await scan_now()
     clock.now += timedelta(minutes=10)
-    await scan(scanner(), bus, event)  # new instance: counts come from the journal
+    await scan_now()  # counts come from the journal, not instance state
     clock.now += timedelta(minutes=10)
-    await scan(scanner(), bus, event)  # third within the hour: suppressed
+    await scan_now()  # third within the hour: suppressed
     assert len(emitted) == 2
     clock.now = emitted[0].ts + timedelta(hours=1)  # first one leaves the window
-    await scan(scanner(), bus, event)
+    await scan_now()
     assert len(emitted) == 3
 
 
