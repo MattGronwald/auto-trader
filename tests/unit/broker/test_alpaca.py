@@ -1,9 +1,13 @@
 """AlpacaBroker against a fake client returning recorded raw API payloads (no network)."""
 
+import asyncio
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
 import pytest
+import requests
+from alpaca.common.exceptions import APIError
 
 from autotrader.broker.alpaca import FEE_TIERS, AlpacaBroker
 from autotrader.broker.base import AssetRules, Broker, BrokerError, BrokerOrder, FeeSchedule
@@ -173,3 +177,117 @@ async def test_connect_without_keys_is_a_broker_error() -> None:
 
     with pytest.raises(BrokerError, match="ALPACA_API_KEY_ID"):
         await AlpacaBroker.connect(settings)
+
+
+# --- regressions from the PR #9 review: one error contract at the adapter boundary ---
+
+
+class FailingClient(FakeClient):
+    """Raises `error` from the named SDK method; others behave like FakeClient."""
+
+    def __init__(self, method: str, error: BaseException) -> None:
+        super().__init__()
+        self._method, self._error = method, error
+
+    def _maybe_fail(self, method: str) -> None:
+        if method == self._method:
+            raise self._error
+
+    def get_account(self) -> dict[str, Any]:
+        self._maybe_fail("get_account")
+        return super().get_account()
+
+    def get_all_positions(self) -> list[dict[str, Any]]:
+        self._maybe_fail("get_all_positions")
+        return super().get_all_positions()
+
+    def get_asset(self, symbol: str) -> dict[str, Any]:
+        self._maybe_fail("get_asset")
+        return super().get_asset(symbol)
+
+
+def _api_error(body: str) -> Exception:
+    error: Exception = APIError(body)  # type: ignore[no-untyped-call]  # untyped in alpaca-py
+    return error
+
+
+# Factories: a fresh exception per test, so tracebacks don't accumulate on shared objects.
+TRANSPORT_ERRORS: list[Callable[[], Exception]] = [
+    lambda: requests.exceptions.ConnectionError("network down"),
+    lambda: _api_error('{"code": 40110000, "message": "request is not authorized"}'),
+    lambda: _api_error('{"code": 42910000, "message": "rate limit exceeded"}'),
+]
+
+
+@pytest.mark.parametrize("make_error", TRANSPORT_ERRORS, ids=["connection", "auth", "rate-limit"])
+async def test_connect_failures_are_broker_errors(make_error: Callable[[], Exception]) -> None:
+    error = make_error()
+    with pytest.raises(BrokerError) as exc:
+        await connect(FailingClient("get_account", error))
+
+    assert exc.value.__cause__ is error
+
+
+@pytest.mark.parametrize("make_error", TRANSPORT_ERRORS, ids=["connection", "auth", "rate-limit"])
+async def test_account_read_failures_are_broker_errors(make_error: Callable[[], Exception]) -> None:
+    error = make_error()
+    client = FailingClient("none", error)
+    broker = await connect(client)
+    client._method = "get_account"
+
+    with pytest.raises(BrokerError) as exc:
+        await broker.get_account()
+
+    assert exc.value.__cause__ is error
+
+
+@pytest.mark.parametrize("make_error", TRANSPORT_ERRORS, ids=["connection", "auth", "rate-limit"])
+async def test_position_read_failures_are_broker_errors(
+    make_error: Callable[[], Exception],
+) -> None:
+    error = make_error()
+    broker = await connect(FailingClient("get_all_positions", error))
+
+    with pytest.raises(BrokerError) as exc:
+        await broker.get_positions()
+
+    assert exc.value.__cause__ is error
+
+
+async def test_error_messages_do_not_echo_sdk_messages() -> None:
+    # The SDK message can carry request details; only the type name is surfaced.
+    secretish = requests.exceptions.ConnectionError("https://user:pass@paper-api/...")
+
+    with pytest.raises(BrokerError) as exc:
+        await connect(FailingClient("get_account", secretish))
+
+    assert "pass" not in str(exc.value)
+    assert "ConnectionError" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "account",
+    [
+        {k: v for k, v in ACCOUNT.items() if k != "equity"},
+        {**ACCOUNT, "cash": "not-a-number"},
+    ],
+)
+async def test_malformed_account_payload_is_a_broker_error(account: dict[str, Any]) -> None:
+    client = FakeClient()
+    broker = await connect(client)
+    client.account = account
+
+    with pytest.raises(BrokerError, match="unexpected"):
+        await broker.get_account()
+
+
+async def test_malformed_position_payload_is_a_broker_error() -> None:
+    positions = [{"symbol": "BTC/USD", "asset_class": "crypto", "qty": "1"}]  # no avg_entry_price
+
+    with pytest.raises(BrokerError, match="unexpected"):
+        await (await connect(FakeClient(positions=positions))).get_positions()
+
+
+async def test_cancellation_is_not_swallowed() -> None:
+    with pytest.raises(asyncio.CancelledError):
+        await connect(FailingClient("get_account", asyncio.CancelledError()))
