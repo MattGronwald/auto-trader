@@ -18,15 +18,35 @@ Any `CommitUncertain` suspends admission for the rest of the process; `recover()
 the next start resolves the uncertain rows (§9).
 """
 
-from datetime import datetime
+import asyncio
+import math
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol, TypeVar
 
+import structlog
 from pydantic import Field
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from autotrader.core.bus import DomainEvent
+from autotrader.agents import stub
+from autotrader.agents.stub import StubBuy, StubSkip
+from autotrader.core.bus import CommitUncertain, DomainEvent, EventBus
+from autotrader.core.config import StrategyProfile
+from autotrader.core.indicators import compute_features
+from autotrader.core.kill import ControlStatus
+from autotrader.core.logging import bind_cycle
 from autotrader.core.resample import parse_timeframe
 from autotrader.core.scanner import CandidateSignal
+from autotrader.core.types import Bar, Quote
+from autotrader.journal import repo
+from autotrader.risk.engine import OrderResult
+from autotrader.risk.types import EntryIntent
+
+log = structlog.get_logger(__name__)
+T = TypeVar("T")
 
 
 class CycleState(StrEnum):
@@ -100,3 +120,316 @@ def signal_features(candidate: CandidateSignal) -> dict[str, Any]:
         "_timeframe": candidate.timeframe,
         "_bar_ts": candidate.bar_ts.isoformat(),
     }
+
+
+STEP_TIMEOUT_S = 30.0  # SPEC §4.3: e.g. an LLM call > 30 s -> ERROR
+NO_ANALYST = {"skipped": "no analyst in phase 1"}
+
+
+class CycleMarketView(Protocol):
+    def history(self, symbol: str, timeframe: str) -> list[Bar]: ...
+    def quote(self, symbol: str) -> Quote | None: ...
+    def last_price(self, symbol: str) -> float | None: ...
+    def is_stale(self, symbol: str) -> bool: ...
+
+
+class Gate(Protocol):
+    async def status(self, now: datetime | None = None) -> ControlStatus: ...
+
+
+class EntryChecker(Protocol):
+    async def check(self, intent: EntryIntent) -> OrderResult: ...
+
+
+@dataclass(frozen=True)
+class CycleSnapshot:
+    ask: Decimal
+    bid: Decimal | None
+    last_price: Decimal | None
+    atr: Decimal
+
+    def details(self) -> dict[str, Any]:
+        return {
+            "ask": str(self.ask),
+            "bid": None if self.bid is None else str(self.bid),
+            "last_price": None if self.last_price is None else str(self.last_price),
+            "atr": str(self.atr),
+        }
+
+
+Decision = StubBuy | StubSkip
+DecisionMaker = Callable[[CandidateSignal, CycleSnapshot], Awaitable[Decision]]
+
+
+@dataclass(frozen=True)
+class CloseReport:
+    abandoned: tuple[int, ...] = ()  # cycle ids whose task or check() was still running
+
+
+@dataclass
+class _Cursor:
+    cycle_id: int
+    state: CycleState
+
+
+class _WriteFailed(Exception):
+    """A transition write failed; the database error is the `__cause__`."""
+
+
+def _dec(value: float | None) -> Decimal | None:
+    return None if value is None or not math.isfinite(value) else Decimal(str(value))
+
+
+async def _verify(session: AsyncSession, event: DomainEvent) -> bool:
+    """Read-back after a commit error: is the cycle row in the event's target state?"""
+    if not isinstance(event, CycleTransitioned) or event.cycle_id is None:
+        raise TypeError(f"cannot verify {type(event).__name__}")
+    return await repo.cycle_state(session, event.cycle_id) == event.to_state
+
+
+def _consume(task: asyncio.Future[Any]) -> None:
+    if not task.cancelled():
+        task.exception()  # retrieved: a check() nobody awaits any more must not warn
+
+
+class CycleRunner:
+    def __init__(
+        self,
+        *,
+        profile: StrategyProfile,
+        strategy_id: int,
+        market: CycleMarketView,
+        gate: Gate,
+        risk: EntryChecker,
+        bus: EventBus,
+        sessions: async_sessionmaker[AsyncSession],
+        decide: DecisionMaker | None = None,
+        trading_day_tz: str = "UTC",
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        step_timeout_s: float = STEP_TIMEOUT_S,
+    ) -> None:
+        self._profile = profile
+        self._strategy_id = strategy_id
+        self._market = market
+        self._gate = gate
+        self._risk = risk
+        self._bus = bus
+        self._sessions = sessions
+        self._decide: DecisionMaker = decide or self._stub_decide
+        self._tz = trading_day_tz
+        self._clock = clock
+        self._step_timeout = step_timeout_s
+        self._admission_lock = asyncio.Lock()
+        self._tasks: dict[int, asyncio.Task[None]] = {}
+        self._checks: dict[int, asyncio.Future[OrderResult]] = {}  # cycles inside check()
+        self._closing = False
+        self._suspended = False
+
+    @property
+    def admission_suspended(self) -> bool:
+        return self._suspended
+
+    def _suspend(self, error: CommitUncertain) -> None:
+        """`on_uncertain` callback: called by the bus-owned unit itself (D15)."""
+        if not self._suspended:
+            self._suspended = True
+            log.error("cycle.admission_suspended", error=str(error))
+
+    async def join(self) -> None:
+        """Wait until every running cycle task has finished (tests; not a shutdown path)."""
+        while self._tasks:
+            await asyncio.gather(*list(self._tasks.values()), return_exceptions=True)
+            await asyncio.sleep(0)  # let done-callbacks drop finished tasks
+
+    # --- transitions -----------------------------------------------------------------
+
+    async def _move(
+        self,
+        cycle_id: int,
+        from_: CycleState,
+        to: CycleState,
+        details: dict[str, Any] | None = None,
+        reason: str | None = None,
+    ) -> None:
+        check_edge(from_, to)  # ValueError: a bug, handled like any step error
+        now = self._clock()
+        event = CycleTransitioned(
+            ts=now,
+            cycle_id=cycle_id,
+            from_state=from_,
+            to_state=to,
+            details={**(details or {}), **({"reason": reason} if reason else {})},
+        )
+
+        async def build(session: AsyncSession) -> DomainEvent:
+            await repo.transition_cycle(
+                session, cycle_id, from_state=from_, to_state=to, now=now, reason=reason
+            )
+            return event
+
+        try:
+            await self._bus.publish_tx(build, _verify, on_uncertain=self._suspend)
+        except (CommitUncertain, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            raise _WriteFailed(f"{from_} -> {to}") from e
+        log.info("cycle.transition", from_state=from_, to_state=to, reason=reason)
+
+    async def _advance(
+        self,
+        cur: _Cursor,
+        to: CycleState,
+        details: dict[str, Any] | None = None,
+        reason: str | None = None,
+    ) -> None:
+        await self._move(cur.cycle_id, cur.state, to, details, reason)
+        cur.state = to
+
+    # --- one cycle -------------------------------------------------------------------
+
+    async def _run(self, cycle_id: int, candidate: CandidateSignal) -> None:
+        with bind_cycle(cycle_id):
+            cur = _Cursor(cycle_id, S.NEW)
+            try:
+                intent = await self._prepare(cur, candidate)
+            except asyncio.CancelledError:
+                raise
+            except CommitUncertain:
+                log.error("cycle.stuck", state=cur.state, reason="commit uncertain")
+                return
+            except Exception as e:
+                if isinstance(e, _WriteFailed):
+                    log.error("cycle.transition_failed", state=cur.state, error=repr(e.__cause__))
+                    reason = "transition write failed"
+                elif isinstance(e, TimeoutError):
+                    log.error("cycle.step_timeout", state=cur.state)
+                    reason = f"{cur.state}: timeout"
+                else:
+                    log.exception("cycle.step_failed", state=cur.state)
+                    reason = f"{cur.state}: {type(e).__name__}"
+                await self._fail(cur, reason)
+                return
+            if intent is not None:
+                await self._risk_check(cur, intent)
+
+    async def _fail(self, cur: _Cursor, reason: str) -> None:
+        """General rule (§9): one attempt to write ERROR, else the row keeps its state."""
+        try:
+            await self._advance(cur, S.ERROR, reason=reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("cycle.stuck", state=cur.state, reason=reason)
+
+    async def _timed(self, step: Awaitable[T]) -> T:
+        async with asyncio.timeout(self._step_timeout):
+            return await step
+
+    async def _prepare(self, cur: _Cursor, candidate: CandidateSignal) -> EntryIntent | None:
+        """NEW .. RISK_CHECK. Returns the intent, or None when the cycle already ended."""
+        await self._advance(cur, S.ENRICHING)
+        snap = await self._timed(self._enrich(candidate))
+        if isinstance(snap, str):
+            await self._advance(cur, S.EXPIRED, reason=snap)
+            return None
+        await self._advance(cur, S.ANALYZING, details=snap.details())
+        await self._advance(cur, S.DECIDING, details=dict(NO_ANALYST))
+        decision = await self._timed(self._decide(candidate, snap))
+        if isinstance(decision, StubSkip):
+            await self._advance(cur, S.REJECTED, reason=f"decision: skip ({decision.reason})")
+            return None
+        intent = EntryIntent(
+            cycle_id=cur.cycle_id,
+            symbol=candidate.symbol,
+            stop=decision.stop,
+            take_profit=decision.take_profit,
+            confidence=decision.confidence,
+            size_fraction=decision.size_fraction,
+        )
+        await self._advance(cur, S.RISK_CHECK, details=intent.model_dump(mode="json"))
+        if signal_is_stale(candidate.bar_ts, candidate.timeframe, self._clock()):
+            await self._advance(cur, S.EXPIRED, reason="signal stale")
+            return None
+        return intent
+
+    async def _enrich(self, candidate: CandidateSignal) -> CycleSnapshot | str:
+        """The snapshot, or the reason the cycle expires."""
+        symbol = candidate.symbol
+        if self._market.is_stale(symbol):
+            return "symbol stale"
+        quote = self._market.quote(symbol)
+        ask = None if quote is None else _dec(quote.ask)
+        if ask is None or ask <= 0:
+            return "no ask"
+        features = compute_features(
+            self._market.history(symbol, self._profile.timeframes.signal),
+            trading_day_tz=self._tz,
+        )
+        if not features["atr14"]:
+            return "ATR missing"
+        atr = _dec(features["atr14"][-1])
+        if atr is None:
+            return "ATR not finite"
+        if atr <= 0:
+            return "ATR not positive"
+        return CycleSnapshot(
+            ask=ask,
+            bid=_dec(quote.bid) if quote is not None else None,
+            last_price=_dec(self._market.last_price(symbol)),
+            atr=atr,
+        )
+
+    async def _stub_decide(self, candidate: CandidateSignal, snap: CycleSnapshot) -> Decision:
+        return stub.decide(candidate.score, snap.ask, snap.atr, self._profile.risk)
+
+    async def _risk_check(self, cur: _Cursor, intent: EntryIntent) -> None:
+        """RISK_CHECK onwards. `check()` once; after it, no fallback ERROR write (§9)."""
+        check = asyncio.ensure_future(self._risk.check(intent))
+        check.add_done_callback(_consume)
+        self._checks[cur.cycle_id] = check
+        try:
+            try:
+                result = await asyncio.shield(check)  # only close() may force it
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.exception("cycle.check_failed")
+                await self._after_check(cur, S.ERROR, reason=f"RISK_CHECK: {type(e).__name__}")
+                return
+            decision = result.decision
+            if not decision.approved:
+                reason = decision.reasons[0] if decision.reasons else "rejected"
+                await self._after_check(cur, S.REJECTED, reason=reason)
+                return
+            submitted = {
+                "order_row_id": result.order_row_id,
+                "status": result.status,
+                "broker_order_id": result.broker_order_id,
+                "qty": None if decision.qty is None else str(decision.qty),
+            }
+            if not await self._after_check(cur, S.SUBMITTED, details=submitted):
+                return
+            if result.status == "filled":
+                await self._after_check(cur, S.FILLED)
+            elif result.status in ("rejected", "not_submitted"):
+                await self._after_check(cur, S.REJECTED, reason=f"order {result.status}")
+            else:  # new / unknown / canceled: WP 1.5 reconciles from the broker's fill qty
+                log.info("cycle.awaiting_order", status=result.status)
+        finally:
+            self._checks.pop(cur.cycle_id, None)
+
+    async def _after_check(
+        self,
+        cur: _Cursor,
+        to: CycleState,
+        details: dict[str, Any] | None = None,
+        reason: str | None = None,
+    ) -> bool:
+        try:
+            await self._advance(cur, to, details, reason)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # incl. CommitUncertain: the order row decides what happens
+            log.exception("cycle.stuck", state=cur.state, to_state=to)
+            return False
