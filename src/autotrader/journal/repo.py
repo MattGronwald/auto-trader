@@ -316,7 +316,7 @@ async def insert_equity_snapshot(
     ts: datetime,
     equity: Decimal,
     cash: Decimal,
-    exposure: Decimal,
+    exposure: Decimal | None,
     hwm: Decimal,
     daily_pnl: Decimal,
 ) -> None:

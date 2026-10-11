@@ -321,6 +321,20 @@ async def test_snapshots_and_day_start_equity(session: AsyncSession) -> None:
     assert latest is not None and latest.equity == Decimal("995")
 
 
+async def test_snapshot_exposure_may_be_unknown(session: AsyncSession) -> None:
+    await repo.insert_equity_snapshot(
+        session,
+        ts=T0,
+        equity=Decimal("1200"),
+        cash=Decimal("1000"),
+        exposure=None,  # an account observation without a positions read
+        hwm=Decimal("1200"),
+        daily_pnl=Decimal(0),
+    )
+    latest = await repo.latest_snapshot(session)
+    assert latest is not None and latest.exposure is None
+
+
 async def test_max_hwm_is_the_numeric_maximum_over_all_snapshots(session: AsyncSession) -> None:
     assert await repo.max_hwm(session) is None
     # Out of ts order, and "999.5" > "1200.000000000001" as strings (SQLite stores text).

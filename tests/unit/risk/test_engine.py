@@ -278,12 +278,18 @@ class EquityBroker(SimBroker):
     """Reports `equity` instead of the simulated one when it is set (cash unchanged)."""
 
     equity: D | None = None
+    positions_down = False  # get_positions raises (after the account was read)
 
     async def get_account(self) -> Account:
         account = await super().get_account()
         if self.equity is None:
             return account
         return account.model_copy(update={"equity": self.equity})
+
+    async def get_positions(self) -> list[Position]:
+        if self.positions_down:
+            raise ConnectionError("positions endpoint down")
+        return await super().get_positions()
 
 
 async def snapshots(sessions: async_sessionmaker[AsyncSession]) -> list[m.EquitySnapshot]:
@@ -292,8 +298,13 @@ async def snapshots(sessions: async_sessionmaker[AsyncSession]) -> list[m.Equity
 
 
 @pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("seen_by", ["invalid_stop", "gather_failure"])
 async def test_equity_peak_seen_by_a_rejected_check_still_bounds_drawdown(
-    restart: bool, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+    seen_by: str,
+    restart: bool,
+    sessions: async_sessionmaker[AsyncSession],
+    gate: ControlGate,
+    cycle_id: int,
 ) -> None:
     broker = _sim(EquityBroker)
     assert isinstance(broker, EquityBroker)
@@ -302,9 +313,17 @@ async def test_equity_peak_seen_by_a_rejected_check_still_bounds_drawdown(
     await engine.snapshot_equity()  # baseline and HWM 1000
     broker.equity = D("1200")  # spike between two snapshots
     clock.now = NOW + timedelta(seconds=10)
-    spiked = await engine.check(intent(cycle_id, stop=D("100.10")))  # invalid stop
-    assert "not below entry" in spiked.decision.reasons[0]
-    assert [s.hwm for s in await snapshots(sessions)] == [D("1000"), D("1200")]
+    if seen_by == "invalid_stop":
+        spiked = await engine.check(intent(cycle_id, stop=D("100.10")))
+        assert "not below entry" in spiked.decision.reasons[0]
+    else:  # the account read succeeds, the positions read after it fails
+        broker.positions_down = True
+        spiked = await engine.check(intent(cycle_id))
+        assert spiked.decision.reasons == ("state unavailable: ConnectionError",)
+        broker.positions_down = False
+    rows = await snapshots(sessions)
+    assert [s.hwm for s in rows] == [D("1000"), D("1200")]
+    assert rows[1].exposure is None  # an account observation: exposure unknown
     broker.equity = D("1000")  # back down before the next periodic snapshot
     clock.now = NOW + timedelta(seconds=20)
     if restart:
@@ -314,6 +333,19 @@ async def test_equity_peak_seen_by_a_rejected_check_still_bounds_drawdown(
     async with sessions() as s:
         assert await repo.get_control(s, PAUSED_KEY) is True
     assert await orders(sessions) == []
+
+
+async def test_snapshot_records_the_peak_even_when_positions_fail(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    broker = _sim(EquityBroker)
+    assert isinstance(broker, EquityBroker)
+    broker.equity, broker.positions_down = D("1200"), True
+    engine = make_engine_(broker, sessions, gate)
+    with pytest.raises(ConnectionError, match="positions endpoint down"):
+        await engine.snapshot_equity()
+    ((row),) = await snapshots(sessions)
+    assert (row.equity, row.hwm, row.exposure) == (D("1200"), D("1200"), None)
 
 
 async def test_hwm_is_the_maximum_of_all_snapshots_not_the_latest(
