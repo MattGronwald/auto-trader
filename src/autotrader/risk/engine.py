@@ -220,9 +220,13 @@ class RiskEngine:
                     await repo.update_order(session, row_id, status=new_status, now=self._clock())
         return still_open
 
-    async def _held_positions(self) -> tuple[HeldPosition, ...]:
+    async def _held_positions(self, symbol: str | None = None) -> tuple[HeldPosition, ...]:
+        """Held positions with prices and rules. `symbol` narrows the (per-symbol REST)
+        lookups to one asset, so an exit depends on nothing unrelated."""
         held = []
         for p in await self._broker.get_positions():
+            if symbol is not None and p.symbol != symbol:
+                continue
             price = _dec(self._market.last_price(p.symbol)) or p.avg_entry_price
             rules = await self._broker.asset_rules(p.symbol)
             held.append(
@@ -291,7 +295,7 @@ class RiskEngine:
         async with self._lock:
             now = self._clock()
             try:
-                held = await self._held_positions()
+                held = await self._held_positions(request.symbol)
             except Exception as e:  # fail closed: unknown positions must not size an exit
                 log.exception("risk.exit_state_unavailable", symbol=request.symbol)
                 decision = RiskDecision(

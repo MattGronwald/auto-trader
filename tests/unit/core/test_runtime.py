@@ -79,6 +79,19 @@ class FakeBroker:
         return FeeSchedule(maker_bps=Decimal(15), taker_bps=Decimal(25))
 
 
+class HangingSnapshotBroker(FakeBroker):
+    """Answers the startup check, then every later `get_account` hangs (a stuck REST call)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def get_account(self) -> Account:
+        self.calls += 1
+        if self.calls > 1:
+            await asyncio.Event().wait()
+        return await super().get_account()
+
+
 async def fake_connect(_: Settings) -> Any:
     return FakeBroker()
 
@@ -190,3 +203,38 @@ async def test_broker_connect_failure_aborts_startup(cfg: AppConfig) -> None:
             connect_broker=failing,
             stop=asyncio.Event(),
         )
+
+
+async def test_hung_equity_snapshot_does_not_stall_the_loop(cfg: AppConfig) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    stop = asyncio.Event()
+    broker = HangingSnapshotBroker()
+
+    async def connect(_: Settings) -> Any:
+        return broker
+
+    task = asyncio.create_task(
+        run_core(
+            cfg,
+            Settings(_env_file=None),
+            load_profile(cfg.strategy),
+            "yaml",
+            source=StreamingSource(),
+            connect_broker=connect,
+            stop=stop,
+            tick_s=0.01,
+            snapshot_s=0.05,
+            snapshot_timeout_s=0.05,
+        )
+    )
+    try:
+        await _wait_for(lambda: any(ln["event"] == "core.started" for ln in _log_lines(buf)))
+        cfg.control.kill_file.parent.mkdir(parents=True, exist_ok=True)
+        cfg.control.kill_file.touch()
+        await _wait_for(lambda: any(ln["event"] == "core.kill_detected" for ln in _log_lines(buf)))
+        failed = [ln for ln in _log_lines(buf) if ln["event"] == "risk.snapshot_failed"]
+        assert failed and failed[0]["timeout"] is True
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=5)

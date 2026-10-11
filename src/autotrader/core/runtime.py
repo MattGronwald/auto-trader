@@ -42,6 +42,7 @@ async def run_core(
     stop: asyncio.Event,
     tick_s: float = 1.0,
     snapshot_s: float = 60.0,
+    snapshot_timeout_s: float | None = None,
 ) -> None:
     """Run until `stop` is set. Raises if the stream dies or startup checks fail."""
     engine = make_engine(cfg.database.url)
@@ -98,6 +99,7 @@ async def run_core(
         )
 
         killed: bool | None = None
+        snapshot_timeout = snapshot_s / 2 if snapshot_timeout_s is None else snapshot_timeout_s
         loop = asyncio.get_running_loop()
         last_snapshot = -math.inf  # the first tick snapshots
         while not stop.is_set():
@@ -107,7 +109,9 @@ async def run_core(
             await feed.tick()
             if loop.time() - last_snapshot >= snapshot_s:
                 try:
-                    await risk.snapshot_equity()
+                    await asyncio.wait_for(risk.snapshot_equity(), timeout=snapshot_timeout)
+                except TimeoutError:  # a hung REST call must not stall kill detection
+                    log.error("risk.snapshot_failed", timeout=True)
                 except Exception:
                     log.exception("risk.snapshot_failed")
                 last_snapshot = loop.time()

@@ -489,6 +489,36 @@ async def test_exit_state_failure_rejects(
     assert await orders(sessions) == []
 
 
+async def test_exit_does_not_depend_on_unrelated_positions(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    eth = "ETH/USD"
+
+    class FlakyEthRules(SimBroker):
+        async def asset_rules(self, symbol: str) -> AssetRules:
+            if symbol == eth:
+                raise ConnectionError("rules endpoint down")
+            return await super().asset_rules(symbol)
+
+    broker = FlakyEthRules(
+        cash=D("1000"),
+        fees=FEES,
+        slippage_bps=D(0),
+        asset_rules={BTC: RULES, eth: RULES},
+        timeframe="5m",
+    )
+    for i in (29, 30):  # bar 29 gives each symbol a price, bar 30 fills the market buys
+        for symbol in (BTC, eth):
+            broker.process_bar(five(i).model_copy(update={"symbol": symbol}))
+            if i == 29:
+                order = BrokerOrder(symbol=symbol, side="buy", qty=D("1"), type="market")
+                await broker.submit_order(order)
+    result = await make_engine_(broker, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert result.decision.approved and result.status == "new"
+    (row,) = await orders(sessions)
+    assert (row.symbol, row.side) == (BTC, "sell")
+
+
 async def test_snapshot_tracks_hwm_and_daily_pnl(
     sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
 ) -> None:
