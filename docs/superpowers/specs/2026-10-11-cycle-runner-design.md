@@ -3,7 +3,9 @@
 Date: 2026-10-11. Status: approved in conversation, pending written-spec review.
 Revised 2026-10-11 after the first written-spec review: orders after an `ERROR` cycle,
 the bus contract, bounded shutdown, SimBroker test scope, signal freshness, stub rounding,
-and `canceled` ≠ nothing filled.
+and `canceled` ≠ nothing filled. Revised again after the second review: commit-and-enqueue
+survives caller cancellation, with read-back on an uncertain commit; `publish_tx` callbacks
+return their event; shutdown budgets and abandoned tasks; reconciliation-only edges.
 Sources: SPEC §0, §4.3, §4.4, §5, §7, §11; PLAN G14, D13, D14.
 Decisions taken while designing are recorded as PLAN **D15**.
 
@@ -56,8 +58,8 @@ Rejected alternatives:
 |---|---|
 | `core/cycle.py` (new) | `CycleState`, the allowed-transition table, `CycleTransitioned` event, `CycleRunner` (admission, per-cycle task, recovery, shutdown). |
 | `agents/stub.py` (new) | `decide(candidate, snapshot, limits) -> StubBuy \| StubSkip`. Pure function with module constants. Phase 1 only; deleted in Phase 2. |
-| `core/bus.py` | `publish(event, *, with_tx=None)` (§6). |
-| `journal/repo.py` | `append_event(..., commit=True)` gains a no-commit mode for `with_tx`; `insert_cycle`, `transition_cycle`, `count_open_cycles`, `open_cycles` (for recovery), `has_order_for_cycle`, `open_entry_symbols`. |
+| `core/bus.py` | `publish_tx(build, verify)`, `CommitUncertain`, bounded `close(budget_s)` (§6, §8). |
+| `journal/repo.py` | `append_event(..., commit=True)` gains a no-commit mode for `publish_tx`; `insert_cycle`, `transition_cycle`, `count_open_cycles`, `open_cycles` (for recovery), `has_order_for_cycle`, `open_entry_symbols`. |
 
 No schema change and no migration. `cycles` already has `state`, `outcome`,
 `reject_reason` and `finished_at`. The candidate's `timeframe` and `bar_ts` go into
@@ -74,7 +76,15 @@ DECIDING  → REJECTED           (stub skip)
 RISK_CHECK → EXPIRED           (signal stale on entry, §5)
 RISK_CHECK → REJECTED          (risk rejection)
 any non-terminal state → ERROR
+
+Reconciliation-only edges (taken by WP 1.5, never by the runner):
+SUBMITTED  → FILLED            (broker filled qty > 0, full or partial)
+SUBMITTED  → EXPIRED           (broker final with filled qty = 0)
+RISK_CHECK → FILLED | EXPIRED  (cycle left in RISK_CHECK with an order row, same rule)
 ```
+
+The transition table is defined in WP 1.4, including these edges, so WP 1.5 uses the same
+`transition_cycle` and audit trail. The runner itself never takes them.
 
 Terminal states are `FILLED`, `REJECTED`, `EXPIRED` and `ERROR` (`repo.TERMINAL_CYCLE_STATES`
 is unchanged). There is no SKIPPED state: a skip is `REJECTED` with a `decision:` reason.
@@ -98,7 +108,11 @@ mapped. `filled` means fully filled. `rejected` (the broker refused it) and
 stay `SUBMITTED`: an IOC that ends `canceled` may have filled partly first, and
 `OrderResult` carries no filled quantity. WP 1.5 reconciliation completes these cycles
 from the broker's order status. It moves a cycle to `EXPIRED` only when the broker
-reports filled quantity 0, and treats any filled quantity > 0 as a position to manage.
+reports a final status with filled quantity 0. **Any filled quantity > 0, full or partial,
+→ `FILLED`**, with `details` carrying `filled_qty`, `ordered_qty` and `partial`
+(`filled_qty < ordered_qty`). `FILLED` therefore means "a position was acquired"; the
+`positions` row carries the real quantity, and the Position Manager manages it. There is no
+separate PARTIAL state: SPEC §4.3 lists none and nothing downstream branches on it.
 
 Against the real `SimBroker`, every accepted order acks `new` (fills and IOC
 cancellation happen on a later bar), so in WP 1.4 a SimBroker cycle ends in `SUBMITTED`.
@@ -127,16 +141,20 @@ agent calls, which is where queueing delay matters.
 3. Ask `ControlGate.status()`. Entries not allowed, or the gate raises → drop (the gate
    fails closed).
 4. Under the runner's admission lock:
-   - re-check `closing` (it is set under this lock, §8);
-   - in the bus transaction (§6):
-     - count the non-terminal cycles. If ≥ `scanner.max_concurrent_cycles` → drop
-       (`max_concurrent_cycles`);
-     - if a non-terminal cycle on the symbol exists → drop (`open cycle on symbol`);
-     - if an entry order in `pending`/`new`/`unknown` on the symbol exists → drop
+   - re-check `closing` → drop (`shutting down`);
+   - `bus.publish_tx(build, verify)` (§6), where `build(session)`:
+     - counts the non-terminal cycles. If ≥ `scanner.max_concurrent_cycles` → returns
+       `None` (drop, `max_concurrent_cycles`);
+     - if a non-terminal cycle on the symbol exists → `None` (`open cycle on symbol`);
+     - if an entry order in `pending`/`new`/`unknown` on the symbol exists → `None`
        (`open entry order on symbol`). The Risk Engine would reject it at check 5 anyway;
        dropping here avoids spending agent money first (Phase 2);
-     - otherwise insert the cycle (state `NEW`) and publish `CycleTransitioned(None → NEW)`;
-   - register the cycle task in the runner's task set **before releasing the lock**.
+     - otherwise inserts the cycle (state `NEW`), flushes to obtain its id, and returns
+       `CycleTransitioned(cycle_id=<new id>, None → NEW)`. The drop reason is recorded in
+       a local variable that `build` closes over;
+   - after `publish_tx` returns, check `closing` again. If it is set, don't start the task:
+     the cycle stays `NEW` and the next `recover()` marks it `ERROR` (`interrupted`).
+     Otherwise create the cycle task and add it to the task set, still under the lock.
 5. Return.
 
 A drop logs `cycle.dropped` with the symbol, rule and reason, and writes no row; the
@@ -150,33 +168,54 @@ mode; this adds "and one core process".
 
 ## 6. Persistence of transitions (bus contract)
 
-`EventBus.publish(event, *, with_tx=None)`:
-- Without `with_tx`, behaviour is unchanged (persist, then deliver).
-- With `with_tx: Callable[[AsyncSession], Awaitable[None]]`, the bus opens its session
-  **under its own lock** and does three things:
-  1. awaits `with_tx(session)`, which does its writes without committing;
-  2. appends the event row (`repo.append_event(..., commit=False)`), then commits once;
-  3. enqueues the event for subscribers, still under the lock.
-- If `with_tx` raises, or the commit fails, the transaction rolls back and nothing is
-  delivered; the exception propagates to the caller.
-- Cancellation inside `with_tx` or the commit also rolls back, because the session context
-  exits without a commit.
+`EventBus.publish(event)` is unchanged: persist in its own transaction, then deliver.
 
-So every published event (with or without `with_tx`) is persisted and enqueued inside the
-one bus lock. The global order of event ids equals the delivery order, and no delivery is
-pending outside the lock that `close()` could lose. `close()` takes the same lock, so it
-waits for an in-flight `with_tx` publish to finish (commit and enqueue, or rollback).
+`EventBus.publish_tx(build, verify) -> DomainEvent | None` is the transactional path:
+- `build: Callable[[AsyncSession], Awaitable[DomainEvent | None]]` does its writes in
+  the given session without committing (flushing is fine, e.g. to obtain an id). It
+  returns the event to persist, or `None`, meaning "nothing to do": the transaction is
+  rolled back and nothing is written or delivered.
+- `verify: Callable[[AsyncSession, DomainEvent], Awaitable[bool]]` answers, in a fresh
+  session, whether the event's transaction is visible. For cycle events this means "the
+  cycle row exists in `to_state`" (the event row and the cycle row are committed
+  together, so one implies the other).
 
-**Lock order:** runner admission lock, then the bus lock; never the reverse.
-`with_tx` callbacks only touch the given session. They never publish or await other
-locks.
+**Commit-and-enqueue is owned by the bus, not by the caller.** `publish_tx` starts an
+internal task that does the whole unit of work and awaits it through `asyncio.shield`.
+Cancelling the caller therefore never interrupts it. The caller's own `CancelledError`
+still propagates, and the unit finishes on its own. The internal task:
+1. takes the bus lock (the same lock `publish` uses);
+2. opens a session, awaits `build(session)`, appends the returned event
+   (`repo.append_event(..., commit=False)`), and commits;
+3. enqueues the event for subscribers, still under the lock.
 
-Transitions use `with_tx` for the guarded update in
+If `build` raises, the transaction is rolled back and the exception propagates; nothing
+was written.
+
+**Uncertain commit.** A database can commit and then fail to acknowledge it (e.g. a
+connection drop during `COMMIT` on Postgres). An exception raised by the commit itself is
+therefore not proof that nothing persisted. On a commit exception the internal task,
+still under the lock, calls `verify` once in a fresh session:
+- `True` → it was committed: enqueue the event and return it as if nothing went wrong
+  (logged `bus.commit_recovered`);
+- `False` → it was not committed: raise the original exception;
+- `verify` raises → raise `CommitUncertain` (logged). The caller must assume either
+  outcome (§9).
+
+So every event is persisted and enqueued inside the one bus lock. The global order of
+event ids equals the delivery order, and a persisted event is delivered exactly once,
+even if its caller was cancelled after the commit. The internal tasks are tracked by the
+bus; `close()` waits for them within its budget (§8).
+
+**Lock order:** runner admission lock, then the bus lock; never the reverse. `build` and
+`verify` only touch the session they are given. They never publish or await other locks.
+
+Transitions use `publish_tx` with `build` doing the guarded update in
 `repo.transition_cycle(session, cycle_id, from_, to, details, now)`:
 `UPDATE … WHERE id = :id AND state = :from_`. Zero rows updated → `RuntimeError` (a lost
-race or a bug), so the event is not written. The update also sets `outcome`, `finished_at`
-and `reject_reason` on terminal states. Admission's count + insert also runs inside
-`with_tx`; a drop is signalled by a sentinel exception that the runner catches and logs.
+race or a bug), so no event is written. The update also sets `outcome`, `finished_at`
+and `reject_reason` on terminal states. `build` returns the `CycleTransitioned` event.
+Admission's `build` is described in §5.
 
 `CycleTransitioned(DomainEvent)` fields: `cycle_id` (base field), `from_state`
 (`str | None`), `to_state`, `details` (JSON-safe dict: Decimals as strings). The field is
@@ -237,25 +276,56 @@ order:
 - `RISK_CHECK` with an order row, and every `SUBMITTED` cycle → left open and logged
   (`cycle.awaiting_reconciliation`). WP 1.5 completes them from the order's broker status.
 
-**Shutdown** (`CycleRunner.close(grace_s)`), in order:
-1. Take the admission lock and set `closing`. An admission already inside the lock
-   finishes, including registering its task, before the flag is set. Every later
-   candidate is dropped (`shutting down`).
+**Shutdown is best-effort bounded in process; the hard deadline belongs to the process.**
+A coroutine blocked in a driver call (aiosqlite runs statements in a thread) cannot be
+interrupted, and `Task.cancel()` only *requests* cancellation. So no in-process step can
+promise to stop everything by a deadline. What each step promises:
+
+`CycleRunner.close(budget_s) -> CloseReport` (default budget 20 s, injectable). The budget
+bounds the **whole call**, measured from entry:
+1. Set `closing` **without** taking the admission lock, so `close()` never waits behind a
+   stalled admission. Admission checks the flag after taking its lock and again after
+   `publish_tx` returns (§5). A cycle committed after the flag is set gets no task; it
+   stays `NEW`, and the next `recover()` marks it `ERROR`.
 2. Cancel every task that is not inside `check()`. Their cycles stay in their last
    committed state; the next `recover()` marks them `ERROR`.
-3. **Graceful drain:** wait up to `grace_s` (default 15 s, injectable) for tasks inside
-   `check()`. The `check()` call is wrapped in `asyncio.shield`, so step 2's cancel can't
-   reach it. A task that finishes in time records its transition normally.
-4. **Forced termination:** cancel the shielded `check()` calls that are still running,
-   log `cycle.forced_cancel` per cycle, and return. The engine's io budget does not bound
-   its lock wait or its journal writes, so without this step shutdown would have no upper
-   bound. Forcing is safe because `check()` writes the `pending` order row before
-   submitting. An order that may have reached the broker is therefore durable, `recover()`
-   leaves its cycle open, and WP 1.5 reconciles it.
+3. **Graceful drain:** wait until `deadline − cancel_wait_s` (`cancel_wait_s` default 3 s)
+   for tasks inside `check()`. The `check()` call runs under `asyncio.shield`, so step 2's
+   cancel can't reach it. A task that finishes in time records its transition normally.
+4. **Forced termination:** cancel the shielded `check()` calls that are still running and
+   log `cycle.forced_cancel` per cycle.
+5. Wait for all cancelled tasks until the deadline.
+6. Any task still running is logged `cycle.task_abandoned` and returned in
+   `CloseReport.abandoned`. The runner no longer owns or awaits it. It may still touch a
+   session or publish; the bus refuses publishes once closed (`BusClosedError`, which the
+   task logs). Process exit ends it.
 
-**Shutdown order in `run core`** (wired in WP 1.5): stop the feed stream (no new bars),
-drain the bus subscribers (scanner, runner admission), `runner.close(grace_s)`, then
-`bus.close()`.
+Forcing and abandoning are safe because `check()` writes the `pending` order row before it
+submits. An order that may have reached the broker is therefore durable, `recover()`
+leaves its cycle open, and WP 1.5 reconciles it.
+
+`EventBus.close(budget_s)` gets the same shape (it already exists; its drain is
+unbounded today):
+1. mark closed, without waiting for the bus lock longer than the budget allows; new
+   publishes raise `BusClosedError`;
+2. wait for in-flight `publish_tx` units and the subscriber backlog until the deadline;
+3. cancel the workers and wait for them until the deadline;
+4. log survivors as `bus.task_abandoned`.
+An in-flight `publish_tx` unit that is abandoned may still commit. Its cycle and event
+are then consistent in the database, and `recover()` handles the cycle on the next start.
+
+**Shutdown order in `run core`** (wired in WP 1.5): stop the feed stream (no new bars);
+`runner.close(budget)`, which drops further candidates immediately; then
+`bus.close(budget)`. The runner is closed before the bus is drained, so draining the
+scanner's backlog can no longer admit new cycles, and nothing waits on the bus before the
+runner's budget starts.
+
+**Process-level hard deadline** (WP 1.5, with the wiring): after the first SIGINT/SIGTERM
+starts the shutdown above, a second signal, or a watchdog at `shutdown.timeout_s`
+(> runner + bus budgets), logs `core.forced_exit` and calls `os._exit(1)`. Once the core
+runs under a supervisor (container stop timeout, systemd `TimeoutStopSec`), that is the
+outer bound. Until then the watchdog is. The spec promises bounded *in-process* steps and
+a hard process deadline, not a clean in-process stop of every task.
 
 ## 9. Error handling
 
@@ -269,6 +339,14 @@ drain the bus subscribers (scanner, runner admission), `runner.close(grace_s)`, 
   outcome is already in `risk_decisions`/`orders`, so the order row decides what
   happens. If `check()` itself raised, the transition to `ERROR` is the normal
   transition, not a fallback.
+- **`CommitUncertain`** (§6) counts as a failed transition write. However, the runner
+  doesn't know which state is committed. So it never attempts a fallback `ERROR` write
+  (the guarded update would hit an unknown `from_`). It logs `cycle.stuck`
+  (`commit uncertain`) and ends the task. The row is in either the old state or the new
+  one, both consistent with its event. `recover()` resolves it on the next start.
+  At admission, `CommitUncertain` → no task is started; a cycle that did commit stays
+  `NEW`, holds a cycle slot until restart, and `recover()` marks it `ERROR`. That is fail
+  safe: it can only block admissions, never allow extra ones.
 - A task done-callback removes the task from the runner's set and logs anything that
   escaped. This is a backstop; step code already catches.
 
@@ -285,8 +363,10 @@ are injected; no wall-clock asserts.
   - stale candidate → dropped;
   - kill/pause or a raising gate → dropped;
   - DB error at admission → dropped, and the handler doesn't raise;
-  - the interleaving is driven explicitly (the first admission is held inside `with_tx`
-    by an event).
+  - the interleaving is driven explicitly (the first admission is held inside `build`
+    by an event);
+  - the admission event's `cycle_id` equals the inserted row's id; a drop (`build`
+    returns `None`) writes neither a row nor an event.
 - **FSM:**
   - **Real `RiskEngine` + `SimBroker`:** approved entry → `SUBMITTED`, with every
     transition in `events` (from/to/details, in order), `orders.cycle_id` set and status
@@ -307,30 +387,47 @@ are injected; no wall-clock asserts.
 - **Transition write failures:**
   - a failure before `check()` → `ERROR` via the fallback;
   - a failure after `check()` returned → stays `RISK_CHECK`, no `ERROR` write attempted,
-    `cycle.stuck` logged.
+    `cycle.stuck` logged;
+  - `CommitUncertain` on a transition → no fallback write, `cycle.stuck`, the task ends;
+    at admission → no task started.
 - **Shutdown:**
-  - `close()` while an admission is held inside `with_tx` → that cycle is registered and
-    then cancelled or drained; a candidate after the flag → dropped (`shutting down`);
-  - `close()` during DECIDING → cancelled; `recover()` → `ERROR`;
-  - `close()` while `check()` is blocked and releases within the grace period → result
+  - `close()` while an admission is held inside `build` → `close()` does not wait for the
+    admission lock; the admission commits, sees `closing`, starts no task; the cycle
+    stays `NEW`, and `recover()` → `ERROR`. A candidate after the flag → dropped
+    (`shutting down`);
+  - `close()` during DECIDING → cancelled and awaited; `recover()` → `ERROR`;
+  - `close()` while `check()` is blocked and releases before the drain deadline → result
     recorded;
-  - `check()` blocked beyond the grace period → forced cancel, `cycle.forced_cancel`
+  - `check()` blocked beyond the drain deadline → forced cancel, `cycle.forced_cancel`
     logged, the cycle stays `RISK_CHECK`, the order row stays `pending`; `recover()`
-    leaves the cycle open.
+    leaves the cycle open;
+  - a task that ignores cancellation (blocks on an event that swallows `CancelledError`
+    until released) → `close()` returns by its deadline (injected clock) with the task in
+    `CloseReport.abandoned` and `cycle.task_abandoned` logged.
 - **Recovery:** seeded rows for every open state, both `RISK_CHECK` variants → the
   expected outcome.
 - **Transitions:**
   - guarded update with the wrong `from_` → raises, no event row;
   - an illegal transition → `ERROR`;
   - terminal fields set.
-- **Bus `with_tx`:**
-  - `with_tx` raises → no event row, no cycle write, no delivery;
+- **Bus `publish_tx`:**
+  - `build` raises → no event row, no cycle write, no delivery, exception propagates;
+  - `build` returns `None` → rollback, nothing written or delivered;
   - commit → delivered once;
-  - **ordering:** a `with_tx` publish held inside its callback while a plain `publish` is
-    attempted → the plain publish waits, and event ids and delivery order agree;
-  - cancellation inside `with_tx` → rollback, no delivery;
-  - `close()` while a `with_tx` publish is in flight → `close()` waits for it, which then
-    commits and delivers; a later publish → `BusClosedError`;
+  - **ordering:** a `publish_tx` held inside `build` while a plain `publish` is attempted
+    → the plain publish waits, and event ids and delivery order agree;
+  - caller cancelled while `build` runs → the unit still completes (commit + enqueue)
+    under the bus; the caller sees `CancelledError`;
+  - **caller cancelled after the DB committed but before it got confirmation** (commit
+    wrapped to succeed, then block on an event while the caller is cancelled) → the row
+    and the event are persisted and the event is delivered exactly once;
+  - commit raises but the data is committed (fake commit that commits, then raises) →
+    `verify` true → delivered once, `bus.commit_recovered` logged;
+  - commit raises and `verify` false → original exception, nothing delivered;
+  - commit raises and `verify` raises → `CommitUncertain`;
+  - `close(budget)` while a `publish_tx` is in flight → it finishes and delivers within
+    the budget; a later publish → `BusClosedError`; a unit blocked past the budget →
+    `close()` returns by its deadline, `bus.task_abandoned` logged;
   - `CycleTransitioned` round-trips through `payload()` (guards against field shadowing);
   - existing bus tests unchanged.
 - **Stub:**
@@ -352,17 +449,23 @@ the transition table.
   - 1.4 row → Done; **D15**;
   - 1.5 row gains:
     - subscribe the Cycle Runner in `run core` after `recover()`, with the §8 shutdown
-      order;
+      order (runner closed before the bus is drained, budgets from config);
+    - process-level hard deadline: second signal or `shutdown.timeout_s` watchdog →
+      `os._exit(1)`;
     - complete `SUBMITTED` and `RISK_CHECK`-with-order cycles from the order's broker
-      status (`EXPIRED` only on filled qty 0; any fill → managed position);
+      status via the reconciliation-only edges (`EXPIRED` only on a final status with
+      filled qty 0; any fill, full or partial → `FILLED` + managed position);
     - reconcile open entry orders of any cycle state;
     - SimBroker next-bar fill/cancel integration tests;
   - 1.6 row gains "one core process per journal"; fee-vs-ATR note next to D10.
 - Scanner module docstring: G14 is now enforced by the Cycle Runner.
-- `core/bus.py` docstring: `with_tx` and the ordering guarantee.
+- `core/bus.py` docstring: `publish_tx`, bus-owned commit-and-enqueue, uncertain-commit
+  read-back, ordering guarantee, bounded `close()`.
 - SPEC §4.3: dated note:
-  - no timeout on `RISK_CHECK`/`SUBMITTED` except bounded forced shutdown;
+  - no timeout on `RISK_CHECK`/`SUBMITTED` except forced shutdown;
+  - any fill, full or partial → `FILLED`;
   - skip = `REJECTED`;
   - `canceled` stays `SUBMITTED` until reconciliation;
   - orders are reconciled by order row.
-- CLAUDE.md: the events rule mentions `publish(event, with_tx=...)` for atomic writes.
+- CLAUDE.md: the events rule mentions `publish_tx(build, verify)` for writes that must be
+  atomic with their event.
