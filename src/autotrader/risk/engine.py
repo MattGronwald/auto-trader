@@ -238,16 +238,22 @@ class RiskEngine:
 
     async def _held_positions(self, symbol: str | None = None) -> tuple[HeldPosition, ...]:
         """Held positions with prices and rules. `symbol` narrows the (per-symbol REST)
-        lookups to one asset, so an exit depends on nothing unrelated."""
+        lookups to one asset, so an exit depends on nothing unrelated. `market_value` is
+        None without a fresh feed price (never the cost basis): check 8 then rejects."""
         held = []
         for p in await self._broker.get_positions():
             if symbol is not None and p.symbol != symbol:
                 continue
-            price = _dec(self._market.last_price(p.symbol)) or p.avg_entry_price
+            price = _dec(self._market.last_price(p.symbol))
+            fresh = price is not None and not self._market.is_stale(p.symbol)
             rules = await self._broker.asset_rules(p.symbol)
             held.append(
                 HeldPosition(
-                    symbol=p.symbol, qty=p.qty, market_value=p.qty * price, min_qty=rules.min_qty
+                    symbol=p.symbol,
+                    qty=p.qty,
+                    market_value=p.qty * price if fresh and price is not None else None,
+                    avg_entry_price=p.avg_entry_price,
+                    min_qty=rules.min_qty,
                 )
             )
         return tuple(held)
@@ -367,7 +373,15 @@ class RiskEngine:
                 ts=now,
                 equity=equity,
                 cash=cash,
-                exposure=sum((p.market_value for p in held), Decimal(0)),
+                # Informational only, never used for a limit: an unpriced holding is
+                # estimated at cost basis here (check 8 rejects on it instead).
+                exposure=sum(
+                    (
+                        p.market_value if p.market_value is not None else p.qty * p.avg_entry_price
+                        for p in held
+                    ),
+                    Decimal(0),
+                ),
                 hwm=hwm,
                 daily_pnl=equity - (baseline if baseline is not None else equity),
             )

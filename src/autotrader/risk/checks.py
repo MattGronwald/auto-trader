@@ -115,9 +115,14 @@ def _size_and_finish(
     if qty < rules.min_qty or qty * entry < rules.min_notional:
         return _reject(f"size {qty} below broker minimum")
     notional = qty * entry
-    # 8. exposure (reject, never shrink)
+    # 8. exposure (reject, never shrink). An unpriced (no or stale feed price) non-dust
+    # holding makes the sum unknowable; cost basis would undercount, so reject. Dust is
+    # ignored when unpriced and counted when priced.
+    for pos in portfolio.positions:
+        if pos.market_value is None and not pos.is_dust:
+            return _reject(f"held position {pos.symbol} has no current price")
     exposure = (
-        sum((p.market_value for p in portfolio.positions), Decimal(0))
+        sum((p.market_value for p in portfolio.positions if p.market_value is not None), Decimal(0))
         + sum((o.notional for o in portfolio.open_entries), Decimal(0))
         + notional
     )

@@ -69,6 +69,8 @@ class FakeView:
     last: float | None = 100.0
     q: Quote | None = field(default_factory=lambda: Quote(symbol=BTC, ts=NOW, bid=99.98, ask=100.0))
     stale: bool = False
+    prices: dict[str, float] = field(default_factory=dict)  # last prices besides BTC
+    stale_symbols: frozenset[str] = frozenset()
 
     def history(self, symbol: str, timeframe: str) -> list[Bar]:
         return list(self.bars) if symbol == BTC and timeframe == "5m" else []
@@ -77,10 +79,10 @@ class FakeView:
         return self.q if symbol == BTC else None
 
     def last_price(self, symbol: str) -> float | None:
-        return self.last if symbol == BTC else None
+        return self.last if symbol == BTC else self.prices.get(symbol)
 
     def is_stale(self, symbol: str) -> bool:
-        return self.stale
+        return self.stale or symbol in self.stale_symbols
 
     def spread_bps(self, symbol: str) -> float | None:
         return None if self.q is None else (self.q.ask - self.q.bid) / self.q.ask * 10_000
@@ -743,3 +745,53 @@ async def test_hung_exit_state_rejects_and_hung_close_is_unknown(
     assert result.decision.approved and result.status == "unknown"
     (row,) = await orders(sessions)
     assert (row.side, row.status, row.broker_order_id) == ("sell", "unknown", None)
+
+
+# --- held positions without a trustworthy price ----------------------------------------
+
+ETH = "ETH/USD"
+
+
+async def _holding_eth() -> SimBroker:
+    broker = SimBroker(
+        cash=D("1000"),
+        fees=FEES,
+        slippage_bps=D(0),
+        asset_rules={BTC: RULES, ETH: RULES},
+        timeframe="5m",
+    )
+    for i in (29, 30):  # bar 29 prices both symbols, bar 30 fills the ETH market buy
+        for symbol in (BTC, ETH):
+            broker.process_bar(five(i).model_copy(update={"symbol": symbol}))
+            if i == 29 and symbol == ETH:
+                await broker.submit_order(
+                    BrokerOrder(symbol=ETH, side="buy", qty=D("1"), type="market")
+                )
+    return broker
+
+
+@pytest.mark.parametrize(
+    "view",
+    [
+        FakeView(),  # the feed has a price for BTC only (Codex's reproduction)
+        FakeView(prices={ETH: 100.0}, stale_symbols=frozenset({ETH})),  # ETH priced but stale
+    ],
+    ids=["unpriced", "stale"],
+)
+async def test_held_position_without_current_price_fails_entries_closed_not_exits(
+    view: FakeView, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    broker = await _holding_eth()
+    clock = Clock(NOW)
+    engine = make_engine_(broker, sessions, gate, view=view, clock=clock)
+    result = await engine.check(intent(cycle_id))
+    assert result.decision.reasons == (f"held position {ETH} has no current price",)
+    assert await orders(sessions) == []
+
+    clock.now = NOW + timedelta(minutes=1)
+    await engine.snapshot_equity()  # informational exposure falls back to cost basis
+    (position,) = await broker.get_positions()
+    assert (await snapshots(sessions))[-1].exposure == position.qty * position.avg_entry_price
+
+    exited = await engine.exit(ExitRequest(symbol=ETH, reason="stale"))
+    assert exited.decision.approved and exited.status == "new"

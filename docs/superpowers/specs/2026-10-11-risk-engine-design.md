@@ -36,7 +36,9 @@ objects (indirection with no user).
   `flatten`, `stale`), optional `cycle_id`. Full exits only.
 - `PortfolioState`: `equity`, `cash`, `day_start_equity`, `hwm`, broker positions with
   market value (`qty × last trade` from the feed view; the broker's `Position` type
-  carries no market value), open entry orders (symbol, notional), entry-order timestamps for the rate
+  carries no market value; `None` when the feed has no last price for the symbol or the
+  symbol is stale — never the cost basis, which would undercount exposure) and
+  `avg_entry_price` (informational exposure estimate in snapshots only), open entry orders (symbol, notional), entry-order timestamps for the rate
   check, `strategy_trades_n`, `strategy_win_rate`.
 - `MarketSnapshot`: `last_trade`, `bid`, `ask`, `spread_bps`, `atr` (`Decimal | None`),
   `stale`, `asset_rules`, `fees`.
@@ -87,6 +89,9 @@ An approved decision lists which cap bound the size (`adjusted["bound_by"]`).
    per-order notional maximum ($200k) is omitted as irrelevant at PoC size.
 8. **Exposure.** `Σ position market values + Σ open entry notionals + qty × entry ≤
    max_gross_exposure_pct × equity`. Over the limit rejects; the order is never shrunk.
+   A non-dust held position without a current price (no feed price, or stale) makes the
+   sum unknowable and rejects first: `held position <SYM> has no current price` (fail
+   closed). Unpriced dust is ignored; priced dust still counts. Exits never need a price.
 9. **Order rate.** Entry orders (including failed and unknown submits) in the rolling last
    60 min `< max_orders_per_hour`; since the trading-day start `< max_orders_per_day`.
    Exits never count.
@@ -156,7 +161,9 @@ so exits are identified by `broker_order_id`), `close_position`, record the outc
 failed exits; a stop that failed must be attempted again.
 
 ### `snapshot_equity()`
-Called by `run core` every 60 s. Writes `equity_snapshots`: equity, cash, exposure,
+Called by `run core` every 60 s. Writes `equity_snapshots`: equity (from the broker
+account), cash, exposure (informational only, never used for a limit: an unpriced holding
+is estimated at `qty × avg_entry_price`),
 `hwm = max(highest stored hwm, equity)`, `daily_pnl = equity − day_start_equity`. The
 previous HWM is the maximum over **all** snapshot rows (`repo.max_hwm`), never the latest
 row's value, so writers that interleave (the snapshot task and a `check()`) can never lower
