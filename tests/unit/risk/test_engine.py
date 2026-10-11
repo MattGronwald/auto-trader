@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from autotrader.broker.base import (
+    Account,
     AssetRules,
     Broker,
     BrokerOrder,
@@ -237,6 +238,95 @@ async def test_daily_loss_sets_paused_until_next_day_start_in_trading_tz(
     async with sessions() as s:
         assert await repo.get_control(s, PAUSED_UNTIL_KEY) == "2026-10-09T22:00:00+00:00"
     assert await orders(sessions) == []
+
+
+def _sim(cls: type[SimBroker] = SimBroker) -> SimBroker:
+    broker = cls(
+        cash=D("1000"), fees=FEES, slippage_bps=D(0), asset_rules={BTC: RULES}, timeframe="5m"
+    )
+    broker.process_bar(five(29))
+    return broker
+
+
+async def new_cycle(sessions: async_sessionmaker[AsyncSession]) -> int:
+    async with sessions() as s:
+        strategy = await repo.register_strategy(s, PROFILE, "yaml")
+        row = m.Cycle(
+            strategy_id=strategy.id,
+            symbol=BTC,
+            rule_id="r",
+            signal_features={},
+            state="RISK_CHECK",
+            created_at=NOW,
+        )
+        s.add(row)
+        await s.commit()
+        return row.id
+
+
+class EquityBroker(SimBroker):
+    """Reports `equity` instead of the simulated one when it is set (cash unchanged)."""
+
+    equity: D | None = None
+
+    async def get_account(self) -> Account:
+        account = await super().get_account()
+        if self.equity is None:
+            return account
+        return account.model_copy(update={"equity": self.equity})
+
+
+async def snapshots(sessions: async_sessionmaker[AsyncSession]) -> list[m.EquitySnapshot]:
+    async with sessions() as s:
+        return list(await s.scalars(select(m.EquitySnapshot).order_by(m.EquitySnapshot.ts)))
+
+
+@pytest.mark.parametrize("restart", [False, True])
+async def test_equity_peak_seen_by_a_rejected_check_still_bounds_drawdown(
+    restart: bool, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    broker = _sim(EquityBroker)
+    assert isinstance(broker, EquityBroker)
+    clock = Clock(NOW)
+    engine = make_engine_(broker, sessions, gate, clock=clock)
+    await engine.snapshot_equity()  # baseline and HWM 1000
+    broker.equity = D("1200")  # spike between two snapshots
+    clock.now = NOW + timedelta(seconds=10)
+    spiked = await engine.check(intent(cycle_id, stop=D("100.10")))  # invalid stop
+    assert "not below entry" in spiked.decision.reasons[0]
+    assert [s.hwm for s in await snapshots(sessions)] == [D("1000"), D("1200")]
+    broker.equity = D("1000")  # back down before the next periodic snapshot
+    clock.now = NOW + timedelta(seconds=20)
+    if restart:
+        engine = make_engine_(broker, sessions, gate, clock=clock)
+    result = await engine.check(intent(await new_cycle(sessions)))
+    assert not result.decision.approved and "drawdown" in result.decision.reasons[0]
+    async with sessions() as s:
+        assert await repo.get_control(s, PAUSED_KEY) is True
+    assert await orders(sessions) == []
+
+
+async def test_hwm_is_the_maximum_of_all_snapshots_not_the_latest(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    """An interleaved writer that read before the peak was stored wrote a lower HWM later:
+    neither the next snapshot nor a check may fall back to it."""
+    for minutes, hwm in ((-2, "1200"), (-1, "1000")):
+        async with sessions() as s:
+            await repo.insert_equity_snapshot(
+                s,
+                ts=NOW + timedelta(minutes=minutes),
+                equity=D("1000"),
+                cash=D("1000"),
+                exposure=D(0),
+                hwm=D(hwm),
+                daily_pnl=D(0),
+            )
+    engine = make_engine_(_sim(), sessions, gate)
+    await engine.snapshot_equity()  # equity 1000
+    assert (await snapshots(sessions))[-1].hwm == D("1200")
+    result = await engine.check(intent(cycle_id))
+    assert "drawdown" in result.decision.reasons[0]
 
 
 async def test_drawdown_sets_manual_pause(

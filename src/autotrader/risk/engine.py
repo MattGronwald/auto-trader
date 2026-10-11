@@ -158,12 +158,14 @@ class RiskEngine:
                 session, day_start(now, self._tz), inclusive=True
             )
             baseline = await repo.day_start_equity(session, day_start(now, self._tz))
-            latest = await repo.latest_snapshot(session)
+            stored_hwm = await repo.max_hwm(session)
             trades_n, wins = await repo.strategy_trade_stats(session, self._strategy_id)
-        if latest is None:  # first check ever: this snapshot is the baseline
+        if stored_hwm is None or account.equity > stored_hwm:
+            # A new peak (or the first check ever, whose snapshot is the baseline) is stored
+            # now, even if this check rejects: otherwise a spike between two periodic
+            # snapshots that falls back before the next one would never bound drawdown.
             await self._write_snapshot(now, account.equity, account.cash, held)
-            baseline = account.equity
-        hwm = max(latest.hwm if latest else account.equity, account.equity)
+        hwm = account.equity if stored_hwm is None else max(stored_hwm, account.equity)
         portfolio = PortfolioState(
             equity=account.equity,
             cash=account.cash,
@@ -341,9 +343,9 @@ class RiskEngine:
         self, now: datetime, equity: Decimal, cash: Decimal, held: tuple[HeldPosition, ...]
     ) -> None:
         async with self._sessions() as session:
-            latest = await repo.latest_snapshot(session)
+            stored_hwm = await repo.max_hwm(session)
             baseline = await repo.day_start_equity(session, day_start(now, self._tz))
-            hwm = max(latest.hwm if latest else equity, equity)
+            hwm = equity if stored_hwm is None else max(stored_hwm, equity)
             await repo.insert_equity_snapshot(
                 session,
                 ts=now,

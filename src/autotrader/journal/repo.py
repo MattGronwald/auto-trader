@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import Float, cast, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -330,6 +330,20 @@ async def insert_equity_snapshot(
 
 async def latest_snapshot(session: AsyncSession) -> EquitySnapshot | None:
     return await session.scalar(select(EquitySnapshot).order_by(EquitySnapshot.ts.desc()).limit(1))
+
+
+async def max_hwm(session: AsyncSession) -> Decimal | None:
+    """Highest HWM ever stored (None without snapshots). The maximum over all rows, not the
+    latest row's value, so a writer that interleaved with a peak can never lower it.
+
+    SQLite stores `Money` as text, where a plain `max()` compares strings ("999" > "1200").
+    So the float cast only narrows the candidates; the exact Decimals are compared here.
+    """
+    as_float = cast(EquitySnapshot.hwm, Float)
+    top = await session.scalar(select(func.max(as_float)))
+    if top is None:
+        return None
+    return max(await session.scalars(select(EquitySnapshot.hwm).distinct().where(as_float >= top)))
 
 
 async def day_start_equity(session: AsyncSession, day_start: datetime) -> Decimal | None:
