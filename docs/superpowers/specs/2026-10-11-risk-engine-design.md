@@ -181,11 +181,17 @@ so an acked exit is identified by its `broker_order_id`), `close_position`, reco
 failed exits; a stop that failed must be attempted again.
 
 Retries are safe: every `exit()` re-reads the live position from the broker, and spot
-brokers (Alpaca, `SimBroker`) refuse to sell more than the free quantity. So if an
+brokers refuse to sell more than the free quantity (`SimBroker` does; for Alpaca this is
+verified in the WP 1.6 paper smoke test, not assumed). So if an
 accepted close lost its ack (`unknown`), a retry either finds no position (the sell
 filled → rejected by `check_exit`) or is refused by the broker (the sell is still open →
-`rejected`); it never sells twice. An `unknown` exit carries no ids (no
-`client_order_id`, no `broker_order_id`); WP 1.5 reconciles it by symbol and submit time.
+`rejected`); it never sells twice. An exit row left `unknown`, or `pending` (a crash or a
+failed ack write after the broker accepted it), carries no ids (no `client_order_id`, no
+`broker_order_id`). WP 1.5 reconciles both from the broker's order history for that symbol
+since the row's `submitted_at` (minus a clock-skew allowance), counting only sell orders not
+linked to another row: exactly one → link it and adopt its status; none after a grace
+window → `not_submitted`; several → pause (manual resume) and alert, never guess (PLAN WP
+1.5).
 
 ### `snapshot_equity()`
 Called by `run core` every 60 s. Writes `equity_snapshots`: equity (from the broker
@@ -269,6 +275,6 @@ If no snapshot exists at all, the engine takes one before checking.
 ## 9. Out of scope
 
 Partial exits; broker stop-limit backup orders (G2, WP 1.5); live order submission on
-`AlpacaBroker` (WP 1.6); reconciliation of `unknown` orders (WP 1.5); extra bus events
+`AlpacaBroker` (WP 1.6); reconciliation of `pending` and `unknown` entry and exit orders (WP 1.5); extra bus events
 (the `risk_decisions` and `orders` tables are the audit trail, the Cycle Runner persists
 its transitions in WP 1.4); the LLM budget (WP 2.1).
