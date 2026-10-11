@@ -1,9 +1,9 @@
 """Broker interface and domain types (SPEC §4.6).
 
 Only the Risk Engine holds a `Broker` (SPEC §0.1). All money and quantities are
-`Decimal`. Orders are `market` or `limit`: Alpaca crypto most likely has no bracket/OCO
-orders (PLAN G2, verified in WP 0.7), so stops are enforced client-side by the Position
-Manager.
+`Decimal`. Orders are `market` or `limit`: Alpaca crypto has no bracket/OCO orders
+(PLAN G2, confirmed 2026-10-11, docs/alpaca-notes.md), so stops are enforced
+client-side by the Position Manager.
 """
 
 from collections.abc import AsyncIterator
@@ -72,7 +72,9 @@ class Fill(_Frozen):
     side: Side
     qty: Dec
     price: Dec
-    fee: Dec  # in quote currency (USD); G10: Alpaca's real mechanics verified in 0.7
+    # USD in SimBroker. Alpaca charges buy fees in the received asset and posts them end
+    # of day (G10, docs/alpaca-notes.md); the model change is an open decision (PLAN.md).
+    fee: Dec
     ts: AwareDatetime
 
 
