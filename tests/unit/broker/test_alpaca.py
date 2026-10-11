@@ -107,6 +107,7 @@ async def test_asset_rules_from_raw_strings() -> None:
         min_qty=Decimal("0.000012054"),
         qty_increment=Decimal("0.000000001"),
         min_notional=Decimal(0),  # Alpaca states no minimum notional (only a $200k max)
+        price_increment=Decimal("0.000000001"),
     )
 
 

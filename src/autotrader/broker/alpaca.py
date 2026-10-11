@@ -126,6 +126,7 @@ class AlpacaBroker:
                 min_qty=Decimal(raw["min_order_size"]),
                 qty_increment=Decimal(raw["min_trade_increment"]),
                 min_notional=Decimal(0),
+                price_increment=Decimal(raw["price_increment"]),
             )
 
     def fee_schedule(self) -> FeeSchedule:

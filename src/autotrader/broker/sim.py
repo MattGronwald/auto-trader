@@ -11,6 +11,8 @@ Fill model, driven by `process_bar()`:
 - Market: bar open +/- `slippage_bps`, taker fee.
 - Limit: fills when the bar trades through the limit, at the better of open and limit,
   maker fee, no slippage.
+- IOC limit: evaluated on the next processed bar only; fills like a limit but pays the
+  taker fee (it crosses the book), otherwise canceled.
 - Fees are charged in quote currency (USD).
 - Spot only: sells can never exceed the position (no shorting).
 
@@ -190,6 +192,8 @@ class SimBroker:
         for o in [o for o in self._orders.values() if o.status == "new"]:
             if o.order.symbol == bar.symbol and bar.ts > o.submitted_at:
                 self._try_fill(o, bar)
+                if o.status == "new" and o.order.time_in_force == "ioc":
+                    o.status = "canceled"  # IOC: only the first bar after submit counts
         self._last_price[bar.symbol] = _dec(bar.close)
         self._now = bar.ts if self._now is None else max(self._now, bar.ts)
         return True
@@ -208,7 +212,9 @@ class SimBroker:
                 price = max(open_, limit)
             else:
                 return
-            fee_bps = self.fees.maker_bps
+            # An IOC limit crosses the book at submit (marketable limit): taker, not maker.
+            ioc = order.time_in_force == "ioc"
+            fee_bps = self.fees.taker_bps if ioc else self.fees.maker_bps
         notional = price * order.qty
         fee = notional * fee_bps / _BPS
         if order.side == "buy":
@@ -270,7 +276,8 @@ class SimBroker:
 
     def _estimated_cost(self, order: BrokerOrder, last: Decimal) -> Decimal:
         if order.limit_price is not None:
-            return order.limit_price * order.qty * (1 + self.fees.maker_bps / _BPS)
+            fee_bps = self.fees.taker_bps if order.time_in_force == "ioc" else self.fees.maker_bps
+            return order.limit_price * order.qty * (1 + fee_bps / _BPS)
         price = last * (1 + self.slippage_bps / _BPS)
         return price * order.qty * (1 + self.fees.taker_bps / _BPS)
 
