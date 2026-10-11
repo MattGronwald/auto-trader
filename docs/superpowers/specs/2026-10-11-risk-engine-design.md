@@ -2,7 +2,9 @@
 
 Date: 2026-10-11. Status: approved in conversation, pending written-spec review.
 Sources: SPEC §0.1, §4.5, §4.6; PLAN G1, G3, G4, G6, G10, G14, D3, D4, D5, D13.
-Decisions taken while designing are recorded as PLAN **D14**.
+Decisions taken while designing are recorded as PLAN **D14**. Updated 2026-10-11 after the
+PR #13 review (persisted HWM peaks, time budget, unpriced holdings fail closed, background
+snapshot task, exit retry safety; see the D14 update).
 
 ## 1. Purpose and success criteria
 
@@ -155,9 +157,9 @@ forever. `asyncio.CancelledError` is never caught. Broker-side request timeouts 
      counts as an open entry order for checks 5, 8 and 9.
 
 ### `exit(request) -> ExitResult`
-No gate check. Gather positions and asset rules, `check_exit`, persist (kind `exit`),
+No gate check. Gather the symbol's position and asset rules (no price needed), `check_exit`, persist (kind `exit`),
 insert the `orders` row (no `client_order_id`: `Broker.close_position(symbol)` takes none,
-so exits are identified by `broker_order_id`), `close_position`, record the outcome as above. The caller retries
+so an acked exit is identified by its `broker_order_id`), `close_position`, record the outcome as above. The caller retries
 failed exits; a stop that failed must be attempted again.
 
 Retries are safe: every `exit()` re-reads the live position from the broker, and spot
@@ -222,7 +224,13 @@ If no snapshot exists at all, the engine takes one before checking.
   and submitted; both pause side effects, including the next-day boundary in a non-UTC
   `trading_day_tz`; gathering failure rejects; kill between gathering and submit; broker
   rejection vs `unknown` (and `unknown` counting as open afterwards); exit while killed;
-  dust ignored; `day_start_equity` / `hwm` from snapshots.
+  dust ignored; `day_start_equity` / `hwm` from snapshots. PR #13 review additions: a
+  peak seen by a rejected check still bounds drawdown (also after a restart) and the HWM
+  is the max over all snapshots; a hung entry gather cannot block an exit; hung submit /
+  close → `unknown`, hung or raising pre-submit gate → `not_submitted`; an unpriced or
+  stale held position rejects entries but not exits; a retried `unknown` exit never sells
+  twice. `run core`: a hung snapshot never delays kill detection at the default interval;
+  a dead snapshot task is logged and restarted.
 - **SimBroker:** `ioc` fills through the limit with taker fee, otherwise cancels.
 
 ## 9. Out of scope
