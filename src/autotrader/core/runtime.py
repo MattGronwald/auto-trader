@@ -13,7 +13,7 @@ Position Manager (WP 1.5).
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Protocol
 
 import structlog
 
@@ -42,7 +42,6 @@ async def run_core(
     stop: asyncio.Event,
     tick_s: float = 1.0,
     snapshot_s: float = 60.0,
-    snapshot_timeout_s: float | None = None,
 ) -> None:
     """Run until `stop` is set. Raises if the stream dies or startup checks fail."""
     engine = make_engine(cfg.database.url)
@@ -100,14 +99,9 @@ async def run_core(
         )
 
         killed: bool | None = None
-        snapshot_timeout = (
-            min(snapshot_s / 2, 30.0) if snapshot_timeout_s is None else snapshot_timeout_s
-        )
 
         def start_snapshots() -> asyncio.Task[None]:
-            return asyncio.create_task(
-                _snapshot_loop(risk, snapshot_s, snapshot_timeout), name="equity-snapshots"
-            )
+            return asyncio.create_task(_snapshot_loop(risk, snapshot_s), name="equity-snapshots")
 
         snapshot_task = start_snapshots()
         while not stop.is_set():
@@ -141,16 +135,21 @@ async def run_core(
         await engine.dispose()
 
 
-async def _snapshot_loop(risk: RiskEngine, interval_s: float, timeout_s: float) -> None:
-    """Snapshot equity now, then every `interval_s`. Each attempt is bounded by
-    `timeout_s`; a failure or timeout is logged and the loop carries on. Runs beside the
-    core loop, so a hung REST call only delays the next snapshot, never kill detection."""
+class _Snapshotter(Protocol):
+    async def snapshot_equity(self) -> None: ...
+
+
+async def _snapshot_loop(risk: _Snapshotter, interval_s: float) -> None:
+    """Snapshot equity now, then every `interval_s`; a failure is logged and the loop
+    carries on. No outer `wait_for`: the engine bounds its own broker calls
+    (`io_timeout_s`), and cancelling here could cut a journal write mid-commit. Runs beside
+    the core loop, so even a hung DB write only stalls this task, never kill detection."""
     loop = asyncio.get_running_loop()
     next_at = loop.time()
     while True:
         try:
-            await asyncio.wait_for(risk.snapshot_equity(), timeout=timeout_s)
-        except TimeoutError:
+            await risk.snapshot_equity()
+        except TimeoutError:  # the engine's own budget expired on a broker call
             log.error("risk.snapshot_failed", timeout=True)
         except Exception:
             log.exception("risk.snapshot_failed")

@@ -187,11 +187,13 @@ is estimated at `qty × avg_entry_price`),
 previous HWM is the maximum over **all** snapshot rows (`repo.max_hwm`), never the latest
 row's value, so writers that interleave (the snapshot task and a `check()`) can never lower
 it. `run core` runs it in one supervised background task (`_snapshot_loop`): the first
-snapshot immediately, then every `snapshot_s` (60); each attempt bounded by
-`snapshot_timeout_s` (default `min(snapshot_s / 2, 30)`); a failure or timeout is logged as
-`risk.snapshot_failed` (`timeout=True` for a timeout) and the next attempt follows on
-schedule; a success logs `risk.snapshot_written`. The core loop never awaits a snapshot, so
-a hung REST call cannot delay kill detection or feed ticks; if the task ever ends it is
+snapshot immediately, then every `snapshot_s` (60). There is no outer `wait_for`: the
+engine bounds the snapshot's broker calls with its own `io_timeout_s` budget, and an outer
+timeout would only risk cancelling the journal write mid-commit. A failure is logged as
+`risk.snapshot_failed` (`timeout=True` when the engine's budget expired) and the next
+attempt follows on schedule; a success logs `risk.snapshot_written`. The core loop never
+awaits a snapshot, so a hung REST call (or even a hung DB write, which only stalls the
+task) cannot delay kill detection or feed ticks; if the task ever ends it is
 logged as `risk.snapshot_task_died` and restarted on the next tick. `check()` folds live equity into the
 `hwm` it uses and, when live equity exceeds the stored maximum, writes a snapshot at once,
 also when the check then rejects: a spike between two periodic snapshots that falls back

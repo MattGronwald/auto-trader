@@ -385,7 +385,8 @@ class RiskEngine:
     # --- equity snapshots ------------------------------------------------------------
 
     async def snapshot_equity(self) -> None:
-        """Called every 60 s by `run core`'s background snapshot task, which bounds it.
+        """Called every 60 s by `run core`'s background snapshot task. Its broker calls
+        have their own `io_timeout_s` budget; journal writes are never cancelled.
         Lock-free on purpose: it must never delay an exit."""
         deadline = self._monotonic() + self._io_timeout  # its own budget; no lock shared
         now = self._clock()
