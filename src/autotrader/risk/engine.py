@@ -144,12 +144,14 @@ class RiskEngine:
         self, symbol: str, now: datetime
     ) -> tuple[ControlStatus, PortfolioState, MarketSnapshot]:
         control = await self._gate.status(now)
+        # Refresh our own entries BEFORE reading positions: a fill the refresh observes
+        # is then already in the positions read below (never neither-position-nor-entry).
+        open_rows = await self._refresh_open_entries()
         account = await self._broker.get_account()
         held = await self._held_positions()
         rules = await self._broker.asset_rules(symbol)
         fees = self._broker.fee_schedule()
         async with self._sessions() as session:
-            open_rows = await self._refresh_open_entries(session)
             entries_hour = await repo.count_entry_orders(session, now - HOUR, inclusive=False)
             entries_day = await repo.count_entry_orders(
                 session, day_start(now, self._tz), inclusive=True
@@ -196,20 +198,25 @@ class RiskEngine:
         )
         return control, portfolio, market
 
-    async def _refresh_open_entries(self, session: AsyncSession) -> list[Order]:
+    async def _refresh_open_entries(self) -> list[Order]:
         """Order status sync for our own acked entries (WP 1.6 adds the fill stream):
-        without it an IOC entry would stay `new` and block its symbol forever."""
-        rows = await repo.open_entry_orders(session)
-        still_open = []
+        without it an IOC entry would stay `new` and block its symbol forever. No DB
+        session is held open across the broker calls."""
+        async with self._sessions() as session:
+            rows = await repo.open_entry_orders(session)
+        still_open: list[Order] = []
+        changed: list[tuple[int, str]] = []
         for row in rows:
             if row.status == "new" and row.broker_order_id is not None:
                 status = await self._broker.get_order(row.broker_order_id)
                 if status.status != "new":
-                    await repo.update_order(
-                        session, row.id, status=status.status, now=self._clock()
-                    )
+                    changed.append((row.id, status.status))
                     continue
             still_open.append(row)
+        if changed:
+            async with self._sessions() as session:
+                for row_id, new_status in changed:
+                    await repo.update_order(session, row_id, status=new_status, now=self._clock())
         return still_open
 
     async def _held_positions(self) -> tuple[HeldPosition, ...]:

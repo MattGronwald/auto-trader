@@ -17,6 +17,8 @@ from autotrader.broker.base import (
     FeeSchedule,
     OrderAck,
     OrderRejected,
+    OrderStatus,
+    Position,
 )
 from autotrader.broker.sim import SimBroker
 from autotrader.core.config import StrategyProfile, load_profile
@@ -407,3 +409,44 @@ async def test_snapshot_equity_marks_held_positions(
     async with sessions() as s:
         snap = await repo.latest_snapshot(s)
     assert snap is not None and snap.exposure > 0 and snap.equity > 0
+
+
+class OrderingBroker(SimBroker):
+    """Reports positions only once get_order has been called (a fill seen late)."""
+
+    order_polled = False
+
+    async def get_order(self, order_id: str) -> OrderStatus:
+        self.order_polled = True
+        return await super().get_order(order_id)
+
+    async def get_positions(self) -> list[Position]:
+        return await super().get_positions() if self.order_polled else []
+
+
+async def test_own_orders_are_refreshed_before_positions_are_read(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    broker = OrderingBroker(
+        cash=D("1000"), fees=FEES, slippage_bps=D(0), asset_rules={BTC: RULES}, timeframe="5m"
+    )
+    broker.process_bar(five(29))
+    engine = make_engine_(broker, sessions, gate)
+    await engine.check(intent(cycle_id))
+    broker.process_bar(five(30, close=100.0))  # the entry fills at the broker
+    async with sessions() as s:
+        strategy = await repo.register_strategy(s, PROFILE, "yaml")
+        row = m.Cycle(
+            strategy_id=strategy.id,
+            symbol=BTC,
+            rule_id="r",
+            signal_features={},
+            state="RISK_CHECK",
+            created_at=NOW,
+        )
+        s.add(row)
+        await s.commit()
+        second = row.id
+    result = await engine.check(intent(second))
+    assert not result.decision.approved
+    assert "already has a position or open entry" in result.decision.reasons[0]
