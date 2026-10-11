@@ -1,13 +1,13 @@
 """`autotrader run core` (SPEC §12 Phase 0 DoD): connect to the broker, backfill and stream
 bars for the universe, persist 1m bars, respond to the kill-switch. Since WP 1.2 the Signal
-Scanner runs on closed bars and persists `CandidateSignal`s; nothing consumes them until
-the Cycle Runner (WP 1.4).
+Scanner runs on closed bars and persists `CandidateSignal`s; `run core` does not subscribe
+the Cycle Runner (`core/cycle.py`, WP 1.4) until WP 1.5, so nothing consumes them yet.
 
 The broker is connected here and handed to the `RiskEngine`, which is its only holder from
 then on (SPEC §0.1); `run core` also snapshots equity every 60 s for the daily-loss and
 drawdown checks, in one supervised background task so a hung snapshot can never delay
-kill detection or feed ticks. Nothing calls `check()`/`exit()` until the Cycle Runner (WP 1.4) and
-Position Manager (WP 1.5).
+kill detection or feed ticks. Nothing in `run core` calls `check()`/`exit()` until WP 1.5
+wires the Cycle Runner and the Position Manager.
 """
 
 import asyncio
