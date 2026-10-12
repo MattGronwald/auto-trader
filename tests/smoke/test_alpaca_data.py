@@ -33,7 +33,7 @@ async def test_history_returns_recent_minute_bars(source: AlpacaBarSource) -> No
 async def test_latest_bar_and_quote(source: AlpacaBarSource) -> None:
     latest = await source.latest("BTC/USD")
 
-    assert latest.bar_end is not None
+    assert latest.bar is not None and latest.bar.symbol == "BTC/USD"
     assert latest.quote is not None and latest.quote.symbol == "BTC/USD"
 
 

@@ -12,7 +12,7 @@ and a smoke test against the real stream; re-check on alpaca-py upgrades.
 """
 
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 import structlog
@@ -23,8 +23,6 @@ from autotrader.core.feed import Latest
 from autotrader.core.types import Bar, Quote
 
 log = structlog.get_logger(__name__)
-
-ONE_MINUTE = timedelta(minutes=1)
 
 
 class _Historical(Protocol):
@@ -125,7 +123,7 @@ class AlpacaBarSource:
         bar = bar_raw.get(symbol)
         quote = quote_raw.get(symbol)
         return Latest(
-            bar_end=_ts(bar["t"]) + ONE_MINUTE if bar else None,
+            bar=_bar(symbol, bar) if bar else None,
             quote=_quote(symbol, quote) if quote else None,
         )
 
