@@ -20,11 +20,13 @@ Sources:
   - **sell BTC/USD:** fee in **USD**.
 - "Fees are currently calculated and **posted end of day**". Same-day queries may return nothing. Alpaca says real-time posting is planned.
 - Fees are retrievable only as account **activities** (`activity_type` `CFEE` / `FEE`). The docs don't say whether order or fill objects carry fees.
+- **Paper observation (2026-10-12, fee check step 2):** the paper account posted **no** `CFEE`/`FEE` activity for either leg, neither ~32 h after the buy nor right after the sell. On paper the fee is visible only as the coin shortfall (buy) and the cash shortfall (sell). Whether live posts `CFEE` is unverified.
 
 **Consequences:**
 1. **`SimBroker` currently charges all fees in USD.** That is right for sells but wrong for buys, where the real position is smaller than the ordered qty. Owner decision D10 (2026-10-11 review) selects coin-denominated buy fees and dust handling; PLAN 1.R2 implements it. The simulator has not yet been changed.
-2. **Reconciliation (WP 1.5):** the empirical step-1 probe below shows the buy fee deducted from coin **at fill time**; only the activity record is posted later. Gross fill qty and net broker position therefore differ immediately. Explain that difference using fee denomination and bounded rounding; an unexplained discrepancy still pauses new entries. Do not hide discrepancies by unconditionally overwriting local qty.
+2. **Reconciliation (WP 1.5):** the empirical step-1 probe below shows the buy fee deducted from coin **at fill time**; the sell fee likewise comes out of the USD proceeds at fill (step 2). On paper no activity record is posted at all. Gross fill qty and net broker position therefore differ immediately. Explain that difference using fee denomination and bounded rounding; an unexplained discrepancy still pauses new entries. Do not hide discrepancies by unconditionally overwriting local qty.
 3. **Journal (WP 1.5 basic accounting; WP 3.1 activity reconciliation):** the posted fee record is not available at fill time. Record an **estimated** fee from `fee_schedule()` at fill time, then reconcile it with the posted `CFEE` amount once available, retaining its asset denomination and avoiding double counting.
+   **2026-10-12:** paper never posts `CFEE`, so the posted amount can't be the only source. Derive the actual fee from the broker's own numbers instead: gross fill qty minus position qty for buys, gross fill notional minus the cash credit for sells. Don't use Alpaca's position P&L for this: `cost_basis` is net qty × entry price, so the buy fee doesn't appear in `unrealized_pl` at all.
 4. **Exits sell the actual position qty**, not the ordered entry qty, or they can hit "insufficient qty" immediately after the fill. Account for reserved sell qty as well; test the actual close/dust behavior before relying on retries.
 
 ## Fees
@@ -84,6 +86,26 @@ Owner-approved paper order: market buy, notional $10 BTC/USD, `gtc`.
 
 **Step 2 (due 2026-10-12 or later):** re-read the position and the `CFEE` activity, then sell the full position qty and record the USD fee and its posting.
 
+## Empirical fee check — step 2 (2026-10-12, paper)
+
+Owner-approved paper order: market sell of the full position, `qty` 0.000117817 BTC/USD, `gtc`. Raw payloads (order ids replaced): `tests/fixtures/alpaca/fee_check_btcusd_20261012.json`.
+
+| | Value |
+|---|---|
+| Pre-sell read (~32 h after the buy) | position unchanged (0.000117817, `cost_basis` 9.778128 = net qty × entry); no `CFEE`/`FEE` activity |
+| Fill | 0.000117817 BTC @ 82,420.56, filled in ~2 ms, `position_intent` `sell_to_close` |
+| Gross notional | 9.71054 USD |
+| Cash credited | **9.68** USD (99,990.20 → 99,999.88) |
+| Implied sell fee | 0.0305 USD (31.5 bps of gross; see rounding below) |
+| Position after | none (full close, no dust) |
+| `CFEE`/`FEE` activity | **none** |
+| Round trip | −0.12 USD on ~$9.80 (fees ≈ 0.025 + 0.024, rest is price move and rounding) |
+
+- **The sell fee comes out of the USD proceeds at fill time.** The FILL activity shows the gross price, and nothing records the fee.
+- **Cash is rounded down to cents on both legs.** 25 bps of the gross gives 9.6863. That truncates to 9.68 but rounds half-up to 9.69. The buy also truncated (9.8027 → 9.80). "25 bps taker, cash truncated to cents" explains both legs. On a $10 trade one cent is ~10 bps, so a larger trade would be needed to separate this from a slightly higher fee rounded normally (inference, not verified).
+- **Selling the exact `qty_available` closes the position cleanly.** After a coin-fee buy, the net qty (9 decimals) was accepted as-is, with no increment rejection and no dust left behind.
+- **No `CFEE`/`FEE` activity on paper at all**, even after both legs, so paper journalling can't wait for one (see G10 consequence 3).
+
 ## Market data (2026-10-11)
 
 - **REST bars** (`raw_data=True`): `{symbol: [{"t": "…Z", "o", "h", "l", "c", "v", "n", "vw"}]}`, prices as floats. Fine for bars, which are indicator input.
@@ -114,6 +136,7 @@ Owner-approved paper order: market buy, notional $10 BTC/USD, `gtc`.
 
 ## Not verified yet
 
-- **`CFEE` posting and the sell-side fee:** fee check step 2.
+- **`CFEE` posting on live.** Paper never posts it (fee check step 2, 2026-10-12). Check on the first live fills (Phase 5).
+- **Exact cash rounding rule** (truncate vs round) at sizes where the difference exceeds one cent. One $10 sample can't settle it.
 - **Stop-limit behaviour** on crypto (trigger price source, gaps). Paper-test in WP 1.5 if a broker-side backup stop is wanted.
 - **Live availability for German residents** (SPEC §2, open risk). Unchanged; not checkable from a paper account.
