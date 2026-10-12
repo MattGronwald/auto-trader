@@ -92,6 +92,10 @@ An approved decision lists which cap bound the size (`adjusted["bound_by"]`).
    `qty = size_fraction × min(risk_qty, cap_qty, cash_qty)`, rounded **down** to
    `qty_increment`. Reject if `qty < min_qty` or `qty × entry < min_notional`. The broker's
    per-order notional maximum ($200k) is omitted as irrelevant at PoC size.
+   *Update 2026-10-12 (WP 1.R1b, D16):* `risk_qty` divides by the estimated net loss per
+   unit at the stop (`net_pnl_per_unit`: taker fee on both legs, `exit_slippage_bps`, buy
+   fee in coin or USD per `FeeSchedule.buy_fee_asset`) instead of `d`. `adjusted` also
+   records `initial_risk` (qty × d) and `est_net_stop_loss`.
 8. **Exposure.** `Σ position market values + Σ open entry notionals + qty × entry ≤
    max_gross_exposure_pct × equity`. Over the limit rejects; the order is never shrunk.
    A non-dust held position without a current price (no feed price, or stale) makes the
@@ -110,6 +114,9 @@ An approved decision lists which cap bound the size (`adjusted["bound_by"]`).
     `strategy_trades_n < learning.min_trades_for_evidence`, else `strategy_win_rate`.
     `p = min(confidence, win_rate_est + 0.10)`.
     `ev = qty·(tp − entry)·p − qty·(entry − stop)·(1 − p) − qty·entry·taker − qty·tp·taker`.
+    *Update 2026-10-12 (WP 1.R1b):* `ev = qty·(p·net_pnl_per_unit(tp) − (1 − p)·unit_loss)`,
+    the same cash-flow model as the size, with exit slippage on TP and stop. The
+    "known optimism" below is reduced to gaps beyond that finite allowance.
     Reject if `ev ≤ 0`. Known optimism: stop exits are market orders and slippage past the
     stop is not modelled.
 

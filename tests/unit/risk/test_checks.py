@@ -33,7 +33,7 @@ RULES = AssetRules(
     min_notional=D("1"),
     price_increment=D("0.01"),
 )
-FEES = FeeSchedule(maker_bps=D("15"), taker_bps=D("25"))
+FEES = FeeSchedule(maker_bps=D("15"), taker_bps=D("25"), buy_fee_asset="quote")
 ALLOWED = ControlStatus(killed=False, reasons=())
 
 INTENT = EntryIntent(
@@ -65,12 +65,14 @@ def run(
     *,
     control: ControlStatus = ALLOWED,
     mode_matches: bool = True,
+    risk: dict[str, Any] | None = None,
 ) -> RiskDecision:
+    profile = PROFILE.model_copy(update={"risk": PROFILE.risk.model_copy(update=risk or {})})
     return check_entry(
         INTENT.model_copy(update=intent or {}),
         PORTFOLIO.model_copy(update=portfolio or {}),
         MARKET.model_copy(update=market or {}),
-        profile=PROFILE,
+        profile=profile,
         control=control,
         mode_matches=mode_matches,
     )
@@ -282,16 +284,41 @@ def test_open_entry_notional_counts_toward_exposure() -> None:
     assert not d.approved and "exposure" in d.reasons[0]
 
 
+WIDE = {"stop": D("94.1"), "take_profit": D("120")}  # d = 6: risk-bound, positive EV
+
+
 def test_sizing_caps_choose_the_smallest() -> None:
     assert run(portfolio={"cash": D("100")}).adjusted["bound_by"] == "cash"
-    d = run(intent={"stop": D("94.1"), "take_profit": D("120")})  # d = 6: 10/6 = 1.666 < 2.997
+    d = run(intent=WIDE)
+    # D16, USD buy fee: loss/unit = 100.1 x 1.0025 - 94.1 x 0.999 x 0.9975 = 6.57936475
+    # -> 10 / 6.579... = 1.5199 (the old price-distance cap gave 10 / 6 = 1.6666)
+    assert d.adjusted["bound_by"] == "risk" and d.qty == D("1.5199")
+    assert D(d.adjusted["initial_risk"]) == D("1.5199") * 6  # price-distance R, unchanged
+    assert D(d.adjusted["est_net_stop_loss"]) == D("1.5199") * D("6.57936475")
+
+
+def test_coin_denominated_buy_fee_uses_its_own_cash_flow() -> None:
+    # Alpaca: the buy fee comes out of the coin, so only 0.9975 x qty is sold at the stop:
+    # loss/unit = 100.1 - 0.9975 x 94.1 x 0.999 x 0.9975 = 6.563541963125 -> 1.5235
+    base = FEES.model_copy(update={"buy_fee_asset": "base"})
+    d = run(intent=WIDE, market={"fees": base})
+    assert d.adjusted["bound_by"] == "risk" and d.qty == D("1.5235")
+    assert D(d.adjusted["est_net_stop_loss"]) == D("1.5235") * D("6.563541963125")
+
+
+def test_without_fees_and_exit_slippage_sizing_is_the_price_distance() -> None:
+    free = FeeSchedule(maker_bps=D(0), taker_bps=D(0), buy_fee_asset="quote")
+    d = run(intent=WIDE, market={"fees": free}, risk={"exit_slippage_bps": D(0)})
     assert d.adjusted["bound_by"] == "risk" and d.qty == D("1.6666")
+    assert d.adjusted["initial_risk"] == d.adjusted["est_net_stop_loss"]
 
 
 def test_expected_value_is_reported() -> None:
-    # p = 0.5; per unit: 5.9 x 0.5 - 2.1 x 0.5 - 100.1 x 0.0025 - 106 x 0.0025 = 1.38475
+    # D16 cash flows, p = 0.5, both exits with 10 bps adverse slippage and 25 bps taker:
+    # gain at TP 106 x 0.999 x 0.9975 - 100.1 x 1.0025 = 5.279015
+    # loss at stop 2.693005 -> per unit 0.5 x 5.279015 - 0.5 x 2.693005 = 1.29300500
     d = run()
-    assert D(d.adjusted["expected_value"]) == D("2.997") * D("1.38475")
+    assert D(d.adjusted["expected_value"]) == D("2.997") * D("1.29300500")
 
 
 money = st.decimals(min_value=D("10"), max_value=D("100000"), places=2)
@@ -309,9 +336,17 @@ def test_sizing_invariants() -> None:
         reward=st.decimals(min_value=D("1.5"), max_value=D("10"), places=2),
         fraction=st.decimals(min_value=D("0.01"), max_value=D("1"), places=2),
         confidence=st.decimals(min_value=D("0.45"), max_value=D("1"), places=2),
+        fee_asset=st.sampled_from(["base", "quote"]),
     )
     def check(
-        equity: D, cash_share: D, ask: D, stop_atr: D, reward: D, fraction: D, confidence: D
+        equity: D,
+        cash_share: D,
+        ask: D,
+        stop_atr: D,
+        reward: D,
+        fraction: D,
+        confidence: D,
+        fee_asset: str,
     ) -> None:
         entry = entry_limit(ask, PROFILE.risk.entry_slippage_bps, RULES.price_increment)
         atr = ask / 50
@@ -329,7 +364,13 @@ def test_sizing_invariants() -> None:
                 "size_fraction": fraction,
             },
             portfolio={"equity": equity, "cash": cash, "day_start_equity": equity, "hwm": equity},
-            market={"bid": ask - D("0.01"), "ask": ask, "last_trade": ask, "atr": atr},
+            market={
+                "bid": ask - D("0.01"),
+                "ask": ask,
+                "last_trade": ask,
+                "atr": atr,
+                "fees": FEES.model_copy(update={"buy_fee_asset": fee_asset}),
+            },
         )
         if not d.approved:
             return
@@ -339,7 +380,18 @@ def test_sizing_invariants() -> None:
         qty, taker = d.qty, FEES.taker_bps / D(10_000)
         tiny = D("1e-18") * equity  # Decimal division rounds to 28 digits
         assert qty > 0 and qty % RULES.qty_increment == 0
-        assert qty * distance <= PROFILE.risk.risk_per_trade_pct / 100 * equity + tiny
+        budget = PROFILE.risk.risk_per_trade_pct / 100 * equity
+        assert qty * distance <= budget + tiny
+        # D16, restated as cash flows: buy, then sell everything held at the stop less the
+        # exit slippage allowance. The estimated net loss never exceeds the budget.
+        exit_price = stop * (1 - PROFILE.risk.exit_slippage_bps / D(10_000))
+        if fee_asset == "base":  # fee taken from the coin received
+            spent, held_qty = qty * entry, qty * (1 - taker)
+        else:  # fee paid in USD on top
+            spent, held_qty = qty * entry * (1 + taker), qty
+        net_loss = spent - held_qty * exit_price * (1 - taker)
+        assert D(0) < net_loss <= budget + tiny
+        assert D(d.adjusted["est_net_stop_loss"]) == net_loss
         assert qty * entry <= PROFILE.risk.max_position_pct / 100 * equity + tiny
         assert qty * entry * (1 + taker) <= cash + tiny
         assert stop < entry < tp

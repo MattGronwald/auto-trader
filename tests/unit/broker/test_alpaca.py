@@ -77,7 +77,7 @@ async def test_fee_schedule_follows_account_crypto_tier() -> None:
     tier3 = {**ACCOUNT, "crypto_tier": 3}
 
     assert (await connect(FakeClient())).fee_schedule() == FeeSchedule(
-        maker_bps=Decimal(15), taker_bps=Decimal(25)
+        maker_bps=Decimal(15), taker_bps=Decimal(25), buy_fee_asset="base"
     )
     assert (await connect(FakeClient(tier3))).fee_schedule() == FEE_TIERS[3]
 

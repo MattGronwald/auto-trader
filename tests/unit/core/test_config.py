@@ -152,6 +152,10 @@ def _set(data: dict[str, Any], path: str, value: Any) -> None:
         ("risk.min_stop_atr", 3.0, "min_stop_atr"),
         ("risk.entry_slippage_bps", 100, "entry_slippage_bps"),  # 1 % = max deviation
         ("risk.entry_slippage_bps", -1, "entry_slippage_bps"),
+        ("risk.exit_slippage_bps", -1, "exit_slippage_bps"),
+        ("risk.exit_slippage_bps", 10_000, "exit_slippage_bps"),
+        ("risk.exit_slippage_bps", "NaN", "exit_slippage_bps"),
+        ("risk.exit_slippage_bps", "Infinity", "exit_slippage_bps"),
         ("risk.max_daily_loss_pct", 0, "max_daily_loss_pct"),
         ("risk.max_position_pct", 101, "max_position_pct"),
         ("risk.default_win_rate_prior", 1.0, "default_win_rate_prior"),
@@ -177,6 +181,17 @@ def test_invalid_profile_rejected(
 
 def test_entry_slippage_loaded_exactly(profile_data: dict[str, Any]) -> None:
     assert parse_profile(profile_data).risk.entry_slippage_bps == Decimal("10")
+
+
+def test_exit_slippage_is_required_and_loaded_exactly(profile_data: dict[str, Any]) -> None:
+    # D16: a human-only risk input; no schema default may fill it in silently.
+    assert parse_profile(profile_data).risk.exit_slippage_bps == Decimal("10")
+    zero = {**profile_data, "risk": {**profile_data["risk"], "exit_slippage_bps": 0}}
+    assert parse_profile(zero).risk.exit_slippage_bps == 0
+
+    del profile_data["risk"]["exit_slippage_bps"]
+    with pytest.raises(ConfigError, match="exit_slippage_bps"):
+        parse_profile(profile_data)
 
 
 def test_unquoted_numeric_expression_accepted(profile_data: dict[str, Any]) -> None:

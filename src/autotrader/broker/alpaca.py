@@ -36,7 +36,7 @@ from autotrader.core.config import Settings
 
 # 30-day-volume fee tiers (maker, taker in bps), docs verified 2026-10-11.
 FEE_TIERS: dict[int, FeeSchedule] = {
-    tier: FeeSchedule(maker_bps=Decimal(maker), taker_bps=Decimal(taker))
+    tier: FeeSchedule(maker_bps=Decimal(maker), taker_bps=Decimal(taker), buy_fee_asset="base")
     for tier, (maker, taker) in {
         1: (15, 25),
         2: (12, 22),

@@ -8,7 +8,7 @@ control state, pauses or rate limits, so a stop-out can't be blocked.
 from collections.abc import Sequence
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
-from autotrader.broker.base import BrokerOrder
+from autotrader.broker.base import BrokerOrder, FeeSchedule
 from autotrader.core.config import StrategyProfile
 from autotrader.core.kill import ControlStatus
 from autotrader.risk.types import (
@@ -37,6 +37,20 @@ def _step(value: Decimal, step: Decimal, rounding: str) -> Decimal:
 def entry_limit(ask: Decimal, slippage_bps: Decimal, price_increment: Decimal) -> Decimal:
     """Marketable IOC limit (D14): ask plus the allowance, rounded up to the price step."""
     return _step(ask * (1 + slippage_bps / _BPS), price_increment, ROUND_CEILING)
+
+
+def net_pnl_per_unit(
+    entry: Decimal, exit_price: Decimal, fees: FeeSchedule, exit_slippage_bps: Decimal
+) -> Decimal:
+    """Estimated net cash result per unit bought at `entry` (D16): the exit fills at
+    `exit_price` less the adverse slippage allowance, both legs pay the taker fee (IOC
+    entry, market exit). A buy fee in the coin (`base`, Alpaca) leaves fewer units to
+    sell; one in USD (`quote`) is paid on top. Never both deductions at once."""
+    fee = fees.taker_bps / _BPS
+    proceeds_per_unit = exit_price * (1 - exit_slippage_bps / _BPS) * (1 - fee)
+    if fees.buy_fee_asset == "base":
+        return (1 - fee) * proceeds_per_unit - entry
+    return proceeds_per_unit - entry * (1 + fee)
 
 
 def check_entry(
@@ -111,9 +125,12 @@ def _size_and_finish(
 ) -> RiskDecision:
     limits, rules = profile.risk, market.rules
     taker = market.fees.taker_bps / _BPS
-    # 7. size (G4 + cash cap, D14)
+    # 7. size (G4 + cash cap, D14). D16: the risk budget bounds the estimated *net* loss
+    # at the stop (fees on both legs + exit slippage), not just the price distance.
+    # Positive: stop < entry (check 6), 0 <= fee < 100 % (FeeSchedule), 0 <= slip < 100 %.
+    unit_loss = -net_pnl_per_unit(entry, intent.stop, market.fees, limits.exit_slippage_bps)
     caps = {
-        "risk": limits.risk_per_trade_pct / _PCT * portfolio.equity / distance,
+        "risk": limits.risk_per_trade_pct / _PCT * portfolio.equity / unit_loss,
         "position": limits.max_position_pct / _PCT * portfolio.equity / entry,
         "cash": portfolio.cash / (entry * (1 + taker)),
     }
@@ -154,12 +171,9 @@ def _size_and_finish(
     if rate is None or portfolio.strategy_trades_n < profile.learning.min_trades_for_evidence:
         rate = limits.default_win_rate_prior
     p = min(intent.confidence, rate + WIN_RATE_MARGIN)
-    ev = (
-        qty * (intent.take_profit - entry) * p
-        - qty * distance * (1 - p)
-        - notional * taker
-        - qty * intent.take_profit * taker
-    )
+    # Same cash-flow model as the size (D16); the TP exit also gets the adverse slippage.
+    unit_gain = net_pnl_per_unit(entry, intent.take_profit, market.fees, limits.exit_slippage_bps)
+    ev = qty * (p * unit_gain - (1 - p) * unit_loss)
     if ev <= 0:
         return _reject(f"expectancy {ev} <= 0 after fees (p = {p})")
     order = BrokerOrder(
@@ -174,7 +188,14 @@ def _size_and_finish(
     return RiskDecision(
         approved=True,
         reasons=(f"sized by {bound_by} cap",),
-        adjusted={"entry": str(entry), "bound_by": bound_by, "expected_value": str(ev)},
+        adjusted={
+            "entry": str(entry),
+            "bound_by": bound_by,
+            "expected_value": str(ev),
+            # R stays the price distance; the D16 estimate is reported next to it.
+            "initial_risk": str(qty * distance),
+            "est_net_stop_loss": str(qty * unit_loss),
+        },
         qty=qty,
         order=order,
     )

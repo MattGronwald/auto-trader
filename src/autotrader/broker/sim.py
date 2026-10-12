@@ -82,6 +82,8 @@ class SimBroker:
         mode: Mode = "paper",
         timeframe: str = "1m",
     ) -> None:
+        if fees.buy_fee_asset != "quote":  # coin-denominated buy fees arrive with WP 1.R2
+            raise ValueError("SimBroker models only buy_fee_asset='quote' (USD) fees")
         self.cash = cash
         self.fees = fees
         self.slippage_bps = slippage_bps

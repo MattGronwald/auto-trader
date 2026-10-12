@@ -249,6 +249,9 @@ class RiskLimits(_Frozen):
     max_orders_per_day: Annotated[int, Field(ge=1)]
     max_price_deviation_pct: Pct
     entry_slippage_bps: Annotated[Decimal, Field(ge=0)]
+    # D16: adverse slippage assumed on a stop exit when sizing by net loss. Required, no
+    # default; finite (pydantic rejects NaN/inf Decimals) and below 100 %.
+    exit_slippage_bps: Annotated[Decimal, Field(ge=0, lt=10_000)]
     default_win_rate_prior: Annotated[Decimal, Field(gt=0, lt=1)]
     trailing: Trailing
 
