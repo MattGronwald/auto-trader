@@ -32,6 +32,7 @@
   `uv run pytest -q --cov=autotrader.risk --cov-branch --cov-report=term-missing`.
 - Never pipe a check into `tail`. Redirect to a file and read the real exit code.
 - Line length 100 (ruff). mypy is strict.
+- **ASCII only in Python code, comments and docstrings.** ruff's `RUF001`–`RUF003` reject `−`, `×` and similar characters (this plan's prose may use them; its code blocks don't). Docstrings are not wrapped by `ruff format`; wrap them by hand.
 - Tests never hit Alpaca or Anthropic.
 
 ## Review Focus
@@ -125,7 +126,7 @@ class Fill(_Frozen):
     """One broker execution. `fill_id` is unique and stable per execution, so a consumer
     applies each fill once (WP 1.5). `qty` is the gross qty traded at `price`; `fee` is
     denominated in `fee_asset`: a buy with `FeeSchedule.buy_fee_asset == "base"` pays
-    it in the coin (net coins received = qty − fee), every sell and every "quote" buy
+    it in the coin (net coins received = qty - fee), every sell and every "quote" buy
     pays it in USD (G10, D10, docs/alpaca-notes.md)."""
 
     fill_id: str
@@ -306,7 +307,14 @@ and replace the body of `_refresh_open_entries` after the docstring with:
         return still_open
 ```
 
-Update the docstring's first sentence to: `"""Order status sync for our own acked entries (WP 1.6 adds the fill stream): a final broker status is written and the row leaves the open set; "partially_filled" is written but stays open. Without it an IOC entry would stay `new` and block its symbol forever. No DB session is held open across the broker calls."""`
+Replace the docstring with (wrapped by hand: `ruff format` does not wrap docstrings):
+
+```python
+        """Order status sync for our own acked entries (WP 1.6 adds the fill stream): a
+        final broker status is written and the row leaves the open set; "partially_filled"
+        is written but stays open. Without it an IOC entry would stay `new` and block its
+        symbol forever. No DB session is held open across the broker calls."""
+```
 
 - [ ] **Step 4: Run the tests and coverage**
 
@@ -414,7 +422,7 @@ async def test_multi_bar_market_sell_goes_partial_then_filled() -> None:
     assert states == ["partially_filled", "partially_filled", "filled"]
     status = await sim.get_order(ack.order_id)
     assert status.filled_qty == D(1)
-    assert status.avg_fill_price == D("117")  # 0.5·110 + 0.3·120 + 0.2·130
+    assert status.avg_fill_price == D("117")  # 0.5*110 + 0.3*120 + 0.2*130
     fills = await drain(sim)
     assert [f.fill_id for f in fills] == [f"{ack.order_id}:{n}" for n in (1, 2, 3)]
     assert [f.qty for f in fills] == [D("0.5"), D("0.3"), D("0.2")]
@@ -495,7 +503,7 @@ async def test_partial_buy_cancel_releases_cash() -> None:
     sim.process_bar(bar(0, 100.0))
     sim.script(BTC, "buy", FillPlan((D("0.5"),)))
     first = await sim.submit_order(limit("buy", "8", "100"))  # gtc
-    sim.process_bar(bar(1, 100.0))  # 4 filled: cash 1000 − 400 − 0.6 maker fee
+    sim.process_bar(bar(1, 100.0))  # 4 filled: cash 1000 - 400 - 0.6 maker fee
     assert (await sim.get_order(first.order_id)).status == "partially_filled"
 
     with pytest.raises(OrderRejected, match="insufficient cash"):
@@ -585,13 +593,13 @@ class FillPlan:
     def __post_init__(self) -> None:
         for step in self.steps:
             if isinstance(step, Decimal):
-                if not D0 < step <= 1:
+                if not _D0 < step <= 1:
                     raise ValueError(f"fill step fraction must be in (0, 1], got {step}")
             elif step not in ("cancel", "reject"):
                 raise ValueError(f"unknown fill step {step!r}")
 ```
 
-with `D0 = Decimal(0)` defined next to `_BPS`.
+with `_D0 = Decimal(0)` defined next to `_BPS`.
 
 Replace the `_Order` dataclass with:
 
@@ -699,7 +707,7 @@ Replace `_try_fill` with these four methods:
         elif step == "reject":
             o.status, o.reason = "rejected", "scripted rejection"
         else:
-            qty = self._slice(o, cast(Decimal, step))
+            qty = self._slice(o, step)  # narrowed to Decimal by the branches above
             if qty > 0:
                 self._fill(o, qty, price, fee_bps, bar.ts)
 
@@ -769,7 +777,7 @@ Replace `_try_fill` with these four methods:
         self._fills.put_nowait(fill)
 ```
 
-`self.coin_precision` is introduced in Task 4. To keep this task self-contained, add it now to `__init__` as a keyword argument `coin_precision: Decimal = Decimal("1e-9")` stored as `self.coin_precision = coin_precision` (Task 4 adds its validation).
+`self.coin_precision` is introduced in Task 4. To keep this task self-contained, add it now to `__init__` as the **last** keyword argument (after `timeframe`), `coin_precision: Decimal = Decimal("1e-9")`, stored as `self.coin_precision = coin_precision`. Task 4 adds its validation.
 
 Change `_validate` to take `full_close` and skip only the increment check for a full close:
 
@@ -940,7 +948,7 @@ async def test_base_buy_adds_to_existing_position() -> None:
 
     (pos,) = await sim.get_positions()
     assert pos.qty == D("1.995")
-    assert pos.avg_entry_price == D("150")  # (0.9975·100 + 0.9975·200) / 1.995
+    assert pos.avg_entry_price == D("150")  # (0.9975*100 + 0.9975*200) / 1.995
 
 
 async def test_base_cash_checks_need_only_the_notional() -> None:
@@ -996,12 +1004,13 @@ def _ceil(value: Decimal, step: Decimal) -> Decimal:
 In `__init__`, replace the `if fees.buy_fee_asset != "quote": raise …` block with:
 
 ```python
-        for symbol, rules in asset_rules.items():
-            # A coin fee rounded up to coin_precision must never exceed a minimal slice.
-            if rules.qty_increment % coin_precision != 0:
+        for symbol, symbol_rules in asset_rules.items():
+            # Applies to both fee assets: quantities never go below one coin quantum, and a
+            # coin fee rounded up to coin_precision can't exceed a minimal slice (spec §3).
+            if symbol_rules.qty_increment % coin_precision != 0:
                 raise ValueError(
-                    f"{symbol}: qty_increment {rules.qty_increment} is not a multiple of "
-                    f"coin_precision {coin_precision}"
+                    f"{symbol}: qty_increment {symbol_rules.qty_increment} is not a multiple "
+                    f"of coin_precision {coin_precision}"
                 )
 ```
 
@@ -1114,9 +1123,9 @@ async def test_close_sells_an_off_increment_holding_exactly() -> None:
 
 async def test_close_of_dust_is_rejected_and_the_position_stays() -> None:
     sim = make_sim(fees=BASE)
-    sim.process_bar(bar(0, 100.0))
+    sim.process_bar(bar(0, 20000.0))  # notional 2 >= min_notional 1
     await sim.submit_order(market("buy", "0.0001"))
-    sim.process_bar(bar(1, 100.0))  # net 0.00009975 < min_qty 0.0001
+    sim.process_bar(bar(1, 20000.0))  # net 0.00009975 < min_qty 0.0001
 
     with pytest.raises(OrderRejected, match="dust below minimum"):
         await sim.close_position(BTC)
@@ -1127,7 +1136,7 @@ async def test_close_of_dust_is_rejected_and_the_position_stays() -> None:
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `uv run pytest tests/unit/broker/test_sim.py -k "off_increment or dust" -q`
-Expected: the dust test FAILS: it raises "qty … below minimum quantity" from `_validate`, not "dust below minimum". The off-increment test already passes after Task 3; keep it as the regression for spec §4.
+Expected: the dust test FAILS with `qty 0.00009975 below minimum quantity 0.0001` from `_validate`, not "dust below minimum". The off-increment test already passes after Task 3; keep it as the regression for spec §4.
 
 - [ ] **Step 3: Implement**
 
@@ -1170,7 +1179,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: everything above, plus `autotrader.risk.checks.net_pnl_per_unit(entry, exit_price, fees, exit_slippage_bps) -> Decimal`.
 
-- [ ] **Step 1: Write the tests** (append; add `from autotrader.risk.checks import net_pnl_per_unit` to the imports)
+- [ ] **Step 1: Write the tests** (append; add `from autotrader.risk.checks import net_pnl_per_unit` after the `autotrader.core.types` import)
 
 ```python
 # --- properties (WP 1.R2) ---------------------------------------------------------------
@@ -1230,7 +1239,7 @@ def test_replaying_fills_reproduces_cash_and_positions(
 @given(
     entry=st.decimals(min_value=D("10"), max_value=D("1000"), places=2),
     drop=st.decimals(min_value=D("0.01"), max_value=D("0.10"), places=3),
-    qty_steps=st.integers(min_value=100, max_value=50_000),
+    qty_steps=st.integers(min_value=2_000, max_value=50_000),  # close notional >= 1 at entry 10
     fee_asset=st.sampled_from(["base", "quote"]),
 )
 @settings(max_examples=200, deadline=None)
@@ -1252,7 +1261,7 @@ def test_ioc_buy_then_stop_sale_matches_d16_net_loss(
         await sim.submit_order(ioc_buy(str(qty), str(entry)))
         sim.process_bar(bar(1, float(entry)))  # IOC limit fills at entry, taker, no slip
         await sim.close_position(BTC)
-        sim.process_bar(bar(2, float(stop)))  # market sell at stop × (1 − 10 bps)
+        sim.process_bar(bar(2, float(stop)))  # market sell at stop x (1 - 10 bps)
 
         loss = D("1000000") - sim.cash
         expected = -net_pnl_per_unit(entry, stop, fees, exit_slippage) * qty
@@ -1326,3 +1335,15 @@ git commit -m "docs: WP 1.R2 SimBroker fees and fills
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 Expected: both pytest runs print `0`, and the risk coverage report shows 100 %.
+
+---
+
+## Plan verification (2026-10-12)
+
+Tasks 1-6 were dry-run verbatim in a throwaway worktree before review. Six snippet bugs were found and are fixed above:
+- non-ASCII `−`/`×` in code (RUF002/RUF003);
+- an over-long one-line docstring (E501);
+- a redundant `cast` (mypy `redundant-cast`);
+- the dust test and the D16 property test failing on `min_notional` before reaching their real assertion.
+
+With those fixes, every task's fail step failed for the stated reason. `uv run pytest -q` passed (737), ruff and mypy were clean, and `risk/` had 100 % branch coverage.
