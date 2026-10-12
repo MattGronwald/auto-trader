@@ -1,13 +1,15 @@
 import asyncio
 import io
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from structlog.testing import capture_logs
 
 from autotrader.core.bus import EventBus
 from autotrader.core.feed import (
@@ -62,7 +64,7 @@ class FakeSource:
     def __init__(self, bars: Sequence[Bar] = ()) -> None:
         self.bars = list(bars)
         self.history_calls: list[tuple[tuple[str, ...], datetime, datetime]] = []
-        self.latest_bar_end: dict[str, datetime] = {}
+        self.latest_bar: dict[str, Bar] = {}
         self.latest_quote: dict[str, Quote] = {}
         self.latest_calls = 0
         self.is_connected = True
@@ -82,7 +84,7 @@ class FakeSource:
 
     async def latest(self, symbol: str) -> Latest:
         self.latest_calls += 1
-        return Latest(bar_end=self.latest_bar_end.get(symbol), quote=self.latest_quote.get(symbol))
+        return Latest(bar=self.latest_bar.get(symbol), quote=self.latest_quote.get(symbol))
 
     async def stream(
         self, on_bar: Callable[[Bar], Awaitable[None]], on_quote: Callable[[Quote], Awaitable[None]]
@@ -836,3 +838,204 @@ async def test_quote_and_last_price_include_pending_minutes(
     assert feed.last_price(BTC) == 150
     assert feed.quote(BTC) == q
     assert feed.last_price("ETH/USD") is None
+
+
+# --- bar validation (WP 1.R1a-bars) --------------------------------------------------
+# A NaN close became a NaN last_price and reached indicators and the Scanner; a bad bar
+# was also persisted, resampled and refreshed price age. bar(m) has high 101, low 99.
+
+INVALID_BARS = pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ({"close": NAN}, "non-finite"),
+        ({"high": INF}, "non-finite"),
+        ({"low": -INF}, "non-finite"),
+        ({"volume": NAN}, "non-finite"),
+        ({"open": 0.0}, "non-positive"),
+        ({"low": -1.0}, "non-positive"),
+        ({"volume": -1.0}, "negative volume"),
+        ({"high": 98.0}, "high < low"),
+    ],
+    ids=[
+        "nan-close",
+        "inf-high",
+        "neg-inf-low",
+        "nan-volume",
+        "zero-open",
+        "negative-low",
+        "negative-volume",
+        "inverted-range",
+    ],
+)
+
+
+def bad(minute: int, change: dict[str, float], price: float = 100.0) -> Bar:
+    return bar(minute, price).model_copy(update=change)
+
+
+def rejections(logs: list[MutableMapping[str, Any]]) -> list[tuple[object, object]]:
+    return [(ln["source"], ln["reason"]) for ln in logs if ln["event"] == "feed.bar_rejected"]
+
+
+@INVALID_BARS
+async def test_invalid_stream_bar_is_dropped_and_does_not_refresh(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    announced: list[BarClosed],
+    change: dict[str, float],
+    reason: str,
+) -> None:
+    clock = Clock(T0 + M)
+    feed = make_feed(FakeSource(), sessions, bus, clock)
+    await feed.on_bar(bar(0))
+
+    with capture_logs() as logs:
+        await feed.on_bar(bad(1, change))
+    await bus.drain()
+
+    assert rejections(logs) == [("stream", reason)]
+    assert await bar_count(sessions) == 1
+    assert [e.bar_ts for e in announced] == [T0]
+    assert feed.last_price(BTC) == 100
+    clock.now = T0 + M + 61 * S  # 61 s after the last *valid* bar ended
+    await feed.tick()
+    assert feed.is_stale(BTC)
+
+
+async def test_invalid_late_bar_is_not_persisted(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    clock = Clock(T0 + M)
+    feed = make_feed(FakeSource([bar(0)]), sessions, bus, clock)
+    await feed.on_bar(bar(0))
+    clock.now = T0 + 5 * M + GRACE
+    await feed.tick()
+
+    with capture_logs() as logs:
+        await feed.on_bar(bad(3, {"close": NAN}))
+
+    assert rejections(logs) == [("stream", "non-finite")]
+    assert feed.late_bars == 0
+    assert await bar_count(sessions) == 1
+
+
+async def test_invalid_rest_bar_does_not_replace_the_stream_bar(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    # REST is authoritative only for bars that pass validation.
+    clock = Clock(T0 + M)
+    feed = make_feed(FakeSource([bad(0, {"close": NAN})]), sessions, bus, clock)
+    await feed.on_bar(bar(0, 100))
+
+    clock.now = T0 + 5 * M + GRACE
+    with capture_logs() as logs:
+        await feed.tick()
+
+    assert rejections(logs) == [("rest", "non-finite")]
+    assert "feed.bar_corrected" not in [ln["event"] for ln in logs]
+    (five,) = feed.history(BTC, "5m")
+    assert five.close == 100
+    async with sessions() as s:
+        (stored,) = await repo.get_bars(s, BTC, "1m", since=T0)
+    assert stored.close == 100
+
+
+async def test_invalid_rest_bar_is_not_recovered(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus, announced: list[BarClosed]
+) -> None:
+    # No stream bar for minute 2: the bad REST bar leaves it missing, like a sparse minute.
+    clock = Clock(T0 + M)
+    feed = make_feed(FakeSource([bar(0), bad(2, {"high": 98.0})]), sessions, bus, clock)
+    await feed.on_bar(bar(0))
+
+    clock.now = T0 + 5 * M + GRACE
+    with capture_logs() as logs:
+        await feed.tick()
+    await bus.drain()
+
+    assert rejections(logs) == [("rest", "high < low")]
+    assert await bar_count(sessions) == 1
+    assert [e.bar_ts for e in announced if e.timeframe == "1m"] == [T0]
+    (five,) = feed.history(BTC, "5m")
+    assert (five.high, five.low, five.volume) == (101, 99, 1.0)
+
+
+async def test_backfill_drops_invalid_fetched_bars(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    clock = Clock(T0 + 30 * M + GRACE)
+    fetched = [bar(i, 100 + i) for i in range(29)] + [bad(29, {"close": NAN}, 129)]
+    feed = make_feed(FakeSource(fetched), sessions, bus, clock)
+
+    with capture_logs() as logs:
+        await feed.backfill()
+
+    assert rejections(logs) == [("rest", "non-finite")]
+    assert await bar_count(sessions) == 29
+    assert len(feed.history(BTC, "1m")) == 29
+    assert feed.last_price(BTC) == 128
+
+
+async def test_backfill_ignores_invalid_rows_already_in_the_db(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    # A row persisted before validation existed, for a minute REST no longer serves.
+    async with sessions() as s:
+        await repo.upsert_bars(s, [bad(29, {"close": -1.0}, 129)])
+    clock = Clock(T0 + 30 * M + GRACE)
+    feed = make_feed(FakeSource([bar(i, 100 + i) for i in range(29)]), sessions, bus, clock)
+
+    with capture_logs() as logs:
+        await feed.backfill()
+
+    assert rejections(logs) == [("db", "non-positive")]
+    assert len(feed.history(BTC, "1m")) == 29
+    assert feed.last_price(BTC) == 128
+    await feed.tick()  # minute 28 ended 80 s ago; the bad row must not count as price age
+    assert feed.is_stale(BTC)
+
+
+async def test_invalid_latest_rest_bar_leaves_the_symbol_stale(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    clock = Clock(T0 + M)
+    source = FakeSource()
+    feed = make_feed(source, sessions, bus, clock)
+    await feed.on_bar(bar(0))
+
+    clock.now = T0 + M + 90 * S
+    source.latest_bar[BTC] = bad(1, {"close": NAN})  # would end 30 s ago
+    with capture_logs() as logs:
+        await feed.tick()
+
+    assert rejections(logs) == [("rest", "non-finite")]
+    assert feed.is_stale(BTC)
+
+
+async def test_valid_latest_rest_bar_refreshes_price_age(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    clock = Clock(T0 + M)
+    source = FakeSource()
+    feed = make_feed(source, sessions, bus, clock)
+    await feed.on_bar(bar(0))
+
+    clock.now = T0 + M + 90 * S
+    source.latest_bar[BTC] = bar(1)  # ended 30 s ago
+    await feed.tick()
+
+    assert not feed.is_stale(BTC)
+
+
+async def test_zero_volume_bar_is_accepted(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    # Sparse crypto minutes really do report volume 0.
+    feed = make_feed(FakeSource(), sessions, bus, Clock(T0 + M))
+
+    with capture_logs() as logs:
+        await feed.on_bar(bad(0, {"volume": 0.0}))
+
+    assert rejections(logs) == []
+    assert await bar_count(sessions) == 1
+    assert feed.last_price(BTC) == 100

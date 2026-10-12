@@ -8,11 +8,11 @@ are normal), so a missing minute in the stream can't be told apart from a minute
 without trades. Stream bars are therefore only *pending*: persisted and announced as 1m
 right away, but not resampled. When a window of the smallest higher timeframe is due
 (its end + `grace` has passed), one REST fetch for all symbols covers it. REST is
-authoritative: it adds minutes the stream missed and replaces minutes the stream sent
-differently (persisted, logged as `feed.bar_corrected`, not re-announced). Accepted bars
-from either source update price age, and stale symbols are marked fresh *before* the
-recovered bars and aggregates are announced, so subscribers see the final state. The
-window is then fed to the resampler in order.
+authoritative for valid bars: it adds minutes the stream missed and replaces minutes the
+stream sent differently (persisted, logged as `feed.bar_corrected`, not re-announced).
+Accepted (valid) bars from either source update price age, and stale symbols are marked
+fresh *before* the recovered bars and aggregates are announced, so subscribers see the
+final state. The window is then fed to the resampler in order.
 Higher timeframes are built from these verified minutes, so they are complete too.
 If REST keeps failing, the window is closed from stream data after `unverified_after`
 and logged as `feed.unverified_close`. While disconnected nothing is finalised (no flat
@@ -21,7 +21,7 @@ slips in while a REST request is in flight.
 
 **Health is split (D11).** Feed health is the websocket connection; before the first
 connection the feed is starting up (no event). Per symbol, price age is the time since
-the last bar or quote; past `stale_alert_s` the feed asks REST for the latest bar/quote
+the last valid bar or quote; past `stale_alert_s` the feed asks REST for the latest bar/quote
 (at most once per symbol per `stale_alert_s`) before publishing `SymbolStale`.
 
 **Quotes are validated before use.** A quote from the stream or the REST refresh is
@@ -29,6 +29,15 @@ stored only if bid and ask are finite and > 0, bid <= ask (a locked book is fine
 is not older than the stored one. Anything else is dropped (`feed.quote_rejected`) and
 does not refresh price age, so a feed sending garbage still goes stale. The REST refresh stores
 the quote itself, not just its timestamp, so a symbol never turns fresh on old prices.
+
+**So are bars.** A bar from the stream, verification, backfill (REST fetch and the rows
+already in the DB) or the REST latest-bar refresh is used only if all OHLCV values are
+finite, open/high/low/close > 0, volume >= 0 (0 is a real sparse minute) and high >= low.
+Anything else is dropped (`feed.bar_rejected`) before it is persisted, kept pending,
+announced, resampled or counted as price age. A bad REST bar does not replace a good
+stream bar; with no stream bar its minute stays missing. Open/close outside [low, high]
+is not checked (owner decision 2026-10-12): whether Alpaca's multi-venue crypto bars do
+that is unknown, and rejecting them could drop real minutes.
 
 Backfill always refetches the full G5 window, so holes left in the DB by an earlier run
 heal on restart; it warms history but publishes no events, so the scanner never fires on
@@ -93,7 +102,7 @@ class FeedDisconnected(DomainEvent):
 
 @dataclass(frozen=True)
 class Latest:
-    bar_end: datetime | None  # end (open + 1m) of the latest 1m bar REST knows
+    bar: Bar | None  # latest 1m bar REST knows; validated by the feed before use
     quote: Quote | None
 
 
@@ -219,10 +228,12 @@ class MarketFeed:
         self._finalized_until = bucket_start(now - self._grace, self._window)
         fetched = await self._source.history(self._symbols, start, end)
         async with self._sessions() as session:
-            await repo.upsert_bars(session, fetched)
+            await repo.upsert_bars(session, [b for b in fetched if _valid_bar(b, source="rest")])
         for symbol in self._symbols:
             async with self._sessions() as session:
                 stored = await repo.get_bars(session, symbol, "1m", since=start, until=end)
+            # Rows from a run before bars were validated may still be invalid.
+            stored = [b for b in stored if _valid_bar(b, source="db")]
             for b in stored:
                 self._observe(symbol, b.ts + ONE_MINUTE)
                 if b.ts >= self._finalized_until:
@@ -238,6 +249,8 @@ class MarketFeed:
     # --- live input ------------------------------------------------------------------
 
     async def on_bar(self, bar: Bar) -> None:
+        if not _valid_bar(bar, source="stream"):
+            return
         async with self._lock:
             self._observe(bar.symbol, bar.ts + ONE_MINUTE)
             if bar.ts < self._finalized_until:
@@ -298,9 +311,12 @@ class MarketFeed:
                 verified = []
             # 1. Merge: REST is authoritative within verification. It adds minutes the
             #    stream missed and corrects minutes the stream delivered differently.
-            #    Persisted and price age updated, but nothing announced yet.
+            #    Persisted and price age updated, but nothing announced yet. An invalid
+            #    REST bar is dropped: the stream's version (if any) stays.
             recovered: list[Bar] = []
             for b in verified:
+                if not _valid_bar(b, source="rest"):
+                    continue
                 old = self._pending[b.symbol].get(b.ts)
                 if old is not None and old != b:
                     log.info("feed.bar_corrected", symbol=b.symbol, ts=b.ts.isoformat())
@@ -414,8 +430,8 @@ class MarketFeed:
         except Exception:
             log.exception("feed.rest_refresh_failed", symbol=symbol)
             return
-        if latest.bar_end is not None:
-            self._observe(symbol, latest.bar_end)
+        if latest.bar is not None and _valid_bar(latest.bar, source="rest"):
+            self._observe(symbol, latest.bar.ts + ONE_MINUTE)
         if latest.quote is not None:
             self._accept_quote(latest.quote, source="rest")
 
@@ -431,3 +447,36 @@ class MarketFeed:
             )
             self._density.clear()
             self._density_hour = hour
+
+
+def _bar_problem(bar: Bar) -> str | None:
+    """Why `bar` is unusable, or None. Non-finite first: NaN fails every comparison."""
+    if not all(math.isfinite(v) for v in (bar.open, bar.high, bar.low, bar.close, bar.volume)):
+        return "non-finite"
+    if min(bar.open, bar.high, bar.low, bar.close) <= 0:
+        return "non-positive"
+    if bar.volume < 0:
+        return "negative volume"
+    if bar.high < bar.low:
+        return "high < low"
+    return None
+
+
+def _valid_bar(bar: Bar, *, source: str) -> bool:
+    """Gate for every bar entering the feed; logs `feed.bar_rejected` for bad ones."""
+    reason = _bar_problem(bar)
+    if reason is None:
+        return True
+    log.info(
+        "feed.bar_rejected",
+        symbol=bar.symbol,
+        source=source,
+        reason=reason,
+        ts=bar.ts.isoformat(),
+        open=bar.open,
+        high=bar.high,
+        low=bar.low,
+        close=bar.close,
+        volume=bar.volume,
+    )
+    return False
