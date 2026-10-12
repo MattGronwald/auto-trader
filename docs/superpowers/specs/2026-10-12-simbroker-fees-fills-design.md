@@ -1,6 +1,9 @@
 # SimBroker fees and fills design (WP 1.R2)
 
 Date: 2026-10-12. Status: approved in conversation (sections 1 and 2), pending written-spec review.
+Revised 2026-10-12 after the PR #21 spec review: coin-fee floor (no zero or negative
+receipts), per-execution rounding bound, split order-view and fill-identity tests,
+delayed delivery versus a cancel/fill race.
 Sources: SPEC §4.6; PLAN 1.R2, §3.2 items 3 and 5, G10, D10, D16; `docs/alpaca-notes.md`
 (G10, asset rules, fee check steps 1 and 2).
 
@@ -18,9 +21,12 @@ Done means:
 - Tests can script partial fills, IOC partial cancels, multi-bar fills, fill-time
   rejections and redelivered (duplicate) fills deterministically.
 - Reservations (cash, sell qty) account for partially filled orders.
-- With either fee asset, the simulator's cash flows for a buy followed by a stop sale match
-  `risk.checks.net_pnl_per_unit`, exactly apart from the coin-fee round-up (bounded by
-  `coin_precision × price`), so D16 sizing is verified against the simulator.
+- For a single-execution buy followed by a stop sale under D16's assumptions (§3), the
+  simulator's cash flows match `risk.checks.net_pnl_per_unit`. The match is exact for
+  `"quote"`. For `"base"` the only difference is the coin-fee round-up of that one
+  execution, at most one `coin_precision` of coin. D16 sizing is thereby verified against
+  the simulator. Multi-slice buys round each slice's fee separately (§5): N buy slices add
+  less than `N × coin_precision` coin of fee in total.
 - All existing behaviour of unscripted orders is unchanged; `risk/` keeps 100 % branch
   coverage.
 
@@ -63,6 +69,18 @@ average price of all fills of the order.
 qty precision, `docs/alpaca-notes.md` asset rules). It is separate from
 `AssetRules.qty_increment`: rounding a fee up to a test increment such as `0.001` would
 inflate it by orders of magnitude.
+
+**No zero or negative coin receipts** (added after the PR #21 review). A rounded-up fee can
+swallow a tiny buy: at `q = 1e-9`, `r = 0.0025` the fee rounds to `1e-9` and no coin is
+received; with `q = 1e-10` (an increment finer than the precision) it would be negative.
+- At construction, every symbol's `qty_increment` must be a multiple of `coin_precision`,
+  otherwise `SimBroker` raises `ValueError`. No order or slice can then be below one
+  quantum.
+- A `"base"` buy fill (whole order or slice) whose rounded fee is `≥ q` is rejected before
+  any state changes: the order ends `rejected` with reason
+  `"fill too small for coin fee"`, and earlier fills are kept. Every applied `"base"` buy
+  therefore adds a strictly positive net qty, and the weighted average never divides by
+  zero.
 
 Let `r` be the fee rate (taker or maker, as today: market and IOC limit pay taker, GTC
 limit pays maker), `q` the gross fill qty and `p` the fill price.
@@ -135,7 +153,9 @@ sim.redeliver(fill_id)                                                 # same Fi
 - **Prices are unchanged.** A plan only reduces or ends filling: a limit the bar does not
   trade through fills nothing, and that bar consumes no step.
 - Each slice is cash-checked at fill like a whole order today. A slice that no longer fits
-  ends the order `rejected` ("insufficient cash at fill") with earlier fills kept.
+  ends the order `rejected` ("insufficient cash at fill") with earlier fills kept. A
+  `"base"` buy slice too small for its rounded coin fee ends it `rejected` ("fill too
+  small for coin fee") the same way (§3).
 - Each slice emits its own `Fill` on `stream_fills`, with `fill_id = "{order_id}:{n}"`, the
   bar's `ts`, and its own fee.
 - `redeliver(fill_id)` puts the identical `Fill` back on the stream. Unknown ids raise
@@ -167,8 +187,12 @@ sim.redeliver(fill_id)                                                 # same Fi
 ## 8. Out of scope
 
 - Volume-based partial fills (WP 1.7, if needed).
-- A fill arriving after a cancel request has been sent (1.5/1.8 can script it with a plan
-  and a `cancel_order` between bars).
+- An execution that happens *after* a cancel request (a cancel/fill race). `cancel_order`
+  is final in the simulator, so no plan can produce it; 1.5/1.8 test it with a
+  controllable fake broker. What the simulator does support is **delayed delivery**: a
+  fill executed before the cancel stays queued on `stream_fills` and can be read after
+  `cancel_order` returns. `redeliver` repeats an existing fill and never creates a new
+  execution.
 - Cash rounding to cents (owner decision above).
 - Alpaca behaviour for sells below `min_order_size` (WP 1.6, paper check).
 - Persisting fills (`fills` table, `broker_fill_id`): WP 1.5.
@@ -186,12 +210,23 @@ TDD in `tests/unit/broker/test_sim.py` unless noted.
   `partially_filled`, `partially_filled`, `filled`; `"reject"` and `"cancel"` keep earlier
   fills; an unscripted order after a consumed plan fills fully; a non-crossing limit bar
   consumes no step; FIFO matching per `(symbol, side)`.
-- Fill identity: ids unique and stable across `get_order`/stream; `redeliver` yields an
-  identical `Fill`; unknown id raises.
+- Order view (`get_order`): cumulative `filled_qty`, qty-weighted `avg_fill_price`, and
+  the order linkage (`Fill.order_id` equals the acked `order_id`). `OrderStatus` carries no
+  fill ids; no fill-history lookup is added here (lookup interfaces are WP 1.5).
+- Fill identity (`stream_fills`): `fill_id`s are unique across orders and slices and are
+  unchanged on redelivery; `redeliver` yields an identical `Fill`; an unknown id raises.
+- Coin-fee floor: a SimBroker with a `qty_increment` that is not a multiple of
+  `coin_precision` raises; a `"base"` slice whose rounded fee is `≥ q` ends the order
+  `rejected` ("fill too small for coin fee") with earlier fills, cash and positions
+  unchanged.
 - Reservations: partial sell + `close_position` never oversells; partial buy releases cash
   on cancel; fill-time cash failure of a later slice.
-- Property tests (hypothesis): conservation for both fee assets with random fill plans;
-  D16 cross-check against `net_pnl_per_unit`.
+- Property tests (hypothesis): conservation for both fee assets with random fill plans
+  (exact replay of the emitted fills); D16 cross-check against `net_pnl_per_unit` for a
+  single IOC buy and a market stop sale with `slippage_bps = exit_slippage_bps`, exact
+  for `"quote"` and within one `coin_precision` of coin for `"base"`. Any multi-slice
+  comparison against the unrounded formula uses a tolerance of
+  `N_buy_slices × coin_precision × price`.
 - `tests/unit/risk/test_engine.py`: `_refresh_open_entries` keeps `partially_filled` open
   and records it; existing tests green; `risk/` 100 % branch coverage.
 - `tests/unit/journal`: `partially_filled` round-trips through `orders.status`.
