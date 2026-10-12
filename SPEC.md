@@ -192,7 +192,7 @@ Entries are **IOC marketable limits without brackets**. Alpaca crypto has no bra
 
 The engine journals `pending` **before** submit/close, records ambiguous outcomes as `unknown`, and records `not_submitted` only when the request is known not to have been sent. A timeout or lost acknowledgement is not proof of failure. WP 1.5–1.6 must reconcile orders independently of cycle state before releasing reservations or retrying exits; see PLAN §3.2.
 
-**Review follow-up (not yet implemented):** PLAN 1.R1/1.R5 require independent validation of bid/ask order and timestamped market inputs at the Risk Engine boundary. `exit()` must gather only position/mode/rules needed for a close, without consulting the market feed: today its shared `_held_positions()` still calls feed accessors, and a raised feed exception can reject a protective exit. 1.R3/1.R5 must also block re-entry into a symbol with an unresolved close that could affect a new position. The current `risk_per_trade_pct` formula limits nominal price-distance loss only; fees and gaps can exceed it. The owner has approved including estimated entry/exit fees and a human-configured adverse exit-slippage allowance in that sizing budget (PLAN D16/1.R5). The new net-loss formula must respect fee denomination, round down and preserve the cash/position/exposure caps; actual gaps can still exceed the estimate. This is a required follow-up, not the behavior of WP 1.3 today.
+**Review follow-up (not yet implemented; scope confirmed by owner 2026-10-11, appended 2026-10-12):** PLAN 1.R1 rejects crossed/non-positive quotes, stores REST quote values, ignores out-of-order WS quotes and removes feed access from exits. Today `exit()` shares `_held_positions()` with entries, so a raised feed exception can reject a protective exit. WP 1.6 adds source-specific freshness/snapshot-age validation at the Risk Engine boundary, including prices for held exposure, and blocks re-entry into a symbol with an unresolved close. WP 1.5 owns durable order/fill handoff and local runtime liveness. The current `risk_per_trade_pct` formula limits nominal price-distance loss only; fees and gaps can exceed it. Owner-approved D16 / 1.R1 changes it to estimated net loss at stop including entry/exit fees and **`risk.exit_slippage_bps`, a human-only adverse exit allowance with initial/default value 10 bps** (finite, `0 ≤ value < 10_000`). It is separate from entry slippage. Implement the schema, profile comment/value and resulting profile hash together in 1.R1. PLAN §3.1 specifies fee-denomination-aware cash flows, rounding down and preservation of cash/position/exposure caps; actual gaps can still exceed the estimate. These are required follow-ups, not WP 1.3 behavior today.
 
 `RiskLimits` is loaded from the strategy profile and **cannot be changed by the Learning Loop**. Only a human edits it (dashboard with confirmation, or config file + restart).
 
@@ -298,7 +298,7 @@ agents:
   exit_review: { enabled: false }
 
 risk:                                         # HUMAN-EDITABLE ONLY. Learning loop cannot touch this block.
-  risk_per_trade_pct: 1.0                     # current nominal price-loss budget; see 1.R5
+  risk_per_trade_pct: 1.0                     # current nominal price-loss budget; see D16 / 1.R1
   max_position_pct: 30
   max_positions: 2
   max_gross_exposure_pct: 60
@@ -455,22 +455,42 @@ auto-trader/
 Each phase has a definition of done. Do not start the next phase before the current one's DoD is met. A merged WP is not evidence of its phase's paper observation gate: record the commit/profile hash, configuration, dates and validation artifacts. Current phase status is in PLAN §3.
 
 ### Phase 0 — Skeleton
+
+**Historical v1 estimate:** 1–2 days. Preserved as planning history, not a revised delivery commitment.
+
 - Repo, tooling, config loading, DB schema + migrations (alembic), event bus, structured logging, kill-switch, `SimBroker`, Alpaca paper adapter with account/positions read.
 - DoD: `cli run core` starts, connects to Alpaca paper, streams bars for the universe, persists 1m bars, responds to `KILL` file. Tests green.
 
 ### Phase 1 — Deterministic loop without LLM
+
+**Historical v1 estimate:** 2–3 days. Preserved as planning history, not a revised delivery commitment.
+
 - Indicators, Scanner with rule engine, Risk Engine, Position Manager, Cycle Runner with a **stub Decision Maker** (rule-based: BUY with fixed stop/TP if score > threshold).
+
+**Original v1 DoD (preserved history):** paper trades flow end to end; every cycle fully audited in DB; signal backtest CLI reports forward returns per rule; Risk Engine has 100 % branch coverage in unit tests; reconciliation works.
+
+**Revised DoD approved by owner 2026-10-11; appended 2026-10-12:**
+
 - DoD: paper entries, partial fills and full exits flow end to end with durable stop/TP/time metadata; every cycle/order is audited; restart, kill/late-fill and duplicate-fill recovery pass; signal backtest CLI reports returns and fee/data-quality diagnostics per rule; Risk Engine retains 100 % branch coverage; unresolved reconciliation discrepancies block new entries. Broker-writing smoke tests require an explicitly selected paper account. WP 1.4 alone does not satisfy this gate.
 
 ### Phase 2 — Agents
+
+**Historical v1 estimate:** 2–3 days. Preserved as planning history, not a revised delivery commitment.
+
 - Agent runner with structured outputs, cost meter, Technical Analyst + Decision Maker, prompts v1, budget enforcement, recorded-fixture tests.
 - DoD: real LLM decisions in paper mode; per-call/per-cycle costs visible, including rejected/no-trade cycles; daily cost stays within budget over 3 consecutive days; no cycle exceeds `llm_usd_per_cycle_max`. Concurrent-call, retry, timeout/unknown-usage and restart tests prove reservations cannot overspend the cap.
 
 ### Phase 3 — Journal & Dashboard
+
+**Historical v1 estimate:** 3–5 days. Preserved as planning history, not a revised delivery commitment.
+
 - Metrics (R, MAE/MFE, benchmark, cost attribution), equity snapshots, API, dashboard views 1–3 and 6, WebSocket live feed.
 - DoD: you can watch a cycle happen live, see cost and P&L, pause/flatten/kill from the UI, from your phone.
 
 ### Phase 4 — Learning Loop
+
+**Historical v1 estimate:** 3–5 days. Preserved as planning history, not a revised delivery commitment.
+
 - Journal Reviewer, hypothesis registry, evidence computation, active-learnings injection, dashboard views 4–5, `propose_only` mode.
 - DoD: 2 weeks of nightly reviews; at least one hypothesis with n ≥ 20; promote/retire works and is reflected in the next day's prompts; `learnings_applied` is populated and attributable.
 
@@ -480,6 +500,7 @@ Preconditions, all required:
 - Paper expectancy after fees **and LLM cost** > 0 over the window (not required to beat benchmark — but if it loses to buy-and-hold by a wide margin, reconsider the whole thing honestly).
 - LLM cost < 1 % of equity per day.
 - Alpaca live crypto verified available for German residents and account funded; otherwise Kraken adapter implemented and paper-tested for ≥ 2 weeks.
+- WP 3.5 persistent journal account/mode binding, cash-flow discontinuity detection and Postgres ownership/recovery pass their acceptance tests before live.
 - Runtime moved to an always-on host (Hetzner VPS or similar) with Docker Compose, Postgres, backups of the DB, alerting (at least: feed down, broker error, daily loss limit, drawdown pause, kill triggered) via a push channel (ntfy/Telegram/Slack).
 - Live risk limits set *tighter* than paper for the first 2 weeks (e.g. `risk_per_trade_pct: 0.5`, `max_positions: 1`), with `kill.flatten = true`.
 - Mode switch to live requires: env var `ALLOW_LIVE=1`, dashboard two-step confirm, and a logged `ModeChanged` event with operator note.
@@ -500,7 +521,7 @@ Preconditions, all required:
 - Dashboard not internet-exposed (localhost / Tailscale). Bearer token.
 - Prompt injection: the Context Analyst (when enabled) consumes third-party text. Its output schema is narrow (numbers + enums + short strings) and it has no tool access; the Decision Maker treats it as data. No agent output is ever executed or used to construct prompts for other agents without schema validation.
 - Dependency pinning, `pip-audit` in CI.
-- One core process per journal and one journal per broker account/mode. Enforce ownership/account binding before broker-writing operation (WP 1.5–1.6); on restart resolve the previous writer's transactions before admitting entries. Postgres locking, query deadlines and recovery need real Postgres tests in WP 3.5, not only SQLite tests or DDL compilation.
+- One core process per journal and one dedicated paper account/journal in Phase 1. WP 1.5 enforces a process-held local single-writer lock; restart resolves the previous writer's SQLite work before admitting entries. WP 3.5 / the Phase 5 gate adds persistent account/mode binding, cash-flow discontinuity detection and Postgres ownership/recovery. Postgres locking and query deadlines require real Postgres tests, not only SQLite tests or DDL compilation.
 
 ---
 
@@ -529,7 +550,7 @@ Requested by the owner during the 2026-10-11 review. **These are candidate requi
 |---|---|---|---|
 | Universe | BTC/USD, ETH/USD, SOL/USD | BTC/USD initially | Recorded venue coverage is strongest for BTC. Reintroduce ETH/SOL only with adequate quote/bar coverage and executable net results, assessed separately. Concentrating in BTC is not diversification. |
 | Signal timeframe | 5m | Compare 15m against 5m; retain 1h context / 4h trend | Larger price moves may better absorb roughly 50 bps round-trip fees. It is a hypothesis, not a reason to assume 15m ATR or trade frequency is sufficient. |
-| Nominal per-trade risk setting | 1.0% | 0.5%, with the fee/slippage sizing decision in PLAN 1.R5 | Lower paper/live pilot exposure while execution and recovery mature. Report both nominal and estimated net loss; market gaps cannot be capped by a client-side stop. |
+| Nominal per-trade risk setting | 1.0% | 0.5%, with the fee/slippage sizing decision in PLAN D16 / 1.R1 | Lower paper/live pilot exposure while execution and recovery mature. Report both nominal and estimated net loss; market gaps cannot be capped by a client-side stop. |
 | Position / gross exposure | 2 positions; 30% each; 60% gross | 1 position; 25% each/gross | Simpler initial operating envelope; assess return and fixed-cost burden at the smaller notional. |
 | LLM spend | $3/day; $0.10/cycle | Evaluate $0.50/day; $0.05/cycle | At roughly $1,000, $3/day consumes about 9% of equity per 30 days before trading fees; $0.50/day still consumes about 1.5%. Provider-price verification must establish whether the intended calls fit; if not, reduce call scope/frequency and report the trade-off rather than silently exceed limits. |
 | Volume filter | Global `min_vol_z: 0.5` plus rule conditions | Compare the existing filter with a rule-specific filter for pullbacks | The current global filter also suppresses the pullback rule even though that rule has no volume clause. Any variant requires a schema/Scanner change in its own WP, and a recorded ablation; do not assume removing the filter improves results. |
