@@ -33,7 +33,7 @@ class StreamingSource:
         return []
 
     async def latest(self, symbol: str) -> Latest:
-        return Latest(bar_end=None, quote_ts=None)
+        return Latest(bar_end=None, quote=None)
 
     async def stream(
         self, on_bar: Callable[[Bar], Awaitable[None]], on_quote: Callable[[Quote], Awaitable[None]]

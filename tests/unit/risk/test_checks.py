@@ -51,7 +51,6 @@ MARKET = MarketSnapshot(
     last_trade=D("100"),
     bid=D("99.98"),
     ask=D("100"),
-    spread_bps=D("2"),
     atr=D("2"),
     stale=False,
     rules=RULES,
@@ -115,10 +114,14 @@ def test_base_case_is_approved_as_marketable_ioc_limit() -> None:
         # 2 market
         ({"intent": {"symbol": "DOGE/USD"}}, "universe"),
         ({"market": {"stale": True}}, "stale"),
-        ({"market": {"spread_bps": None}}, "quote"),
-        ({"market": {"ask": None}}, "quote"),
-        ({"market": {"last_trade": None}}, "quote"),
-        ({"market": {"spread_bps": D("15.01")}}, "spread"),
+        ({"market": {"bid": None}}, "no quote"),
+        ({"market": {"ask": None}}, "no quote"),
+        ({"market": {"last_trade": None}}, "no quote"),
+        ({"market": {"bid": D("100.01")}}, "invalid quote"),  # crossed
+        ({"market": {"bid": D("0")}}, "invalid quote"),
+        ({"market": {"bid": D("-1"), "ask": D("-0.5")}}, "invalid quote"),
+        ({"market": {"last_trade": D("0")}}, "invalid quote"),
+        ({"market": {"bid": D("99.92"), "ask": D("100.075")}}, "spread"),  # 15.5 bps
         # 5 positions
         ({"portfolio": {"positions": (held(BTC),)}}, "already"),
         ({"portfolio": {"open_entries": (OpenEntry(symbol=BTC, notional=D("1")),)}}, "already"),
@@ -148,7 +151,8 @@ def test_entry_rejections_checks_1_to_6(kwargs: dict[str, Any], reason: str) -> 
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"market": {"spread_bps": D("15")}},  # at the limit
+        {"market": {"bid": D("99.925"), "ask": D("100.075")}},  # exactly 15 bps: at the limit
+        {"market": {"bid": D("100"), "ask": D("100")}},  # locked book: spread 0 is valid
         {"intent": {"stop": D("98.5")}},  # d = 1.6 = 0.8 x ATR
         # d = 6.0 = 3.0 x ATR; tp 120 keeps expectancy positive once Task 5 adds check 11
         {"intent": {"stop": D("94.1"), "take_profit": D("120")}},
@@ -325,7 +329,7 @@ def test_sizing_invariants() -> None:
                 "size_fraction": fraction,
             },
             portfolio={"equity": equity, "cash": cash, "day_start_equity": equity, "hwm": equity},
-            market={"ask": ask, "last_trade": ask, "atr": atr},
+            market={"bid": ask - D("0.01"), "ask": ask, "last_trade": ask, "atr": atr},
         )
         if not d.approved:
             return

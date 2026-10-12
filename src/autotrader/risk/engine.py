@@ -65,7 +65,6 @@ class RiskMarketView(Protocol):
     def quote(self, symbol: str) -> Quote | None: ...
     def last_price(self, symbol: str) -> float | None: ...
     def is_stale(self, symbol: str) -> bool: ...
-    def spread_bps(self, symbol: str) -> float | None: ...
 
 
 class Gate(Protocol):
@@ -231,7 +230,6 @@ class RiskEngine:
             last_trade=_dec(self._market.last_price(symbol)),
             bid=_dec(quote.bid if quote else None),
             ask=_dec(quote.ask if quote else None),
-            spread_bps=_dec(self._market.spread_bps(symbol)),
             atr=_dec(atr),
             stale=self._market.is_stale(symbol),
             rules=rules,
@@ -261,29 +259,40 @@ class RiskEngine:
                     await repo.update_order(session, row_id, status=new_status, now=self._clock())
         return still_open
 
-    async def _held_positions(
+    async def _broker_positions(
         self, deadline: float, symbol: str | None = None
     ) -> tuple[HeldPosition, ...]:
-        """Held positions with prices and rules. `symbol` narrows the (per-symbol REST)
-        lookups to one asset, so an exit depends on nothing unrelated. `market_value` is
-        None without a fresh feed price (never the cost basis): check 8 then rejects."""
+        """Held positions from the broker alone, unpriced (`market_value` None). This is
+        all an exit reads: no feed access, so a broken feed can't block a protective
+        exit. `symbol` narrows the (per-symbol REST) rules lookups to one asset, so an
+        exit depends on nothing unrelated either."""
         held = []
         for p in await self._within(deadline, self._broker.get_positions):
             if symbol is not None and p.symbol != symbol:
                 continue
-            price = _dec(self._market.last_price(p.symbol))
-            fresh = price is not None and not self._market.is_stale(p.symbol)
             rules = await self._within(deadline, partial(self._broker.asset_rules, p.symbol))
             held.append(
                 HeldPosition(
                     symbol=p.symbol,
                     qty=p.qty,
-                    market_value=p.qty * price if fresh and price is not None else None,
+                    market_value=None,
                     avg_entry_price=p.avg_entry_price,
                     min_qty=rules.min_qty,
                 )
             )
         return tuple(held)
+
+    async def _held_positions(self, deadline: float) -> tuple[HeldPosition, ...]:
+        """Broker positions priced from the feed, for entries and snapshots.
+        `market_value` stays None without a fresh feed price (never the cost basis):
+        check 8 then rejects."""
+        priced = []
+        for p in await self._broker_positions(deadline):
+            price = _dec(self._market.last_price(p.symbol))
+            if price is not None and not self._market.is_stale(p.symbol):
+                p = p.model_copy(update={"market_value": p.qty * price})
+            priced.append(p)
+        return tuple(priced)
 
     async def _within(self, deadline: float, call: Callable[[], Awaitable[T]]) -> T:
         """Run `call` in what is left of the section's budget; a spent budget raises
@@ -361,7 +370,7 @@ class RiskEngine:
             deadline = self._monotonic() + self._io_timeout
             now = self._clock()
             try:
-                held = await self._held_positions(deadline, request.symbol)
+                held = await self._broker_positions(deadline, request.symbol)
             except Exception as e:  # fail closed: unknown positions must not size an exit
                 log.exception("risk.exit_state_unavailable", symbol=request.symbol)
                 decision = RiskDecision(

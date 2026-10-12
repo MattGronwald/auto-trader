@@ -42,6 +42,11 @@ class _Stream(Protocol):
     async def stop_ws(self) -> None: ...
 
 
+def _quote(symbol: str, raw: dict[str, Any]) -> Quote:
+    """Stream and REST share `t`, `bp`, `ap`; REST keys each quote by symbol instead of `S`."""
+    return Quote(symbol=symbol, ts=_ts(raw["t"]), bid=raw["bp"], ask=raw["ap"])
+
+
 def _ts(value: Any) -> datetime:
     """REST sends ISO strings, the stream msgpack Timestamps."""
     if isinstance(value, str):
@@ -121,7 +126,7 @@ class AlpacaBarSource:
         quote = quote_raw.get(symbol)
         return Latest(
             bar_end=_ts(bar["t"]) + ONE_MINUTE if bar else None,
-            quote_ts=_ts(quote["t"]) if quote else None,
+            quote=_quote(symbol, quote) if quote else None,
         )
 
     async def stream(
@@ -137,9 +142,7 @@ class AlpacaBarSource:
 
         async def handle_quote(raw: dict[str, Any]) -> None:
             try:
-                await on_quote(
-                    Quote(symbol=raw["S"], ts=_ts(raw["t"]), bid=raw["bp"], ask=raw["ap"])
-                )
+                await on_quote(_quote(raw["S"], raw))
             except Exception:
                 log.exception("alpaca_stream.quote_handler_failed", symbol=raw.get("S"))
 

@@ -59,10 +59,17 @@ def check_entry(
         return _reject(f"{intent.symbol} not in universe")
     if market.stale:
         return _reject("symbol stale")
-    if market.spread_bps is None or market.ask is None or market.last_trade is None:
+    bid, ask, last_trade = market.bid, market.ask, market.last_trade
+    if bid is None or ask is None or last_trade is None:
         return _reject("no quote or last trade")
-    if market.spread_bps > profile.scanner.max_spread_bps:
-        return _reject(f"spread {market.spread_bps} bps > {profile.scanner.max_spread_bps}")
+    # Second line behind the feed's own filter: never size off a crossed or empty book.
+    # A locked book (bid == ask) is a valid price.
+    if bid <= 0 or ask <= 0 or last_trade <= 0 or bid > ask:
+        return _reject(f"invalid quote: bid {bid}, ask {ask}, last trade {last_trade}")
+    # Derived here from the same bid/ask, so the spread can't disagree with the prices.
+    spread_bps = (ask - bid) / ((ask + bid) / 2) * _BPS
+    if spread_bps > profile.scanner.max_spread_bps:
+        return _reject(f"spread {spread_bps:.2f} bps > {profile.scanner.max_spread_bps}")
     # 3. daily loss
     loss = portfolio.day_start_equity - portfolio.equity
     if loss >= limits.max_daily_loss_pct / _PCT * portfolio.day_start_equity:
@@ -79,7 +86,7 @@ def check_entry(
     if len(busy) >= limits.max_positions:
         return _reject(f"{len(busy)} positions/open entries >= max_positions")
     # 6. stop
-    entry = entry_limit(market.ask, limits.entry_slippage_bps, market.rules.price_increment)
+    entry = entry_limit(ask, limits.entry_slippage_bps, market.rules.price_increment)
     if market.atr is None:
         return _reject("ATR unavailable")
     if intent.stop >= entry:
@@ -90,7 +97,7 @@ def check_entry(
             f"stop distance {distance} outside {limits.min_stop_atr}-"
             f"{limits.max_stop_atr} x ATR {market.atr}"
         )
-    return _size_and_finish(intent, portfolio, market, profile, entry, distance, market.last_trade)
+    return _size_and_finish(intent, portfolio, market, profile, entry, distance, last_trade)
 
 
 def _size_and_finish(

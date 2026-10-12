@@ -34,7 +34,7 @@ async def test_latest_bar_and_quote(source: AlpacaBarSource) -> None:
     latest = await source.latest("BTC/USD")
 
     assert latest.bar_end is not None
-    assert latest.quote_ts is not None
+    assert latest.quote is not None and latest.quote.symbol == "BTC/USD"
 
 
 async def test_stream_connects(source: AlpacaBarSource) -> None:

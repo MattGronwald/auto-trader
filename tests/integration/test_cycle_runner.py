@@ -77,9 +77,6 @@ class View:
     def is_stale(self, symbol: str) -> bool:
         return False
 
-    def spread_bps(self, symbol: str) -> float | None:
-        return 2.0 if symbol == BTC else None
-
 
 def candidate() -> CandidateSignal:
     return CandidateSignal(

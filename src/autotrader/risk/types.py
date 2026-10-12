@@ -36,8 +36,8 @@ class ExitRequest(_Frozen):
 class HeldPosition(_Frozen):
     symbol: str
     qty: Dec
-    # qty x the feed's last price; None when the feed has no price or the symbol is stale.
-    # Entries then fail closed (check 8); exits never look at it.
+    # qty x the feed's last price; None when the feed has no price or the symbol is stale,
+    # and always None for exits, which read the broker only. Entries fail closed (check 8).
     market_value: Dec | None
     avg_entry_price: Dec  # cost basis: informational exposure estimate only, never a limit
     min_qty: Dec  # below it the position is dust: unsellable, ignored by the checks
@@ -69,7 +69,6 @@ class MarketSnapshot(_Frozen):
     last_trade: Dec | None
     bid: Dec | None
     ask: Dec | None
-    spread_bps: Dec | None
     atr: Dec | None
     stale: bool
     rules: AssetRules
