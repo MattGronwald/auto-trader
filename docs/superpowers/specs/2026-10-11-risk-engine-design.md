@@ -71,6 +71,9 @@ An approved decision lists which cap bound the size (`adjusted["bound_by"]`).
 1. **Control and mode.** `ControlStatus.entries_allowed`; `AppConfig.mode == broker.mode()`.
 2. **Market.** Symbol in the profile universe; not stale; `spread_bps ≤
    scanner.max_spread_bps`. Unknown spread rejects.
+   *Update 2026-10-12 (WP 1.R1a):* bid, ask and last trade must be > 0 with bid ≤ ask
+   (crossed rejects, locked is valid). `spread_bps` is no longer a `MarketSnapshot` field;
+   `check_entry` derives it from that bid/ask.
 3. **Daily loss.** Reject if `day_start_equity − equity ≥ max_daily_loss_pct ×
    day_start_equity`. Side effect `until_next_day`: the engine sets
    `control_state.paused_until` to the next trading-day start in `trading_day_tz` (D5, D13).
@@ -116,6 +119,8 @@ Approve if the broker reports a non-dust position in the symbol and the mode mat
 Nothing else: no gate, no pause, no rate limit (G1). The resulting action is the broker's
 `close_position(symbol)`, which sells exactly what the broker holds; this avoids the
 fee-reduced quantity of G10 and precision mismatches. Partial exits are out of scope.
+*Update 2026-10-12 (WP 1.R1a):* `exit()` reads positions from the broker only
+(`_broker_positions`, unpriced) and never touches the feed, so a broken feed can't block it.
 
 ## 6. Engine flow (`risk/engine.py`)
 

@@ -85,8 +85,21 @@ class FakeView:
     def is_stale(self, symbol: str) -> bool:
         return self.stale or symbol in self.stale_symbols
 
-    def spread_bps(self, symbol: str) -> float | None:
-        return None if self.q is None else (self.q.ask - self.q.bid) / self.q.ask * 10_000
+
+class BrokenView(FakeView):
+    """Every feed accessor raises: the feed object itself is broken."""
+
+    def history(self, symbol: str, timeframe: str) -> list[Bar]:
+        raise RuntimeError("feed broken")
+
+    def quote(self, symbol: str) -> Quote | None:
+        raise RuntimeError("feed broken")
+
+    def last_price(self, symbol: str) -> float | None:
+        raise RuntimeError("feed broken")
+
+    def is_stale(self, symbol: str) -> bool:
+        raise RuntimeError("feed broken")
 
 
 class Clock:
@@ -663,6 +676,23 @@ async def test_exit_state_failure_rejects(
     (dec,) = await decisions(sessions)
     assert (dec.kind, dec.approved, dec.cycle_id) == ("exit", False, None)
     assert await orders(sessions) == []
+
+
+async def test_exit_needs_no_feed_but_entries_fail_closed_without_one(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    # exit() priced the held positions through the feed, so a broken feed accessor made a
+    # protective exit fail as "state unavailable".
+    await _held_btc(sim)
+    engine = make_engine_(sim, sessions, gate, view=BrokenView())
+
+    entry = await engine.check(intent(cycle_id))
+    assert entry.decision.reasons == ("state unavailable: RuntimeError",)
+    exited = await engine.exit(ExitRequest(symbol=BTC, reason="stop"))
+
+    assert exited.decision.approved and exited.status == "new"
+    (row,) = await orders(sessions)
+    assert (row.symbol, row.side, row.qty) == (BTC, "sell", D("1"))
 
 
 async def test_exit_does_not_depend_on_unrelated_positions(

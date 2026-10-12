@@ -24,6 +24,12 @@ connection the feed is starting up (no event). Per symbol, price age is the time
 the last bar or quote; past `stale_alert_s` the feed asks REST for the latest bar/quote
 (at most once per symbol per `stale_alert_s`) before publishing `SymbolStale`.
 
+**Quotes are validated before use.** A quote from the stream or the REST refresh is
+stored only if bid > 0, ask > 0 and bid <= ask (a locked book is fine), and it is not older
+than the stored one. Anything else is dropped (`feed.quote_rejected`) and does not
+refresh price age, so a feed sending garbage still goes stale. The REST refresh stores
+the quote itself, not just its timestamp, so a symbol never turns fresh on old prices.
+
 Backfill always refetches the full G5 window, so holes left in the DB by an earlier run
 heal on restart; it warms history but publishes no events, so the scanner never fires on
 old bars. Hourly per-symbol bar counts are logged (`feed.density`).
@@ -87,7 +93,7 @@ class FeedDisconnected(DomainEvent):
 @dataclass(frozen=True)
 class Latest:
     bar_end: datetime | None  # end (open + 1m) of the latest 1m bar REST knows
-    quote_ts: datetime | None
+    quote: Quote | None
 
 
 class BarSource(Protocol):
@@ -251,9 +257,8 @@ class MarketFeed:
         await self._mark_fresh(bar.symbol)
 
     async def on_quote(self, quote: Quote) -> None:
-        self._quotes[quote.symbol] = quote
-        self._observe(quote.symbol, quote.ts)
-        await self._mark_fresh(quote.symbol)
+        if self._accept_quote(quote, source="stream"):
+            await self._mark_fresh(quote.symbol)
 
     async def tick(self) -> None:
         """Run every ~second: connection state, verified finalising, staleness, density."""
@@ -338,6 +343,30 @@ class MarketFeed:
     def _append(self, bar: Bar) -> None:
         self._history.setdefault((bar.symbol, bar.timeframe), deque()).append(bar)
 
+    def _accept_quote(self, quote: Quote, *, source: str) -> bool:
+        """Store `quote` if it is a usable, newer top of book; the only way in."""
+        stored = self._quotes.get(quote.symbol)
+        if quote.bid <= 0 or quote.ask <= 0:
+            reason = "non-positive"
+        elif quote.bid > quote.ask:
+            reason = "crossed"
+        elif stored is not None and quote.ts < stored.ts:
+            reason = "out of order"
+        else:
+            self._quotes[quote.symbol] = quote
+            self._observe(quote.symbol, quote.ts)
+            return True
+        log.info(
+            "feed.quote_rejected",
+            symbol=quote.symbol,
+            source=source,
+            reason=reason,
+            bid=quote.bid,
+            ask=quote.ask,
+            ts=quote.ts.isoformat(),
+        )
+        return False
+
     def _observe(self, symbol: str, ts: datetime) -> None:
         if symbol not in self._observed or ts > self._observed[symbol]:
             self._observed[symbol] = ts
@@ -381,9 +410,10 @@ class MarketFeed:
         except Exception:
             log.exception("feed.rest_refresh_failed", symbol=symbol)
             return
-        for ts in (latest.bar_end, latest.quote_ts):
-            if ts is not None:
-                self._observe(symbol, ts)
+        if latest.bar_end is not None:
+            self._observe(symbol, latest.bar_end)
+        if latest.quote is not None:
+            self._accept_quote(latest.quote, source="rest")
 
     def _log_density(self, now: datetime) -> None:
         hour = now.replace(minute=0, second=0, microsecond=0)

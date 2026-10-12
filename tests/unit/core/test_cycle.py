@@ -83,10 +83,6 @@ class Market:
     def is_stale(self, symbol: str) -> bool:
         return symbol in self.stale
 
-    def spread_bps(self, symbol: str) -> float | None:  # for the real RiskEngine (Task 8)
-        q = self.quotes.get(symbol)
-        return None if q is None else (q.ask - q.bid) / q.ask * 10_000
-
 
 class Clock:
     def __init__(self, now: datetime = NOW) -> None:

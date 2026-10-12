@@ -108,11 +108,16 @@ async def test_history_failure_is_a_broker_error() -> None:
     assert isinstance(exc.value.__cause__, ConnectionError)
 
 
-async def test_latest_reports_bar_end_and_quote_time() -> None:
+async def test_latest_reports_bar_end_and_quote() -> None:
     latest = await source().latest("BTC/USD")
 
     assert latest.bar_end == T0 + timedelta(minutes=4)  # 10:03 bar ends at 10:04
-    assert latest.quote_ts == datetime(2026, 10, 11, 10, 4, 30, 500000, tzinfo=UTC)
+    assert latest.quote == Quote(
+        symbol="BTC/USD",
+        ts=datetime(2026, 10, 11, 10, 4, 30, 500000, tzinfo=UTC),
+        bid=99.9,
+        ask=100.1,
+    )
 
 
 async def test_stream_converts_msgpack_payloads_and_tracks_connection() -> None:

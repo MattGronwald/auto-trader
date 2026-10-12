@@ -63,7 +63,7 @@ class FakeSource:
         self.bars = list(bars)
         self.history_calls: list[tuple[tuple[str, ...], datetime, datetime]] = []
         self.latest_bar_end: dict[str, datetime] = {}
-        self.latest_quote: dict[str, datetime] = {}
+        self.latest_quote: dict[str, Quote] = {}
         self.latest_calls = 0
         self.is_connected = True
         self.fail_history = False
@@ -82,9 +82,7 @@ class FakeSource:
 
     async def latest(self, symbol: str) -> Latest:
         self.latest_calls += 1
-        return Latest(
-            bar_end=self.latest_bar_end.get(symbol), quote_ts=self.latest_quote.get(symbol)
-        )
+        return Latest(bar_end=self.latest_bar_end.get(symbol), quote=self.latest_quote.get(symbol))
 
     async def stream(
         self, on_bar: Callable[[Bar], Awaitable[None]], on_quote: Callable[[Quote], Awaitable[None]]
@@ -455,6 +453,108 @@ async def test_quote_updates_spread(
     assert feed.spread_bps("ETH/USD") is None
 
 
+@pytest.mark.parametrize(
+    ("bid", "ask"),
+    [(100.05, 99.95), (0.0, 100.0), (99.0, 0.0), (-1.0, 100.0), (99.0, -1.0)],
+    ids=["crossed", "zero-bid", "zero-ask", "negative-bid", "negative-ask"],
+)
+async def test_invalid_quote_is_dropped_and_does_not_refresh(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus, bid: float, ask: float
+) -> None:
+    clock = Clock(T0 + M)
+    feed = make_feed(FakeSource(), sessions, bus, clock)
+    good = Quote(symbol=BTC, ts=T0, bid=99.95, ask=100.05)
+    await feed.on_quote(good)
+
+    await feed.on_quote(Quote(symbol=BTC, ts=T0 + 30 * S, bid=bid, ask=ask))
+
+    assert feed.quote(BTC) == good
+    clock.now = T0 + 61 * S  # 61 s after the last *valid* quote
+    await feed.tick()
+    clock.now += S
+    await feed.tick()
+    assert feed.is_stale(BTC)
+
+
+async def test_locked_quote_is_accepted(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    feed = make_feed(FakeSource(), sessions, bus, Clock(T0))
+    locked = Quote(symbol=BTC, ts=T0, bid=100.0, ask=100.0)
+
+    await feed.on_quote(locked)
+
+    assert feed.quote(BTC) == locked
+    assert feed.spread_bps(BTC) == 0.0
+
+
+async def test_older_stream_quote_does_not_replace_a_newer_one(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    feed = make_feed(FakeSource(), sessions, bus, Clock(T0))
+    newer = Quote(symbol=BTC, ts=T0 + S, bid=101.0, ask=101.1)
+    await feed.on_quote(newer)
+
+    await feed.on_quote(Quote(symbol=BTC, ts=T0, bid=99.0, ask=99.1))
+
+    assert feed.quote(BTC) == newer
+
+
+async def test_rest_refresh_stores_the_quote_values(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    # The REST refresh only recorded timestamps: a stale symbol turned fresh while the
+    # stored bid/ask stayed at their old values, which check() then sized against.
+    clock = Clock(T0 + M)
+    source = FakeSource()
+    feed = make_feed(source, sessions, bus, clock)
+    await feed.on_quote(Quote(symbol=BTC, ts=T0 + M, bid=90.0, ask=90.1))
+    clock.now = T0 + M + 62 * S
+    await feed.tick()
+    assert feed.is_stale(BTC)
+
+    clock.now += 61 * S  # past the REST throttle
+    rest = Quote(symbol=BTC, ts=clock.now - 2 * S, bid=99.0, ask=99.1)
+    source.latest_quote[BTC] = rest
+    await feed.tick()
+
+    assert not feed.is_stale(BTC)
+    assert feed.quote(BTC) == rest
+
+
+async def test_older_rest_quote_does_not_replace_a_newer_stream_quote(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    clock = Clock(T0 + M)
+    source = FakeSource()
+    feed = make_feed(source, sessions, bus, clock)
+    await feed.on_bar(bar(0))
+    stream = Quote(symbol=BTC, ts=T0 + 30 * S, bid=101.0, ask=101.1)
+    await feed.on_quote(stream)
+
+    clock.now = T0 + 30 * S + 61 * S
+    source.latest_quote[BTC] = Quote(symbol=BTC, ts=T0 + 10 * S, bid=99.0, ask=99.1)
+    await feed.tick()
+
+    assert feed.quote(BTC) == stream
+
+
+async def test_invalid_rest_quote_leaves_the_symbol_stale(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    clock = Clock(T0 + M)
+    source = FakeSource()
+    feed = make_feed(source, sessions, bus, clock)
+    await feed.on_bar(bar(0))
+
+    clock.now = T0 + M + 90 * S
+    source.latest_quote[BTC] = Quote(symbol=BTC, ts=clock.now - 5 * S, bid=99.2, ask=99.1)
+    await feed.tick()
+
+    assert feed.is_stale(BTC)
+    assert feed.quote(BTC) is None
+
+
 async def test_symbol_goes_stale_once_and_recovers(
     sessions: async_sessionmaker[AsyncSession], bus: EventBus
 ) -> None:
@@ -493,7 +593,7 @@ async def test_rest_refresh_prevents_false_stale_on_a_quiet_market(
     await feed.on_bar(bar(0))
 
     clock.now = T0 + M + 90 * S
-    source.latest_quote[BTC] = clock.now - 5 * S
+    source.latest_quote[BTC] = Quote(symbol=BTC, ts=clock.now - 5 * S, bid=99.0, ask=99.1)
     await feed.tick()
 
     assert not feed.is_stale(BTC)
