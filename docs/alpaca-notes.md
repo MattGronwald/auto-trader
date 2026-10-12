@@ -22,10 +22,10 @@ Sources:
 - Fees are retrievable only as account **activities** (`activity_type` `CFEE` / `FEE`). The docs don't say whether order or fill objects carry fees.
 
 **Consequences:**
-1. **`SimBroker` charges all fees in USD.** That is right for sells but wrong for buys, where the real position is smaller than the ordered qty. → Decision needed (see below).
-2. **Reconciliation (WP 1.5):** a fresh fill and the broker position can disagree until the end-of-day fee posting. Reconcile against the broker-reported qty and adopt it (G10 resolution). A mismatch equal to the expected fee must not trigger a pause.
-3. **Journal (WP 3.1):** the fee of a fill is not known at fill time. Record an **estimated** fee from `fee_schedule()` at fill time, then replace it with the posted `CFEE` amount once available.
-4. **Exits sell the actual position qty**, not the ordered entry qty, or they would hit "insufficient qty" after the fee posting.
+1. **`SimBroker` currently charges all fees in USD.** That is right for sells but wrong for buys, where the real position is smaller than the ordered qty. Owner decision D10 (2026-10-11 review) selects coin-denominated buy fees and dust handling; PLAN 1.R2 implements it. The simulator has not yet been changed.
+2. **Reconciliation (WP 1.5):** the empirical step-1 probe below shows the buy fee deducted from coin **at fill time**; only the activity record is posted later. Gross fill qty and net broker position therefore differ immediately. Explain that difference using fee denomination and bounded rounding; an unexplained discrepancy still pauses new entries. Do not hide discrepancies by unconditionally overwriting local qty.
+3. **Journal (WP 1.5 basic accounting; WP 3.1 activity reconciliation):** the posted fee record is not available at fill time. Record an **estimated** fee from `fee_schedule()` at fill time, then reconcile it with the posted `CFEE` amount once available, retaining its asset denomination and avoiding double counting.
+4. **Exits sell the actual position qty**, not the ordered entry qty, or they can hit "insufficient qty" immediately after the fill. Account for reserved sell qty as well; test the actual close/dust behavior before relying on retries.
 
 ## Fees
 
