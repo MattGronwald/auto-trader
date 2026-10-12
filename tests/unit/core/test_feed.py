@@ -476,6 +476,54 @@ async def test_invalid_quote_is_dropped_and_does_not_refresh(
     assert feed.is_stale(BTC)
 
 
+NAN, INF = float("nan"), float("inf")
+NON_FINITE = pytest.mark.parametrize(
+    ("bid", "ask"),
+    [(NAN, 100.0), (99.0, NAN), (NAN, NAN), (INF, INF), (99.0, INF)],
+    ids=["nan-bid", "nan-ask", "nan-both", "inf-locked", "inf-ask"],
+)
+
+
+@NON_FINITE
+async def test_non_finite_stream_quote_is_dropped_and_does_not_refresh(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus, bid: float, ask: float
+) -> None:
+    # NaN fails every comparison and (inf, inf) passes as a locked book, so both slipped
+    # past the positive/crossed checks, replaced the valid book and kept the symbol fresh.
+    clock = Clock(T0 + M)
+    feed = make_feed(FakeSource(), sessions, bus, clock)
+    good = Quote(symbol=BTC, ts=T0, bid=99.95, ask=100.05)
+    await feed.on_quote(good)
+
+    await feed.on_quote(Quote(symbol=BTC, ts=T0 + 30 * S, bid=bid, ask=ask))
+
+    assert feed.quote(BTC) == good
+    assert feed.spread_bps(BTC) == pytest.approx(10.0)
+    clock.now = T0 + 61 * S  # 61 s after the last *valid* quote
+    await feed.tick()
+    clock.now += S
+    await feed.tick()
+    assert feed.is_stale(BTC)
+
+
+@NON_FINITE
+async def test_non_finite_rest_quote_is_dropped_and_leaves_the_symbol_stale(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus, bid: float, ask: float
+) -> None:
+    clock = Clock(T0 + M)
+    source = FakeSource()
+    feed = make_feed(source, sessions, bus, clock)
+    good = Quote(symbol=BTC, ts=T0, bid=99.95, ask=100.05)
+    await feed.on_quote(good)
+
+    clock.now = T0 + 90 * S
+    source.latest_quote[BTC] = Quote(symbol=BTC, ts=clock.now - 5 * S, bid=bid, ask=ask)
+    await feed.tick()
+
+    assert feed.is_stale(BTC)
+    assert feed.quote(BTC) == good
+
+
 async def test_locked_quote_is_accepted(
     sessions: async_sessionmaker[AsyncSession], bus: EventBus
 ) -> None:

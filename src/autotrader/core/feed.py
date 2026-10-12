@@ -25,9 +25,9 @@ the last bar or quote; past `stale_alert_s` the feed asks REST for the latest ba
 (at most once per symbol per `stale_alert_s`) before publishing `SymbolStale`.
 
 **Quotes are validated before use.** A quote from the stream or the REST refresh is
-stored only if bid > 0, ask > 0 and bid <= ask (a locked book is fine), and it is not older
-than the stored one. Anything else is dropped (`feed.quote_rejected`) and does not
-refresh price age, so a feed sending garbage still goes stale. The REST refresh stores
+stored only if bid and ask are finite and > 0, bid <= ask (a locked book is fine) and it
+is not older than the stored one. Anything else is dropped (`feed.quote_rejected`) and
+does not refresh price age, so a feed sending garbage still goes stale. The REST refresh stores
 the quote itself, not just its timestamp, so a symbol never turns fresh on old prices.
 
 Backfill always refetches the full G5 window, so holes left in the DB by an earlier run
@@ -36,6 +36,7 @@ old bars. Hourly per-symbol bar counts are logged (`feed.density`).
 """
 
 import asyncio
+import math
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -346,7 +347,10 @@ class MarketFeed:
     def _accept_quote(self, quote: Quote, *, source: str) -> bool:
         """Store `quote` if it is a usable, newer top of book; the only way in."""
         stored = self._quotes.get(quote.symbol)
-        if quote.bid <= 0 or quote.ask <= 0:
+        # First: NaN fails every comparison below and (inf, inf) looks like a locked book.
+        if not (math.isfinite(quote.bid) and math.isfinite(quote.ask)):
+            reason = "non-finite"
+        elif quote.bid <= 0 or quote.ask <= 0:
             reason = "non-positive"
         elif quote.bid > quote.ask:
             reason = "crossed"
