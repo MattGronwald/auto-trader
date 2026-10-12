@@ -47,7 +47,7 @@ NOW = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 RULES = AssetRules(
     min_qty=D("0.0001"), qty_increment=D("0.0001"), min_notional=D("1"), price_increment=D("0.01")
 )
-FEES = FeeSchedule(maker_bps=D("15"), taker_bps=D("25"))
+FEES = FeeSchedule(maker_bps=D("15"), taker_bps=D("25"), buy_fee_asset="quote")
 
 
 def five(i: int, close: float = 100.0) -> Bar:

@@ -33,7 +33,14 @@ RULES = {
         price_increment=Decimal("0.01"),
     ),
 }
-FEES = FeeSchedule(maker_bps=Decimal("15"), taker_bps=Decimal("25"))
+FEES = FeeSchedule(maker_bps=Decimal("15"), taker_bps=Decimal("25"), buy_fee_asset="quote")
+
+
+def test_sim_refuses_coin_denominated_buy_fees_until_it_models_them() -> None:
+    # SimBroker charges every fee in USD (until WP 1.R2). Accepting a "base" schedule
+    # would make the Risk Engine size for coin fees the simulator never applies.
+    with pytest.raises(ValueError, match="buy_fee_asset"):
+        make_sim(fees=FEES.model_copy(update={"buy_fee_asset": "base"}))
 
 
 def make_sim(cash: str = "1000", slippage_bps: str = "0", fees: FeeSchedule = FEES) -> SimBroker:
@@ -120,7 +127,9 @@ async def test_market_sell_slips_down() -> None:
 
 
 async def test_bar_prices_become_exact_decimals() -> None:
-    sim = make_sim(fees=FeeSchedule(maker_bps=Decimal(0), taker_bps=Decimal(0)))
+    sim = make_sim(
+        fees=FeeSchedule(maker_bps=Decimal(0), taker_bps=Decimal(0), buy_fee_asset="quote")
+    )
     sim.process_bar(bar(0, 0.1))
     ack = await sim.submit_order(market("buy", "10"))
     sim.process_bar(bar(1, 0.1))
@@ -319,7 +328,9 @@ async def test_close_position_without_position_raises() -> None:
 
 
 async def test_equity_is_marked_to_last_close() -> None:
-    sim = make_sim(fees=FeeSchedule(maker_bps=Decimal(0), taker_bps=Decimal(0)))
+    sim = make_sim(
+        fees=FeeSchedule(maker_bps=Decimal(0), taker_bps=Decimal(0), buy_fee_asset="quote")
+    )
     sim.process_bar(bar(0, 100.0))
     await sim.submit_order(market("buy", "2"))
     sim.process_bar(bar(1, 100.0, h=130.0, low=99.0, c=125.0))
@@ -448,12 +459,21 @@ def test_other_timeframes_are_refused() -> None:
         sim.process_bar(five_min)
 
 
+@pytest.mark.parametrize("field", ["maker_bps", "taker_bps"])
+@pytest.mark.parametrize("value", [Decimal(-1), Decimal(10_000)])
+def test_fee_bps_must_stay_below_100_percent(field: str, value: Decimal) -> None:
+    # D16 sizing assumes 0 <= fee < 1; at >= 100 % the net stop loss could turn <= 0.
+    kwargs = {"maker_bps": Decimal(15), "taker_bps": Decimal(25), field: value}
+    with pytest.raises(ValueError, match=field):
+        FeeSchedule(**kwargs, buy_fee_asset="quote")
+
+
 @pytest.mark.parametrize("value", [0.1 + 0.2, 1.0, True])
 def test_broker_models_reject_floats_and_bools(value: object) -> None:
     with pytest.raises(ValueError, match="Decimal"):
         BrokerOrder(symbol=BTC, side="buy", qty=value, type="market")
     with pytest.raises(ValueError, match="Decimal"):
-        FeeSchedule(maker_bps=value, taker_bps=Decimal(1))
+        FeeSchedule(maker_bps=value, taker_bps=Decimal(1), buy_fee_asset="quote")
 
 
 @pytest.mark.parametrize("value", [Decimal("0.3"), "0.3", 3])

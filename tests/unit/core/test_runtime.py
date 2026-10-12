@@ -76,7 +76,7 @@ class FakeBroker:
         return "paper"
 
     def fee_schedule(self) -> FeeSchedule:
-        return FeeSchedule(maker_bps=Decimal(15), taker_bps=Decimal(25))
+        return FeeSchedule(maker_bps=Decimal(15), taker_bps=Decimal(25), buy_fee_asset="quote")
 
 
 class HangingSnapshotBroker(FakeBroker):

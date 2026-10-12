@@ -173,7 +173,7 @@ Notes:
 ### 4.5 Risk Engine (deterministic)
 The implemented `RiskEngine` in `risk/engine.py` owns the broker, state reads, persistence and submission. Its `check(EntryIntent)` and `exit(ExitRequest)` return an `OrderResult` containing the decision and any order status/ids. The deterministic functions `check_entry` / `check_exit` in `risk/checks.py` are pure; the engine is not. No LLM appears in either path.
 
-Entry checks run in order and persist the first rejection reason. Percentage settings are percentage points (`1.0` means 1%, divided by 100 in formulas); fees in bps are divided by 10,000. Let `e = ceil_to_price_step(ask × (1 + entry_slippage_bps / 10_000))`, `d = e − stop`, `f = taker_bps / 10_000`.
+Entry checks run in order and persist the first rejection reason. Percentage settings are percentage points (`1.0` means 1%, divided by 100 in formulas); fees in bps are divided by 10,000. Let `e = ceil_to_price_step(ask × (1 + entry_slippage_bps / 10_000))`, `d = e − stop`, `f = taker_bps / 10_000`. Net cash result per unit bought (D16, WP 1.R1b), exiting at price `x` less `s = exit_slippage_bps / 10_000`: `pnl(x) = (1 − f) × x(1 − s)(1 − f) − e` when the buy fee is taken from the coin (`FeeSchedule.buy_fee_asset = base`, Alpaca), or `pnl(x) = x(1 − s)(1 − f) − e(1 + f)` when it is paid in USD (`quote`, SimBroker until 1.R2). Let `L = −pnl(stop)`, the estimated net loss per unit at the stop.
 
 1. Kill not set, entries not paused, mode matches the broker. Recheck the gate immediately before submitting.
 2. Symbol allowed, price fresh, quote/last trade available, bid/ask/last trade > 0 and bid ≤ ask (crossed rejects; locked is valid), spread computed from that bid/ask ≤ `scanner.max_spread_bps`.
@@ -181,11 +181,11 @@ Entry checks run in order and persist the first rejection reason. Percentage set
 4. `hwm − equity < max_drawdown_pct / 100 × hwm`; otherwise manual-resume pause. HWM is the maximum persisted peak, not merely the latest snapshot. Observed new peaks are persisted even when the entry subsequently fails.
 5. Count non-dust held symbols **and unresolved entry-order symbols** against `max_positions`; no pyramiding. A terminal/error cycle does not release an unresolved order's reservation. Dust means qty below the broker's current minimum; it remains recorded.
 6. `stop < e` and `min_stop_atr × ATR ≤ d ≤ max_stop_atr × ATR`; missing ATR rejects.
-7. `qty = floor_to_qty_step(size_fraction × min((risk_per_trade_pct / 100) × equity / d, (max_position_pct / 100) × equity / e, cash / (e × (1 + f))))`. Reject below broker min qty/notional. This is the WP 1.3 formula; WP 1.6 must use crypto-available `non_marginable_buying_power` rather than raw cash. The broker maximum notional is not currently modelled in `AssetRules` (PLAN G4).
+7. `qty = floor_to_qty_step(size_fraction × min((risk_per_trade_pct / 100) × equity / L, (max_position_pct / 100) × equity / e, cash / (e × (1 + f))))`. Reject below broker min qty/notional. The decision also records `initial_risk = qty × d` (R stays the price distance) and `est_net_stop_loss = qty × L`. Before WP 1.R1b (2026-10-12) the risk cap divided by `d`; WP 1.6 must use crypto-available `non_marginable_buying_power` rather than raw cash. The broker maximum notional is not currently modelled in `AssetRules` (PLAN G4).
 8. Held market value + unresolved entry notional + proposed notional ≤ `max_gross_exposure_pct / 100 × equity`. Excess exposure rejects, never shrinks. Unpriced/stale non-dust holdings reject; cost basis is not a substitute for current value.
 9. Entry-order rows in the rolling last 60 min / current trading day stay within `max_orders_per_hour` / `max_orders_per_day`. Failed and uncertain attempts count conservatively; proven `not_submitted` rows and exits do not count.
 10. `abs(e − last_trade) ≤ max_price_deviation_pct / 100 × last_trade` and `stop < e < take_profit`.
-11. `p = min(confidence, win_rate_est + 0.10)`, using `risk.default_win_rate_prior` until `learning.min_trades_for_evidence` closed trades exist for the strategy. Require `qty × (tp − e) × p − qty × d × (1 − p) − qty × e × f − qty × tp × f > 0` (quote currency). The current estimate uses taker fees on both legs and the TP notional for the exit fee. It does not guarantee positive realized P&L or include stop gaps/LLM cost; WP 1.7 must evaluate those separately.
+11. `p = min(confidence, win_rate_est + 0.10)`, using `risk.default_win_rate_prior` until `learning.min_trades_for_evidence` closed trades exist for the strategy. Require `qty × (p × pnl(tp) − (1 − p) × L) > 0` (quote currency), the same cash-flow model as check 7, with taker fees on both legs and the exit slippage allowance applied to both TP and stop (WP 1.R1b, 2026-10-12). It does not guarantee positive realized P&L or include stop gaps/LLM cost; WP 1.7 must evaluate those separately.
 
 Entries are **IOC marketable limits without brackets**. Alpaca crypto has no bracket/OCO support in the recorded WP 0.7 verification. The Position Manager owns stop/TP/time/trailing enforcement (WP 1.5); it must be active before entry admission is enabled.
 
@@ -193,7 +193,7 @@ Entries are **IOC marketable limits without brackets**. Alpaca crypto has no bra
 
 The engine journals `pending` **before** submit/close, records ambiguous outcomes as `unknown`, and records `not_submitted` only when the request is known not to have been sent. A timeout or lost acknowledgement is not proof of failure. WP 1.5–1.6 must reconcile orders independently of cycle state before releasing reservations or retrying exits; see PLAN §3.2.
 
-**Review follow-up (not yet implemented; scope confirmed by owner 2026-10-11, appended 2026-10-12):** PLAN 1.R1 rejects crossed/non-positive quotes, stores REST quote values, ignores out-of-order WS quotes and removes feed access from exits. Today `exit()` shares `_held_positions()` with entries, so a raised feed exception can reject a protective exit. WP 1.6 adds source-specific freshness/snapshot-age validation at the Risk Engine boundary, including prices for held exposure, and blocks re-entry into a symbol with an unresolved close. WP 1.5 owns durable order/fill handoff and local runtime liveness. The current `risk_per_trade_pct` formula limits nominal price-distance loss only; fees and gaps can exceed it. Owner-approved D16 / 1.R1 changes it to estimated net loss at stop including entry/exit fees and **`risk.exit_slippage_bps`, a human-only adverse exit allowance with initial/default value 10 bps** (finite, `0 ≤ value < 10_000`). It is separate from entry slippage. Implement the schema, profile comment/value and resulting profile hash together in 1.R1. PLAN §3.1 specifies fee-denomination-aware cash flows, rounding down and preservation of cash/position/exposure caps; actual gaps can still exceed the estimate. These are required follow-ups, not WP 1.3 behavior today. **Update 2026-10-12 (WP 1.R1a):** quote validation (feed and check 2), REST quote values, out-of-order WS quotes and the feed-free `exit()` are implemented. D16 net-loss sizing remains open for 1.R1b.
+**Review follow-up (not yet implemented; scope confirmed by owner 2026-10-11, appended 2026-10-12):** PLAN 1.R1 rejects crossed/non-positive quotes, stores REST quote values, ignores out-of-order WS quotes and removes feed access from exits. Today `exit()` shares `_held_positions()` with entries, so a raised feed exception can reject a protective exit. WP 1.6 adds source-specific freshness/snapshot-age validation at the Risk Engine boundary, including prices for held exposure, and blocks re-entry into a symbol with an unresolved close. WP 1.5 owns durable order/fill handoff and local runtime liveness. The current `risk_per_trade_pct` formula limits nominal price-distance loss only; fees and gaps can exceed it. Owner-approved D16 / 1.R1 changes it to estimated net loss at stop including entry/exit fees and **`risk.exit_slippage_bps`, a human-only adverse exit allowance with initial/default value 10 bps** (finite, `0 ≤ value < 10_000`). It is separate from entry slippage. Implement the schema, profile comment/value and resulting profile hash together in 1.R1. PLAN §3.1 specifies fee-denomination-aware cash flows, rounding down and preservation of cash/position/exposure caps; actual gaps can still exceed the estimate. These are required follow-ups, not WP 1.3 behavior today. **Update 2026-10-12 (WP 1.R1a):** quote validation (feed and check 2), REST quote values, out-of-order WS quotes and the feed-free `exit()` are implemented. D16 net-loss sizing remains open for 1.R1b. **Update 2026-10-12 (WP 1.R1b):** D16 is implemented (checks 7 and 11 above; `risk.exit_slippage_bps` is required, with no schema default, and 10 is the profile's value; new profile hash); actual gaps can still exceed the estimate.
 
 `RiskLimits` is loaded from the strategy profile and **cannot be changed by the Learning Loop**. Only a human edits it (dashboard with confirmation, or config file + restart).
 
@@ -299,7 +299,7 @@ agents:
   exit_review: { enabled: false }
 
 risk:                                         # HUMAN-EDITABLE ONLY. Learning loop cannot touch this block.
-  risk_per_trade_pct: 1.0                     # current nominal price-loss budget; see D16 / 1.R1
+  risk_per_trade_pct: 1.0                     # of equity, estimated net loss at stop including fees and exit slippage
   max_position_pct: 30
   max_positions: 2
   max_gross_exposure_pct: 60
@@ -312,6 +312,7 @@ risk:                                         # HUMAN-EDITABLE ONLY. Learning lo
   max_orders_per_day: 30
   max_price_deviation_pct: 1.0
   entry_slippage_bps: 10                      # D14: marketable IOC limit = ask + this
+  exit_slippage_bps: 10                       # D16: adverse stop-exit allowance in net-loss sizing
   default_win_rate_prior: 0.40                # D4: used until n >= learning.min_trades_for_evidence
   trailing: { enabled: true, trigger_r: 1.0, trail_atr: 1.5 }
 
@@ -330,7 +331,7 @@ benchmark: { symbol: BTC/USD, type: buy_and_hold }
 
 The example matches the current profile schema; its pinned model IDs are repository configuration, not a fresh verification of provider availability. Reverify exact IDs, token accounting and prices before Phase 2. `latest` aliases are rejected.
 
-**Current baseline:** 5m signals, ≤ 8 h holds, 2 concurrent positions and a 1% nominal per-trade risk setting. These are initial parameters, not demonstrated viable economics. PLAN §3.3 evaluates fee friction and SPEC §16.1 proposes alternatives; observed latency and executable prices must be measured rather than assumed.
+**Current baseline:** 5m signals, ≤ 8 h holds, 2 concurrent positions and a 1% per-trade risk setting (estimated net loss at stop including fees and exit slippage since WP 1.R1b, 2026-10-12). These are initial parameters, not demonstrated viable economics. PLAN §3.3 evaluates fee friction and SPEC §16.1 proposes alternatives; observed latency and executable prices must be measured rather than assumed.
 
 ---
 

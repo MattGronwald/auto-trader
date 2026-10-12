@@ -41,7 +41,7 @@ RULES = AssetRules(
     min_notional=D("1"),
     price_increment=D("0.01"),
 )
-FEES = FeeSchedule(maker_bps=D("15"), taker_bps=D("25"))
+FEES = FeeSchedule(maker_bps=D("15"), taker_bps=D("25"), buy_fee_asset="quote")
 
 
 def profile() -> StrategyProfile:
