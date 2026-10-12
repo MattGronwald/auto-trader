@@ -1012,6 +1012,27 @@ async def test_invalid_latest_rest_bar_leaves_the_symbol_stale(
     assert feed.is_stale(BTC)
 
 
+async def test_valid_rest_quote_is_kept_when_the_latest_rest_bar_is_invalid(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    # PR #19 review: bar and quote from one REST refresh are validated independently.
+    clock = Clock(T0 + M)
+    source = FakeSource()
+    feed = make_feed(source, sessions, bus, clock)
+    await feed.on_bar(bar(0))
+
+    clock.now = T0 + M + 90 * S
+    source.latest_bar[BTC] = bad(1, {"close": NAN})
+    quote = Quote(symbol=BTC, ts=clock.now - 5 * S, bid=99.0, ask=99.1)
+    source.latest_quote[BTC] = quote
+    with capture_logs() as logs:
+        await feed.tick()
+
+    assert rejections(logs) == [("rest", "non-finite")]
+    assert feed.quote(BTC) == quote
+    assert not feed.is_stale(BTC)  # fresh from the quote, not from the bad bar
+
+
 async def test_valid_latest_rest_bar_refreshes_price_age(
     sessions: async_sessionmaker[AsyncSession], bus: EventBus
 ) -> None:
