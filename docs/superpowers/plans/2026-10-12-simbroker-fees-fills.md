@@ -367,7 +367,7 @@ async def drain(sim: SimBroker) -> list[Fill]:
 
 
 def test_fill_plan_rejects_invalid_steps() -> None:
-    for bad in (D(0), D("1.01"), D("-0.5"), "later"):
+    for bad in (D(0), D("1.01"), D("-0.5"), D("NaN"), D("Infinity"), "later"):
         with pytest.raises(ValueError, match="step"):
             FillPlan((bad,))  # type: ignore[arg-type]
     assert FillPlan((D("0.5"), D(1), "cancel", "reject")).steps[-1] == "reject"
@@ -593,7 +593,8 @@ class FillPlan:
     def __post_init__(self) -> None:
         for step in self.steps:
             if isinstance(step, Decimal):
-                if not _D0 < step <= 1:
+                # is_finite first: comparing a NaN Decimal raises InvalidOperation.
+                if not step.is_finite() or not _D0 < step <= 1:
                     raise ValueError(f"fill step fraction must be in (0, 1], got {step}")
             elif step not in ("cancel", "reject"):
                 raise ValueError(f"unknown fill step {step!r}")
@@ -985,6 +986,20 @@ def test_increment_must_be_a_multiple_of_coin_precision() -> None:
     finer = {BTC: FINE[BTC].model_copy(update={"qty_increment": D("1e-10")})}
     with pytest.raises(ValueError, match="coin_precision"):
         make_sim(fees=BASE, rules=finer)
+
+
+@pytest.mark.parametrize("precision", [D("-1e-9"), D(0), D("NaN"), D("Infinity"), 1e-9, True])
+def test_coin_precision_must_be_a_finite_positive_decimal(precision: object) -> None:
+    # A negative quantum passes the divisibility check and turns the fee's round-up into a
+    # round-down (PR #21 plan review); floats/bools are refused at the money/qty boundary.
+    with pytest.raises(ValueError, match="coin_precision"):
+        SimBroker(
+            cash=D("1000"),
+            fees=BASE,
+            slippage_bps=D(0),
+            asset_rules=FINE,
+            coin_precision=precision,  # type: ignore[arg-type]
+        )
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1004,6 +1019,14 @@ def _ceil(value: Decimal, step: Decimal) -> Decimal:
 In `__init__`, replace the `if fees.buy_fee_asset != "quote": raise …` block with:
 
 ```python
+        # Validate before any arithmetic: a negative quantum would turn the round-up into a
+        # round-down, and 0 or NaN raise InvalidOperation in the modulo below.
+        if (
+            not isinstance(coin_precision, Decimal)
+            or not coin_precision.is_finite()
+            or coin_precision <= 0
+        ):
+            raise ValueError(f"coin_precision must be a finite Decimal > 0, got {coin_precision!r}")
         for symbol, symbol_rules in asset_rules.items():
             # Applies to both fee assets: quantities never go below one coin quantum, and a
             # coin fee rounded up to coin_precision can't exceed a minimal slice (spec §3).
@@ -1236,6 +1259,35 @@ def test_replaying_fills_reproduces_cash_and_positions(
     asyncio.run(run())
 
 
+async def stop_out(
+    entry: Decimal, stop: Decimal, qty: Decimal, fees: FeeSchedule, rules: dict[str, AssetRules]
+) -> tuple[Decimal, Decimal, Decimal]:
+    """IOC buy at `entry`, full close on a bar opening at `stop`. Returns (simulated loss,
+    D16 expected loss, one-quantum bound)."""
+    exit_slippage = D(10)  # the profile's risk.exit_slippage_bps
+    sim = SimBroker(
+        cash=D("1000000"), fees=fees, slippage_bps=exit_slippage, asset_rules=rules
+    )
+    sim.process_bar(bar(0, float(entry)))
+    await sim.submit_order(ioc_buy(str(qty), str(entry)))
+    sim.process_bar(bar(1, float(entry)))  # IOC limit fills at entry, taker, no slip
+    await sim.close_position(BTC)
+    sim.process_bar(bar(2, float(stop)))  # market sell at stop x (1 - 10 bps)
+    loss = D("1000000") - sim.cash
+    expected = -net_pnl_per_unit(entry, stop, fees, exit_slippage) * qty
+    return loss, expected, sim.coin_precision * stop
+
+
+TINY = D("1e-18")  # Decimal's 28-digit rounding: summation order differs from the formula
+
+
+def check_d16(loss: Decimal, expected: Decimal, bound: Decimal, fee_asset: str) -> None:
+    if fee_asset == "quote":
+        assert abs(loss - expected) < TINY
+    else:  # one execution: the rounded-up coin fee costs at most one quantum of coin
+        assert -TINY <= loss - expected <= bound + TINY
+
+
 @given(
     entry=st.decimals(min_value=D("10"), max_value=D("1000"), places=2),
     drop=st.decimals(min_value=D("0.01"), max_value=D("0.10"), places=3),
@@ -1246,36 +1298,38 @@ def test_replaying_fills_reproduces_cash_and_positions(
 def test_ioc_buy_then_stop_sale_matches_d16_net_loss(
     entry: Decimal, drop: Decimal, qty_steps: int, fee_asset: str
 ) -> None:
-    async def run() -> None:
-        exit_slippage = D(10)  # the profile's risk.exit_slippage_bps
-        fees = FEES.model_copy(update={"buy_fee_asset": fee_asset})
-        stop = (entry * (1 - drop)).quantize(D("0.01"))
-        qty = D(qty_steps) * D("0.0001")
-        sim = SimBroker(
-            cash=D("1000000"),
-            fees=fees,
-            slippage_bps=exit_slippage,
-            asset_rules=RULES,
-        )
-        sim.process_bar(bar(0, float(entry)))
-        await sim.submit_order(ioc_buy(str(qty), str(entry)))
-        sim.process_bar(bar(1, float(entry)))  # IOC limit fills at entry, taker, no slip
-        await sim.close_position(BTC)
-        sim.process_bar(bar(2, float(stop)))  # market sell at stop x (1 - 10 bps)
+    # 0.0001 steps at 25 bps: the coin fee is always a whole number of quanta (no rounding).
+    fees = FEES.model_copy(update={"buy_fee_asset": fee_asset})
+    stop = (entry * (1 - drop)).quantize(D("0.01"))
+    qty = D(qty_steps) * D("0.0001")
+    check_d16(*asyncio.run(stop_out(entry, stop, qty, fees, RULES)), fee_asset)
 
-        loss = D("1000000") - sim.cash
-        expected = -net_pnl_per_unit(entry, stop, fees, exit_slippage) * qty
-        if fee_asset == "quote":
-            assert abs(loss - expected) < D("1e-18")
-        else:  # one execution: the rounded-up coin fee costs at most one quantum of coin
-            assert D(0) <= loss - expected <= sim.coin_precision * stop
 
-    asyncio.run(run())
+@given(
+    entry=st.decimals(min_value=D("10"), max_value=D("1000"), places=2),
+    drop=st.decimals(min_value=D("0.01"), max_value=D("0.10"), places=3),
+    qty_nanos=st.integers(min_value=1_000_000, max_value=5_000_000_000),
+)
+@settings(max_examples=200, deadline=None)
+def test_d16_bound_holds_on_the_fine_grid_with_fee_rounding(
+    entry: Decimal, drop: Decimal, qty_nanos: int
+) -> None:
+    # Alpaca's 1e-9 grid (FINE, min_notional 0): fees with a fractional quantum get rounded.
+    stop = (entry * (1 - drop)).quantize(D("0.01"))
+    qty = D(qty_nanos) * D("1e-9")
+    check_d16(*asyncio.run(stop_out(entry, stop, qty, BASE, FINE)), "base")
+
+
+async def test_paper_fill_rounding_makes_the_loss_strictly_larger() -> None:
+    # 0.000118113 x 25 bps = 2.952825e-7 rounds up to 2.96e-7: a fractional quantum, so the
+    # simulated loss must exceed the unrounded D16 estimate, by at most one quantum.
+    loss, expected, bound = await stop_out(D("82994.2"), D("80000"), D("0.000118113"), BASE, FINE)
+    assert TINY < loss - expected <= bound
 ```
 
 - [ ] **Step 2: Run them**
 
-Run: `uv run pytest tests/unit/broker/test_sim.py -k "replaying or d16" -q`
+Run: `uv run pytest tests/unit/broker/test_sim.py -k "replaying or d16 or paper_fill_rounding" -q`
 Expected: PASS. These are properties of Tasks 3–5. If either fails, the implementation is wrong, not the test. Read the hypothesis counterexample, fix the code in the owning task's file, and re-run the whole suite.
 
 - [ ] **Step 3: Commit**
@@ -1340,7 +1394,7 @@ Expected: both pytest runs print `0`, and the risk coverage report shows 100 %.
 
 ## Plan verification (2026-10-12)
 
-Tasks 1-6 were dry-run verbatim in a throwaway worktree before review. Six snippet bugs were found and are fixed above:
+Tasks 1-6 were dry-run verbatim in a throwaway worktree before review. A Codex plan review then added `coin_precision` validation, the finite check for `FillPlan` steps, and D16 tests that actually exercise fee rounding; those snippets were re-run in a scratch copy. Six snippet bugs were found and are fixed above:
 - non-ASCII `−`/`×` in code (RUF002/RUF003);
 - an over-long one-line docstring (E501);
 - a redundant `cast` (mypy `redundant-cast`);
