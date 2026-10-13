@@ -173,7 +173,7 @@ Notes:
 ### 4.5 Risk Engine (deterministic)
 The implemented `RiskEngine` in `risk/engine.py` owns the broker, state reads, persistence and submission. Its `check(EntryIntent)` and `exit(ExitRequest)` return an `OrderResult` containing the decision and any order status/ids. The deterministic functions `check_entry` / `check_exit` in `risk/checks.py` are pure; the engine is not. No LLM appears in either path.
 
-Entry checks run in order and persist the first rejection reason. Percentage settings are percentage points (`1.0` means 1%, divided by 100 in formulas); fees in bps are divided by 10,000. Let `e = ceil_to_price_step(ask × (1 + entry_slippage_bps / 10_000))`, `d = e − stop`, `f = taker_bps / 10_000`. Net cash result per unit bought (D16, WP 1.R1b), exiting at price `x` less `s = exit_slippage_bps / 10_000`: `pnl(x) = (1 − f) × x(1 − s)(1 − f) − e` when the buy fee is taken from the coin (`FeeSchedule.buy_fee_asset = base`, Alpaca), or `pnl(x) = x(1 − s)(1 − f) − e(1 + f)` when it is paid in USD (`quote`, SimBroker until 1.R2). Let `L = −pnl(stop)`, the estimated net loss per unit at the stop.
+Entry checks run in order and persist the first rejection reason. Percentage settings are percentage points (`1.0` means 1%, divided by 100 in formulas); fees in bps are divided by 10,000. Let `e = ceil_to_price_step(ask × (1 + entry_slippage_bps / 10_000))`, `d = e − stop`, `f = taker_bps / 10_000`. Net cash result per unit bought (D16, WP 1.R1b), exiting at price `x` less `s = exit_slippage_bps / 10_000`: `pnl(x) = (1 − f) × x(1 − s)(1 − f) − e` when the buy fee is taken from the coin (`FeeSchedule.buy_fee_asset = base`, Alpaca), or `pnl(x) = x(1 − s)(1 − f) − e(1 + f)` when it is paid in USD (`quote`; SimBroker models both since 1.R2). Let `L = −pnl(stop)`, the estimated net loss per unit at the stop.
 
 1. Kill not set, entries not paused, mode matches the broker. Recheck the gate immediately before submitting.
 2. Symbol allowed, price fresh, quote/last trade available, bid/ask/last trade > 0 and bid ≤ ask (crossed rejects; locked is valid), spread computed from that bid/ask ≤ `scanner.max_spread_bps`.
@@ -213,9 +213,9 @@ class Broker(Protocol):
     def fee_schedule(self) -> FeeSchedule: ...
     async def asset_rules(self, symbol: str) -> AssetRules: ...
 ```
-Implementations: `AlpacaBroker(paper=True|False)`, `SimBroker` (in-process, for backtests and tests; fills at next bar open + slippage model + fee model).
+Implementations: `AlpacaBroker(paper=True|False)`, `SimBroker` (in-process, for backtests and tests; fills at next bar open + slippage model + fee model). Since WP 1.R2 (2026-10-12), SimBroker models Alpaca's coin-denominated buy fee (rounded up to 1e-9), exact-qty full closes with a dust rule, scripted partial fills (FillPlan) and stable fill ids (Fill.fill_id, fee_asset); see docs/superpowers/specs/2026-10-12-simbroker-fees-fills-design.md.
 
-The existing protocol is `broker/base.py`; client-order-id and order-history lookups, durable fill identities and broker I/O deadlines are WP 1.5–1.6 additions. `close_all()` is not an alternate control path: flatten must go through audited Risk Engine exits. `AlpacaBroker` is currently read-only; its order methods are stubs.
+The existing protocol is `broker/base.py`; client-order-id and order-history lookups, durable fill persistence (fill ids exist since 1.R2) and broker I/O deadlines are WP 1.5–1.6 additions. `close_all()` is not an alternate control path: flatten must go through audited Risk Engine exits. `AlpacaBroker` is currently read-only; its order methods are stubs.
 
 Fees and slippage: adapter exposes `fee_schedule()` so the Risk Engine's expectancy check uses real numbers. **Verify Alpaca's current crypto maker/taker tiers before implementing; do not hard-code from memory.**
 

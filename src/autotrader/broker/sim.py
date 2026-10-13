@@ -20,7 +20,7 @@ Fill model, driven by `process_bar()`:
   only the unfilled remainder. `redeliver()` re-emits a fill for duplicate-delivery tests.
 - Fees: sells pay in USD out of the proceeds. Buys follow `FeeSchedule.buy_fee_asset`:
   "quote" pays the fee in USD on top of the notional; "base" (Alpaca) pays exactly the
-  notional and takes the fee from the coin, rounded up to `coin_precision` (1e-9). A
+  notional and takes the fee from the coin, rounded up to `coin_precision` (default 1e-9). A
   slice too small for its rounded coin fee is rejected. `avg_entry_price` is the fill
   price (Alpaca's convention); cash is exact, never rounded to cents (spec section 3).
 - Spot only: sells can never exceed the position (no shorting).

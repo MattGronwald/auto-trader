@@ -104,7 +104,7 @@ class FeeSchedule(_Frozen):
     taker_bps: Dec = Field(ge=0, lt=10_000)  # < 100 %: D16 net stop loss stays positive
     # Which asset a buy's fee is taken from (G10, D10). "base": Alpaca deducts it from the
     # coin received, so the position is smaller than the fill. "quote": charged in USD on
-    # top of the fill value (SimBroker until WP 1.R2). Sells always pay in the quote
+    # top of the fill value. SimBroker models both (WP 1.R2). Sells always pay in the quote
     # currency. Sizing and expectancy (D16) use the matching cash-flow equation.
     buy_fee_asset: Literal["base", "quote"]
 
