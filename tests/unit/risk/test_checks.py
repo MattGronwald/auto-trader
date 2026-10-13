@@ -193,6 +193,33 @@ def test_size_below_broker_minimum_is_rejected() -> None:
     assert not d.approved and "below broker minimum" in d.reasons[0]
 
 
+BASE_FEES = FEES.model_copy(update={"buy_fee_asset": "base"})
+
+
+def _min_qty(value: str) -> dict[str, Any]:
+    return {"rules": RULES.model_copy(update={"min_qty": D(value)})}
+
+
+def test_base_fee_entry_whose_net_qty_is_dust_is_rejected() -> None:
+    # Gross 2.997 >= 2.9896, but the coin fee ceil(2.997 x 0.0025 = 0.0074925, 0.0001)
+    # = 0.0075 leaves 2.9895 < 2.9896: the filled position would be unexitable dust.
+    d = run(market={"fees": BASE_FEES, **_min_qty("2.9896")})
+    assert not d.approved
+    assert d.reasons == ("net qty 2.9895 after coin fee below broker minimum 2.9896",)
+
+
+def test_base_fee_entry_whose_net_qty_equals_the_minimum_is_approved() -> None:
+    d = run(market={"fees": BASE_FEES, **_min_qty("2.9895")})
+    assert d.approved, d.reasons
+    assert d.qty == D("2.997")
+
+
+def test_quote_fee_entry_is_not_reduced_by_a_coin_fee() -> None:
+    d = run(market=_min_qty("2.9896"))  # FEES is quote: the full 2.997 coins are held
+    assert d.approved, d.reasons
+    assert d.qty == D("2.997")
+
+
 # --- exit ----------------------------------------------------------------------------
 
 
