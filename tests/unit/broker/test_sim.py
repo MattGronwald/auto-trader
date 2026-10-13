@@ -11,10 +11,11 @@ from autotrader.broker.base import (
     Broker,
     BrokerOrder,
     FeeSchedule,
+    Fill,
     OrderNotFound,
     OrderRejected,
 )
-from autotrader.broker.sim import SimBroker
+from autotrader.broker.sim import FillPlan, SimBroker
 from autotrader.core.types import Bar
 
 T0 = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
@@ -617,3 +618,198 @@ async def test_ioc_cash_reservation_uses_taker_fee() -> None:
     sim.process_bar(bar(0, 100))
     with pytest.raises(OrderRejected, match="insufficient cash"):
         await sim.submit_order(ioc_buy("1", "100.1"))
+
+
+# --- scripted fills (WP 1.R2) ---------------------------------------------------------
+
+D = Decimal
+
+
+async def drain(sim: SimBroker) -> list[Fill]:
+    stream = sim.stream_fills()
+    out: list[Fill] = []
+    while True:
+        try:
+            out.append(await asyncio.wait_for(anext(stream), timeout=0.01))
+        except TimeoutError:
+            return out
+
+
+def test_fill_plan_rejects_invalid_steps() -> None:
+    for bad in (D(0), D("1.01"), D("-0.5"), D("NaN"), D("Infinity"), "later"):
+        with pytest.raises(ValueError, match="step"):
+            FillPlan((bad,))  # type: ignore[arg-type]
+    assert FillPlan((D("0.5"), D(1), "cancel", "reject")).steps[-1] == "reject"
+
+
+async def test_ioc_partial_fill_cancels_the_rest() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    sim.script(BTC, "buy", FillPlan((D("0.4"),)))
+    ack = await sim.submit_order(ioc_buy("1", "101"))
+    sim.process_bar(bar(1, 100.0))
+
+    status = await sim.get_order(ack.order_id)
+    assert (status.status, status.filled_qty, status.avg_fill_price) == (
+        "canceled",
+        D("0.4"),
+        D("100"),
+    )
+    (pos,) = await sim.get_positions()
+    assert pos.qty == D("0.4")
+    (fill,) = await drain(sim)
+    assert (fill.fill_id, fill.order_id, fill.qty) == (f"{ack.order_id}:1", ack.order_id, D("0.4"))
+
+
+async def test_ioc_scripted_cancel_on_its_bar() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    sim.script(BTC, "buy", FillPlan(("cancel",)))
+    ack = await sim.submit_order(ioc_buy("1", "101"))
+    sim.process_bar(bar(1, 100.0))
+
+    status = await sim.get_order(ack.order_id)
+    assert (status.status, status.filled_qty, status.avg_fill_price) == ("canceled", D(0), None)
+    assert await drain(sim) == []
+    assert sim.cash == D("1000")
+
+
+async def test_multi_bar_market_sell_goes_partial_then_filled() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(1, 100.0))
+    await drain(sim)
+    sim.script(BTC, "sell", FillPlan((D("0.5"), D("0.3"))))
+    ack = await sim.submit_order(market("sell", "1"))
+
+    states = []
+    for i, price in ((2, 110.0), (3, 120.0), (4, 130.0)):
+        sim.process_bar(bar(i, price))
+        states.append((await sim.get_order(ack.order_id)).status)
+
+    assert states == ["partially_filled", "partially_filled", "filled"]
+    status = await sim.get_order(ack.order_id)
+    assert status.filled_qty == D(1)
+    assert status.avg_fill_price == D("117")  # 0.5*110 + 0.3*120 + 0.2*130
+    fills = await drain(sim)
+    assert [f.fill_id for f in fills] == [f"{ack.order_id}:{n}" for n in (1, 2, 3)]
+    assert [f.qty for f in fills] == [D("0.5"), D("0.3"), D("0.2")]
+    assert await sim.get_positions() == []
+
+
+@pytest.mark.parametrize(
+    ("last", "status", "reason"),
+    [("reject", "rejected", "scripted rejection"), ("cancel", "canceled", None)],
+)
+async def test_scripted_end_keeps_earlier_fills(last: str, status: str, reason: str | None) -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    sim.script(BTC, "buy", FillPlan((D("0.5"), last)))  # type: ignore[arg-type]
+    ack = await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(1, 100.0))
+    sim.process_bar(bar(2, 100.0))
+    sim.process_bar(bar(3, 100.0))  # nothing more happens after a final state
+
+    result = await sim.get_order(ack.order_id)
+    assert (result.status, result.filled_qty, result.reason) == (status, D("0.5"), reason)
+    (pos,) = await sim.get_positions()
+    assert pos.qty == D("0.5")
+
+
+async def test_non_crossing_limit_bar_consumes_no_step() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    sim.script(BTC, "buy", FillPlan((D("0.5"),)))
+    ack = await sim.submit_order(limit("buy", "1", "90"))
+
+    sim.process_bar(bar(1, 100.0, low=95.0))  # does not trade through 90
+    assert (await sim.get_order(ack.order_id)).status == "new"
+    sim.process_bar(bar(2, 100.0, low=89.0))
+    assert (await sim.get_order(ack.order_id)).filled_qty == D("0.5")
+    sim.process_bar(bar(3, 100.0, low=89.0))
+    assert (await sim.get_order(ack.order_id)).status == "filled"
+
+
+async def test_scripts_match_fifo_per_symbol_and_side() -> None:
+    sim = make_sim(cash="10000")
+    sim.process_bar(bar(0, 100.0))
+    sim.script(BTC, "buy", FillPlan((D("0.4"),)))
+    sim.script(BTC, "buy", FillPlan((D("0.6"),)))
+    sim.script(BTC, "sell", FillPlan(("reject",)))  # never consumed by a buy
+    a = await sim.submit_order(ioc_buy("1", "101"))
+    b = await sim.submit_order(ioc_buy("1", "101"))
+    c = await sim.submit_order(ioc_buy("1", "101"))  # unscripted: fills fully
+    sim.process_bar(bar(1, 100.0))
+
+    filled = [(await sim.get_order(x.order_id)).filled_qty for x in (a, b, c)]
+    assert filled == [D("0.4"), D("0.6"), D("1")]
+
+
+async def test_partial_sell_blocks_close_until_canceled() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(1, 100.0))
+    sim.script(BTC, "sell", FillPlan((D("0.5"),)))
+    sell = await sim.submit_order(limit("sell", "1", "100"))  # gtc: rest stays open
+    sim.process_bar(bar(2, 100.0, h=101.0))
+    assert (await sim.get_order(sell.order_id)).status == "partially_filled"
+
+    with pytest.raises(OrderRejected, match="fully reserved"):
+        await sim.close_position(BTC)  # held 0.5, open sell remainder 0.5
+    await sim.cancel_order(sell.order_id)
+    ack = await sim.close_position(BTC)
+    sim.process_bar(bar(3, 100.0))
+
+    assert (await sim.get_order(ack.order_id)).filled_qty == D("0.5")
+    assert (await sim.get_order(sell.order_id)).filled_qty == D("0.5")
+    assert await sim.get_positions() == []
+
+
+async def test_partial_buy_cancel_releases_cash() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    sim.script(BTC, "buy", FillPlan((D("0.5"),)))
+    first = await sim.submit_order(limit("buy", "8", "100"))  # gtc
+    sim.process_bar(bar(1, 100.0))  # 4 filled: cash 1000 - 400 - 0.6 maker fee
+    assert (await sim.get_order(first.order_id)).status == "partially_filled"
+
+    with pytest.raises(OrderRejected, match="insufficient cash"):
+        await sim.submit_order(limit("buy", "4", "100"))  # remainder 4 is still reserved
+    await sim.cancel_order(first.order_id)
+    await sim.submit_order(limit("buy", "4", "100"))
+
+    status = await sim.get_order(first.order_id)
+    assert (status.status, status.filled_qty) == ("canceled", D("4"))
+
+
+async def test_later_slice_failing_the_cash_check_rejects_and_keeps_earlier_fills() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    sim.script(BTC, "buy", FillPlan((D("0.5"),)))
+    ack = await sim.submit_order(market("buy", "9"))
+    sim.process_bar(bar(1, 100.0))  # 4.5 filled for 451.125
+    sim.process_bar(bar(2, 200.0))  # remainder 4.5 at 200 needs 902.25 > 548.875
+
+    status = await sim.get_order(ack.order_id)
+    assert (status.status, status.filled_qty, status.reason) == (
+        "rejected",
+        D("4.5"),
+        "insufficient cash at fill",
+    )
+    assert sim.cash == D("1000") - D("450") * D("1.0025")
+
+
+async def test_pre_cancel_fill_is_delivered_after_cancel() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    sim.script(BTC, "buy", FillPlan((D("0.5"),)))
+    ack = await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(1, 100.0))
+    await sim.cancel_order(ack.order_id)  # nobody has read the stream yet
+
+    (fill,) = await drain(sim)  # delayed delivery: executed before the cancel
+    assert (fill.order_id, fill.qty) == (ack.order_id, D("0.5"))
+    sim.process_bar(bar(2, 100.0))
+    assert await drain(sim) == []  # the cancel is final: no later execution

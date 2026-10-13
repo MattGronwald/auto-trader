@@ -12,7 +12,12 @@ Fill model, driven by `process_bar()`:
 - Limit: fills when the bar trades through the limit, at the better of open and limit,
   maker fee, no slippage.
 - IOC limit: evaluated on the next processed bar only; fills like a limit but pays the
-  taker fee (it crosses the book), otherwise canceled.
+  taker fee (it crosses the book); any unfilled remainder is canceled.
+- Every execution is a slice of its order and emits one `Fill` (`fill_id` =
+  "{order_id}:{n}"). By default an order fills completely in one slice; a test can queue
+  a `FillPlan` (`script()`) to split it over bars, cancel or reject it (spec 2026-10-12
+  section 5). Partly filled orders are `partially_filled` (not final); reservations cover
+  only the unfilled remainder. `redeliver()` re-emits a fill for duplicate-delivery tests.
 - Fees are charged in quote currency (USD).
 - Spot only: sells can never exceed the position (no shorting).
 
@@ -22,11 +27,12 @@ can gap; a buy that no longer fits is rejected at fill. Bar floats are converted
 """
 
 import asyncio
+from collections import deque
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal
-from typing import cast
+from decimal import ROUND_FLOOR, Decimal
+from typing import Literal, cast
 
 import structlog
 
@@ -43,15 +49,43 @@ from autotrader.broker.base import (
     OrderState,
     OrderStatus,
     Position,
+    Side,
 )
 from autotrader.core.types import Bar
 
 _BPS = Decimal(10_000)
+_D0 = Decimal(0)
 log = structlog.get_logger(__name__)
 
 
 def _dec(value: float) -> Decimal:
     return Decimal(str(value))
+
+
+def _floor(value: Decimal, step: Decimal) -> Decimal:
+    return (value / step).to_integral_value(rounding=ROUND_FLOOR) * step
+
+
+FillStep = Decimal | Literal["cancel", "reject"]
+
+
+@dataclass(frozen=True)
+class FillPlan:
+    """Scripted outcome for one order (spec section 5): one step per bar on which the order
+    is eligible and its price condition holds. A fraction `0 < f <= 1` fills that share of
+    the *original* qty (rounded down, capped at the remainder); "cancel" / "reject" end
+    the order, keeping earlier fills. When steps run out the order fills its remainder."""
+
+    steps: tuple[FillStep, ...]
+
+    def __post_init__(self) -> None:
+        for step in self.steps:
+            if isinstance(step, Decimal):
+                # is_finite first: comparing a NaN Decimal raises InvalidOperation.
+                if not step.is_finite() or not _D0 < step <= 1:
+                    raise ValueError(f"fill step fraction must be in (0, 1], got {step}")
+            elif step not in ("cancel", "reject"):
+                raise ValueError(f"unknown fill step {step!r}")
 
 
 @dataclass
@@ -61,9 +95,23 @@ class _Order:
     submitted_at: datetime
     status: OrderState = "new"
     filled_qty: Decimal = Decimal(0)
-    avg_fill_price: Decimal | None = None
-    reason: str | None = None
+    filled_notional: Decimal = Decimal(0)
     fills: int = 0
+    reason: str | None = None
+    steps: deque[FillStep] = field(default_factory=deque)
+    full_close: bool = False  # close_position: may be off-increment (spec section 4)
+
+    @property
+    def remaining(self) -> Decimal:
+        return self.order.qty - self.filled_qty
+
+    @property
+    def is_open(self) -> bool:
+        return self.status in ("new", "partially_filled")
+
+    @property
+    def avg_fill_price(self) -> Decimal | None:
+        return None if self.filled_qty == 0 else self.filled_notional / self.filled_qty
 
 
 @dataclass
@@ -82,6 +130,7 @@ class SimBroker:
         asset_rules: Mapping[str, AssetRules],
         mode: Mode = "paper",
         timeframe: str = "1m",
+        coin_precision: Decimal = Decimal("1e-9"),
     ) -> None:
         if fees.buy_fee_asset != "quote":  # coin-denominated buy fees arrive with WP 1.R2
             raise ValueError("SimBroker models only buy_fee_asset='quote' (USD) fees")
@@ -91,6 +140,7 @@ class SimBroker:
         self.asset_rules_by_symbol = dict(asset_rules)
         self.broker_mode = mode
         self.timeframe = timeframe
+        self.coin_precision = coin_precision
         self._last_bar_ts: dict[str, datetime] = {}
         self._holdings: dict[str, _Holding] = {}
         self._orders: dict[str, _Order] = {}
@@ -99,6 +149,7 @@ class SimBroker:
         self._seq = 0
         self._fills: asyncio.Queue[Fill] = asyncio.Queue()
         self._fill_log: dict[str, Fill] = {}  # every emitted fill by id, for redeliver()
+        self._scripts: dict[tuple[str, str], deque[FillPlan]] = {}
 
     # --- Broker protocol -------------------------------------------------------------
 
@@ -113,11 +164,16 @@ class SimBroker:
         ]
 
     async def submit_order(self, order: BrokerOrder) -> OrderAck:
-        self._validate(order)
+        return await self._submit(order, full_close=False)
+
+    async def _submit(self, order: BrokerOrder, *, full_close: bool) -> OrderAck:
+        self._validate(order, full_close=full_close)
         self._seq += 1
         oid = f"sim-{self._seq}"
         submitted_at = self._now or datetime.now(UTC)
-        self._orders[oid] = _Order(oid, order, submitted_at)
+        queued = self._scripts.get((order.symbol, order.side))
+        steps: deque[FillStep] = deque(queued.popleft().steps) if queued else deque()
+        self._orders[oid] = _Order(oid, order, submitted_at, steps=steps, full_close=full_close)
         return OrderAck(
             order_id=oid,
             client_order_id=order.client_order_id,
@@ -126,11 +182,15 @@ class SimBroker:
             submitted_at=submitted_at,
         )
 
+    def script(self, symbol: str, side: Side, plan: FillPlan) -> None:
+        """Queue `plan` for the next order submitted for (symbol, side), FIFO (spec section 5)."""
+        self._scripts.setdefault((symbol, side), deque()).append(plan)
+
     async def cancel_order(self, order_id: str) -> None:
         o = self._get(order_id)
-        if o.status != "new":
+        if not o.is_open:
             raise OrderRejected(f"order {order_id} is not open ({o.status})")
-        o.status = "canceled"
+        o.status = "canceled"  # final; filled_qty is kept, the remainder is released
 
     async def get_order(self, order_id: str) -> OrderStatus:
         o = self._get(order_id)
@@ -148,8 +208,8 @@ class SimBroker:
         qty = self._holdings[symbol].qty - self._pending_qty(symbol, "sell")
         if qty <= 0:
             raise OrderRejected(f"position in {symbol} is already fully reserved by pending sells")
-        return await self.submit_order(
-            BrokerOrder(symbol=symbol, side="sell", qty=qty, type="market")
+        return await self._submit(
+            BrokerOrder(symbol=symbol, side="sell", qty=qty, type="market"), full_close=True
         )
 
     async def close_all(self) -> list[OrderAck]:
@@ -199,33 +259,60 @@ class SimBroker:
         if last is not None and bar.ts <= last:
             return False
         self._last_bar_ts[bar.symbol] = bar.ts
-        for o in [o for o in self._orders.values() if o.status == "new"]:
+        for o in [o for o in self._orders.values() if o.is_open]:
             if o.order.symbol == bar.symbol and bar.ts > o.submitted_at:
-                self._try_fill(o, bar)
-                if o.status == "new" and o.order.time_in_force == "ioc":
+                self._on_bar(o, bar)
+                if o.is_open and o.order.time_in_force == "ioc":
                     o.status = "canceled"  # IOC: only the first bar after submit counts
         self._last_price[bar.symbol] = _dec(bar.close)
         self._now = bar.ts if self._now is None else max(self._now, bar.ts)
         return True
 
-    def _try_fill(self, o: _Order, bar: Bar) -> None:
-        order, open_ = o.order, _dec(bar.open)
+    def _on_bar(self, o: _Order, bar: Bar) -> None:
+        priced = self._price(o.order, bar)
+        if priced is None:
+            return  # limit not traded through: no step is consumed
+        price, fee_bps = priced
+        step: FillStep = o.steps.popleft() if o.steps else Decimal(1)
+        if step == "cancel":
+            o.status = "canceled"
+        elif step == "reject":
+            o.status, o.reason = "rejected", "scripted rejection"
+        else:
+            qty = self._slice(o, step)  # narrowed to Decimal by the branches above
+            if qty > 0:
+                self._fill(o, qty, price, fee_bps, bar.ts)
+
+    def _price(self, order: BrokerOrder, bar: Bar) -> tuple[Decimal, Decimal] | None:
+        """Fill price and fee rate in bps for `order` on `bar`, or None if it can't fill."""
+        open_ = _dec(bar.open)
         if order.type == "market":
             slip = self.slippage_bps / _BPS
             price = open_ * (1 + slip) if order.side == "buy" else open_ * (1 - slip)
-            fee_bps = self.fees.taker_bps
+            return price, self.fees.taker_bps
+        limit = cast(Decimal, order.limit_price)  # BrokerOrder guarantees it for limits
+        if order.side == "buy" and _dec(bar.low) <= limit:
+            price = min(open_, limit)
+        elif order.side == "sell" and _dec(bar.high) >= limit:
+            price = max(open_, limit)
         else:
-            limit = cast(Decimal, order.limit_price)  # BrokerOrder guarantees it for limits
-            if order.side == "buy" and _dec(bar.low) <= limit:
-                price = min(open_, limit)
-            elif order.side == "sell" and _dec(bar.high) >= limit:
-                price = max(open_, limit)
-            else:
-                return
-            # An IOC limit crosses the book at submit (marketable limit): taker, not maker.
-            ioc = order.time_in_force == "ioc"
-            fee_bps = self.fees.taker_bps if ioc else self.fees.maker_bps
-        notional = price * order.qty
+            return None
+        # An IOC limit crosses the book at submit (marketable limit): taker, not maker.
+        ioc = order.time_in_force == "ioc"
+        return price, self.fees.taker_bps if ioc else self.fees.maker_bps
+
+    def _slice(self, o: _Order, fraction: Decimal) -> Decimal:
+        """`fraction` of the original qty, rounded down and capped at the remainder. An
+        off-increment full close rounds to `coin_precision` instead (spec section 5)."""
+        increment = self.asset_rules_by_symbol[o.order.symbol].qty_increment
+        step = increment if o.order.qty % increment == 0 else self.coin_precision
+        return min(_floor(fraction * o.order.qty, step), o.remaining)
+
+    def _fill(
+        self, o: _Order, qty: Decimal, price: Decimal, fee_bps: Decimal, ts: datetime
+    ) -> None:
+        order = o.order
+        notional = price * qty
         fee = notional * fee_bps / _BPS
         if order.side == "buy":
             if notional + fee > self.cash:
@@ -234,41 +321,43 @@ class SimBroker:
             self.cash -= notional + fee
             held = self._holdings.get(order.symbol)
             if held is None:
-                self._holdings[order.symbol] = _Holding(order.qty, price)
+                self._holdings[order.symbol] = _Holding(qty, price)
             else:
-                total = held.qty + order.qty
-                held.avg_entry_price = (held.qty * held.avg_entry_price + notional) / total
+                total = held.qty + qty
+                held.avg_entry_price = (held.qty * held.avg_entry_price + qty * price) / total
                 held.qty = total
         else:
             held = self._holdings[order.symbol]  # reserved at submit; cannot be missing
             self.cash += notional - fee
-            held.qty -= order.qty
+            held.qty -= qty
             if held.qty == 0:
                 del self._holdings[order.symbol]
-        o.status, o.filled_qty, o.avg_fill_price = "filled", order.qty, price
+        o.filled_qty += qty
+        o.filled_notional += notional
+        o.status = "filled" if o.remaining == 0 else "partially_filled"
         o.fills += 1
         fill = Fill(
             fill_id=f"{o.id}:{o.fills}",
             order_id=o.id,
             symbol=order.symbol,
             side=order.side,
-            qty=order.qty,
+            qty=qty,
             price=price,
             fee=fee,
             fee_asset="quote",
-            ts=bar.ts,
+            ts=ts,
         )
         self._fill_log[fill.fill_id] = fill
         self._fills.put_nowait(fill)
 
-    def _validate(self, order: BrokerOrder) -> None:
+    def _validate(self, order: BrokerOrder, *, full_close: bool = False) -> None:
         rules = self.asset_rules_by_symbol.get(order.symbol)
         if rules is None:
             raise OrderRejected(f"unknown symbol {order.symbol}")
         last = self._last_price.get(order.symbol)
         if last is None:
             raise OrderRejected(f"no price for {order.symbol} yet")
-        if order.qty % rules.qty_increment != 0:
+        if not full_close and order.qty % rules.qty_increment != 0:
             raise OrderRejected(
                 f"qty {order.qty} is not a multiple of increment {rules.qty_increment}"
             )
@@ -279,7 +368,7 @@ class SimBroker:
             raise OrderRejected(f"notional below minimum {rules.min_notional}")
         if order.side == "buy":
             available = self.cash - self._reserved_cash()
-            if self._estimated_cost(order, last) > available:
+            if self._estimated_cost(order, last, order.qty) > available:
                 raise OrderRejected(f"insufficient cash: {available} available")
         else:
             held = self._holdings.get(order.symbol)
@@ -287,29 +376,31 @@ class SimBroker:
             if order.qty > free:
                 raise OrderRejected(f"sell qty {order.qty} exceeds position ({free} free)")
 
-    def _estimated_cost(self, order: BrokerOrder, last: Decimal) -> Decimal:
+    def _estimated_cost(self, order: BrokerOrder, last: Decimal, qty: Decimal) -> Decimal:
         if order.limit_price is not None:
             fee_bps = self.fees.taker_bps if order.time_in_force == "ioc" else self.fees.maker_bps
-            return order.limit_price * order.qty * (1 + fee_bps / _BPS)
+            return order.limit_price * qty * (1 + fee_bps / _BPS)
         price = last * (1 + self.slippage_bps / _BPS)
-        return price * order.qty * (1 + self.fees.taker_bps / _BPS)
+        return price * qty * (1 + self.fees.taker_bps / _BPS)
 
     def _reserved_cash(self) -> Decimal:
+        """Estimated cost of the unfilled remainder of every open buy."""
         return sum(
             (
-                self._estimated_cost(o.order, self._last_price[o.order.symbol])
+                self._estimated_cost(o.order, self._last_price[o.order.symbol], o.remaining)
                 for o in self._orders.values()
-                if o.status == "new" and o.order.side == "buy"
+                if o.is_open and o.order.side == "buy"
             ),
             Decimal(0),
         )
 
     def _pending_qty(self, symbol: str, side: str) -> Decimal:
+        """Unfilled remainder of open orders for (symbol, side)."""
         return sum(
             (
-                o.order.qty
+                o.remaining
                 for o in self._orders.values()
-                if o.status == "new" and o.order.symbol == symbol and o.order.side == side
+                if o.is_open and o.order.symbol == symbol and o.order.side == side
             ),
             Decimal(0),
         )
