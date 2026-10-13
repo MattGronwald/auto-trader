@@ -63,6 +63,7 @@ class _Order:
     filled_qty: Decimal = Decimal(0)
     avg_fill_price: Decimal | None = None
     reason: str | None = None
+    fills: int = 0
 
 
 @dataclass
@@ -97,6 +98,7 @@ class SimBroker:
         self._now: datetime | None = None
         self._seq = 0
         self._fills: asyncio.Queue[Fill] = asyncio.Queue()
+        self._fill_log: dict[str, Fill] = {}  # every emitted fill by id, for redeliver()
 
     # --- Broker protocol -------------------------------------------------------------
 
@@ -164,6 +166,12 @@ class SimBroker:
     async def stream_fills(self) -> AsyncIterator[Fill]:
         while True:
             yield await self._fills.get()
+
+    def redeliver(self, fill_id: str) -> None:
+        """Put an already emitted fill on the stream again (same `fill_id`), for duplicate
+        and out-of-order delivery tests. It never creates a new execution. Unknown ids
+        raise KeyError."""
+        self._fills.put_nowait(self._fill_log[fill_id])
 
     def mode(self) -> Mode:
         return self.broker_mode
@@ -238,17 +246,20 @@ class SimBroker:
             if held.qty == 0:
                 del self._holdings[order.symbol]
         o.status, o.filled_qty, o.avg_fill_price = "filled", order.qty, price
-        self._fills.put_nowait(
-            Fill(
-                order_id=o.id,
-                symbol=order.symbol,
-                side=order.side,
-                qty=order.qty,
-                price=price,
-                fee=fee,
-                ts=bar.ts,
-            )
+        o.fills += 1
+        fill = Fill(
+            fill_id=f"{o.id}:{o.fills}",
+            order_id=o.id,
+            symbol=order.symbol,
+            side=order.side,
+            qty=order.qty,
+            price=price,
+            fee=fee,
+            fee_asset="quote",
+            ts=bar.ts,
         )
+        self._fill_log[fill.fill_id] = fill
+        self._fills.put_nowait(fill)
 
     def _validate(self, order: BrokerOrder) -> None:
         rules = self.asset_rules_by_symbol.get(order.symbol)

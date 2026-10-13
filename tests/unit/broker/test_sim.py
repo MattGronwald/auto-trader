@@ -356,6 +356,35 @@ async def test_fills_are_streamed_in_order() -> None:
     assert fills[0].fee == Decimal("100") * Decimal("0.0025")
 
 
+async def test_fills_carry_stable_unique_ids_and_fee_asset() -> None:
+    sim = make_sim(cash="10000")
+    sim.process_bar(bar(0, 100.0))
+    a = await sim.submit_order(market("buy", "1"))
+    b = await sim.submit_order(market("buy", "2"))
+    sim.process_bar(bar(1, 100.0))
+
+    stream = sim.stream_fills()
+    fills = [await asyncio.wait_for(anext(stream), timeout=1) for _ in range(2)]
+
+    assert [f.fill_id for f in fills] == [f"{a.order_id}:1", f"{b.order_id}:1"]
+    assert all(f.fee_asset == "quote" for f in fills)
+
+
+async def test_redeliver_repeats_the_identical_fill() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(1, 100.0))
+    stream = sim.stream_fills()
+    first = await asyncio.wait_for(anext(stream), timeout=1)
+
+    sim.redeliver(first.fill_id)
+
+    assert await asyncio.wait_for(anext(stream), timeout=1) == first
+    with pytest.raises(KeyError):
+        sim.redeliver("sim-999:1")
+
+
 # --- invariants ----------------------------------------------------------------------
 
 _actions = st.lists(
