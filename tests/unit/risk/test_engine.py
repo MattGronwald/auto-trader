@@ -633,6 +633,43 @@ async def test_own_orders_are_refreshed_before_positions_are_read(
     assert "already has a position or open entry" in result.decision.reasons[0]
 
 
+class PartialFillBroker(SimBroker):
+    """Reports every order as partially filled (an IOC never rests there in SimBroker)."""
+
+    async def get_order(self, order_id: str) -> OrderStatus:
+        status = await super().get_order(order_id)
+        return status.model_copy(update={"status": "partially_filled"})
+
+
+async def test_partially_filled_entry_stays_open_and_is_recorded(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    broker = PartialFillBroker(
+        cash=D("1000"), fees=FEES, slippage_bps=D(0), asset_rules={BTC: RULES}, timeframe="5m"
+    )
+    broker.process_bar(five(29))
+    engine = make_engine_(broker, sessions, gate)
+    await engine.check(intent(cycle_id))
+    async with sessions() as s:
+        strategy = await repo.register_strategy(s, PROFILE, "yaml")
+        row = m.Cycle(
+            strategy_id=strategy.id,
+            symbol=BTC,
+            rule_id="r",
+            signal_features={},
+            state="RISK_CHECK",
+            created_at=NOW,
+        )
+        s.add(row)
+        await s.commit()
+        second = row.id
+
+    for _ in range(2):  # first poll records the change, the second sees it unchanged
+        result = await engine.check(intent(second))
+        assert "already has a position or open entry" in result.decision.reasons[0]
+        assert [o.status for o in await orders(sessions)] == ["partially_filled"]
+
+
 async def _held_btc(sim: SimBroker) -> None:
     await sim.submit_order(BrokerOrder(symbol=BTC, side="buy", qty=D("1"), type="market"))
     sim.process_bar(five(30))

@@ -59,6 +59,9 @@ log = structlog.get_logger(__name__)
 HOUR = timedelta(hours=1)
 T = TypeVar("T")
 
+# Broker order states that are not final: the order can still fill (some of) its qty.
+_BROKER_OPEN = ("new", "partially_filled")
+
 
 class RiskMarketView(Protocol):
     def history(self, symbol: str, timeframe: str) -> list[Bar]: ...
@@ -238,19 +241,21 @@ class RiskEngine:
         return control, portfolio, market
 
     async def _refresh_open_entries(self, deadline: float) -> list[Order]:
-        """Order status sync for our own acked entries (WP 1.6 adds the fill stream):
-        without it an IOC entry would stay `new` and block its symbol forever. No DB
-        session is held open across the broker calls."""
+        """Order status sync for our own acked entries (WP 1.6 adds the fill stream): a
+        final broker status is written and the row leaves the open set; "partially_filled"
+        is written but stays open. Without it an IOC entry would stay `new` and block its
+        symbol forever. No DB session is held open across the broker calls."""
         async with self._sessions() as session:
             rows = await repo.open_entry_orders(session)
         still_open: list[Order] = []
         changed: list[tuple[int, str]] = []
         for row in rows:
-            if row.status == "new" and row.broker_order_id is not None:
+            if row.status in _BROKER_OPEN and row.broker_order_id is not None:
                 get_order = partial(self._broker.get_order, row.broker_order_id)
                 status = await self._within(deadline, get_order)
-                if status.status != "new":
+                if status.status != row.status:
                     changed.append((row.id, status.status))
+                if status.status not in _BROKER_OPEN:
                     continue
             still_open.append(row)
         if changed:
