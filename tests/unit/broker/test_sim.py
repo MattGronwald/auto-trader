@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from autotrader.broker.base import (
@@ -967,7 +967,23 @@ _scripted_actions = st.lists(
 )
 
 
+_SELL_SIDE_REPLAY = [
+    ("buy", 20, 100.0),
+    ("bar", 1, 100.0),
+    ("script_sell", 10, 100.0),  # partial: 0.2 of the next sell
+    ("sell", 5, 100.0),
+    ("bar", 1, 101.0),
+    ("bar", 1, 102.0),
+    ("sell", 3, 100.0),
+    ("bar", 1, 99.0),
+    ("close", 1, 100.0),
+    ("bar", 1, 98.0),
+]
+
+
 @given(_scripted_actions, st.sampled_from(["base", "quote"]))
+@example(_SELL_SIDE_REPLAY, "base")
+@example(_SELL_SIDE_REPLAY, "quote")
 @settings(max_examples=200, deadline=None)
 def test_replaying_fills_reproduces_cash_and_positions(
     actions: list[tuple[str, int, float]], fee_asset: str
@@ -1050,7 +1066,8 @@ def test_ioc_buy_then_stop_sale_matches_d16_net_loss(
     fees = FEES.model_copy(update={"buy_fee_asset": fee_asset})
     stop = (entry * (1 - drop)).quantize(D("0.01"))
     qty = D(qty_steps) * D("0.0001")
-    check_d16(*asyncio.run(stop_out(entry, stop, qty, fees, RULES)), fee_asset)
+    loss, expected, _ = asyncio.run(stop_out(entry, stop, qty, fees, RULES))
+    assert abs(loss - expected) < TINY  # exact on this grid for both fee assets
 
 
 @given(
