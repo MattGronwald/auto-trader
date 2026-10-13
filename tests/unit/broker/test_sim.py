@@ -730,6 +730,25 @@ async def test_non_crossing_limit_bar_consumes_no_step() -> None:
     assert (await sim.get_order(ack.order_id)).status == "filled"
 
 
+async def test_zero_size_slice_fills_nothing_but_consumes_its_step() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    sim.script(BTC, "buy", FillPlan((D("0.00001"),)))  # 1e-5 x 1 floors to 0 at 0.0001
+    ack = await sim.submit_order(market("buy", "1"))
+
+    sim.process_bar(bar(1, 100.0))
+    status = await sim.get_order(ack.order_id)
+    assert (status.status, status.filled_qty) == ("new", D(0))
+    assert await drain(sim) == []
+    assert sim.cash == D("1000")
+
+    sim.process_bar(bar(2, 100.0))  # steps exhausted: the full remainder fills
+    status = await sim.get_order(ack.order_id)
+    assert (status.status, status.filled_qty) == ("filled", D(1))
+    (fill,) = await drain(sim)
+    assert (fill.fill_id, fill.qty) == (f"{ack.order_id}:1", D(1))
+
+
 async def test_scripts_match_fifo_per_symbol_and_side() -> None:
     sim = make_sim(cash="10000")
     sim.process_bar(bar(0, 100.0))

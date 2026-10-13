@@ -85,8 +85,10 @@ FillStep = Decimal | Literal["cancel", "reject"]
 class FillPlan:
     """Scripted outcome for one order (spec section 5): one step per bar on which the order
     is eligible and its price condition holds. A fraction `0 < f <= 1` fills that share of
-    the *original* qty (rounded down, capped at the remainder); "cancel" / "reject" end
-    the order, keeping earlier fills. When steps run out the order fills its remainder."""
+    the *original* qty (rounded down, capped at the remainder); a fraction whose slice
+    rounds down to 0 fills nothing on that bar but still consumes its step. "cancel" /
+    "reject" end the order, keeping earlier fills. When steps run out the order fills its
+    remainder."""
 
     steps: tuple[FillStep, ...]
 
