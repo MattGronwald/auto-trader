@@ -24,6 +24,10 @@ Fill model, driven by `process_bar()`:
   slice too small for its rounded coin fee is rejected. `avg_entry_price` is the fill
   price (Alpaca's convention); cash is exact, never rounded to cents (spec section 3).
 - Spot only: sells can never exceed the position (no shorting).
+- `close_position` sells the exact held qty minus pending sell remainders, even when it
+  is not a multiple of `qty_increment` (Alpaca accepted the exact net qty on paper); a
+  remainder below `min_qty` is dust and is rejected (spec section 4). Whether Alpaca rejects
+  a sell below `min_order_size` is unverified (WP 1.6).
 
 Cash is checked at submit (reserving pending buys) and again at fill, because the price
 can gap; a buy that no longer fits is rejected at fill. Bar floats are converted via
@@ -230,6 +234,9 @@ class SimBroker:
         qty = self._holdings[symbol].qty - self._pending_qty(symbol, "sell")
         if qty <= 0:
             raise OrderRejected(f"position in {symbol} is already fully reserved by pending sells")
+        rules = self.asset_rules_by_symbol[symbol]
+        if qty < rules.min_qty:  # unsellable remainder: stays as dust (HeldPosition.is_dust)
+            raise OrderRejected(f"dust below minimum: {qty} < min_qty {rules.min_qty}")
         return await self._submit(
             BrokerOrder(symbol=symbol, side="sell", qty=qty, type="market"), full_close=True
         )

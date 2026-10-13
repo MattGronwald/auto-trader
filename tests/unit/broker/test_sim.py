@@ -923,3 +923,32 @@ def test_coin_precision_must_be_a_finite_positive_decimal(precision: object) -> 
             asset_rules=FINE,
             coin_precision=precision,  # type: ignore[arg-type]
         )
+
+
+async def test_close_sells_an_off_increment_holding_exactly() -> None:
+    sim = make_sim(fees=BASE)
+    sim.process_bar(bar(0, 100.0))
+    await sim.submit_order(market("buy", "1.0003"))
+    sim.process_bar(bar(1, 100.0))
+    (pos,) = await sim.get_positions()
+    assert pos.qty == D("0.99779925")  # not a multiple of the 0.0001 increment
+
+    with pytest.raises(OrderRejected, match="not a multiple"):
+        await sim.submit_order(market("sell", "0.99779925"))  # ordinary orders still checked
+    ack = await sim.close_position(BTC)
+    sim.process_bar(bar(2, 100.0))
+
+    assert (await sim.get_order(ack.order_id)).filled_qty == D("0.99779925")
+    assert await sim.get_positions() == []
+
+
+async def test_close_of_dust_is_rejected_and_the_position_stays() -> None:
+    sim = make_sim(fees=BASE)
+    sim.process_bar(bar(0, 20000.0))  # notional 2 >= min_notional 1
+    await sim.submit_order(market("buy", "0.0001"))
+    sim.process_bar(bar(1, 20000.0))  # net 0.00009975 < min_qty 0.0001
+
+    with pytest.raises(OrderRejected, match="dust below minimum"):
+        await sim.close_position(BTC)
+    (pos,) = await sim.get_positions()
+    assert pos.qty == D("0.00009975")
