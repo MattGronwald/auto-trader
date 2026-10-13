@@ -18,7 +18,11 @@ Fill model, driven by `process_bar()`:
   a `FillPlan` (`script()`) to split it over bars, cancel or reject it (spec 2026-10-12
   section 5). Partly filled orders are `partially_filled` (not final); reservations cover
   only the unfilled remainder. `redeliver()` re-emits a fill for duplicate-delivery tests.
-- Fees are charged in quote currency (USD).
+- Fees: sells pay in USD out of the proceeds. Buys follow `FeeSchedule.buy_fee_asset`:
+  "quote" pays the fee in USD on top of the notional; "base" (Alpaca) pays exactly the
+  notional and takes the fee from the coin, rounded up to `coin_precision` (1e-9). A
+  slice too small for its rounded coin fee is rejected. `avg_entry_price` is the fill
+  price (Alpaca's convention); cash is exact, never rounded to cents (spec section 3).
 - Spot only: sells can never exceed the position (no shorting).
 
 Cash is checked at submit (reserving pending buys) and again at fill, because the price
@@ -31,7 +35,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Literal, cast
 
 import structlog
@@ -64,6 +68,10 @@ def _dec(value: float) -> Decimal:
 
 def _floor(value: Decimal, step: Decimal) -> Decimal:
     return (value / step).to_integral_value(rounding=ROUND_FLOOR) * step
+
+
+def _ceil(value: Decimal, step: Decimal) -> Decimal:
+    return (value / step).to_integral_value(rounding=ROUND_CEILING) * step
 
 
 FillStep = Decimal | Literal["cancel", "reject"]
@@ -132,8 +140,22 @@ class SimBroker:
         timeframe: str = "1m",
         coin_precision: Decimal = Decimal("1e-9"),
     ) -> None:
-        if fees.buy_fee_asset != "quote":  # coin-denominated buy fees arrive with WP 1.R2
-            raise ValueError("SimBroker models only buy_fee_asset='quote' (USD) fees")
+        # Validate before any arithmetic: a negative quantum would turn the round-up into a
+        # round-down, and 0 or NaN raise InvalidOperation in the modulo below.
+        if (
+            not isinstance(coin_precision, Decimal)
+            or not coin_precision.is_finite()
+            or coin_precision <= 0
+        ):
+            raise ValueError(f"coin_precision must be a finite Decimal > 0, got {coin_precision!r}")
+        for symbol, symbol_rules in asset_rules.items():
+            # Applies to both fee assets: quantities never go below one coin quantum, and a
+            # coin fee rounded up to coin_precision can't exceed a minimal slice (spec section 3).
+            if symbol_rules.qty_increment % coin_precision != 0:
+                raise ValueError(
+                    f"{symbol}: qty_increment {symbol_rules.qty_increment} is not a multiple "
+                    f"of coin_precision {coin_precision}"
+                )
         self.cash = cash
         self.fees = fees
         self.slippage_bps = slippage_bps
@@ -313,18 +335,31 @@ class SimBroker:
     ) -> None:
         order = o.order
         notional = price * qty
-        fee = notional * fee_bps / _BPS
+        rate = fee_bps / _BPS
+        if order.side == "buy" and self.fees.buy_fee_asset == "base":
+            # Alpaca takes the buy fee from the coin at fill (G10, fee check step 1),
+            # rounded up; cash pays exactly the notional.
+            fee_asset: Literal["base", "quote"] = "base"
+            fee = _ceil(qty * rate, self.coin_precision)
+            cost, received = notional, qty - fee
+            if received <= 0:
+                o.status, o.reason = "rejected", "fill too small for coin fee"
+                return
+        else:
+            fee_asset, fee = "quote", notional * rate
+            cost, received = notional + fee, qty
         if order.side == "buy":
-            if notional + fee > self.cash:
+            if cost > self.cash:
                 o.status, o.reason = "rejected", "insufficient cash at fill"
                 return
-            self.cash -= notional + fee
+            self.cash -= cost
             held = self._holdings.get(order.symbol)
             if held is None:
-                self._holdings[order.symbol] = _Holding(qty, price)
+                self._holdings[order.symbol] = _Holding(received, price)
             else:
-                total = held.qty + qty
-                held.avg_entry_price = (held.qty * held.avg_entry_price + qty * price) / total
+                # Weighted by coins held at fill prices: Alpaca keeps avg_entry_price = p.
+                total = held.qty + received
+                held.avg_entry_price = (held.qty * held.avg_entry_price + received * price) / total
                 held.qty = total
         else:
             held = self._holdings[order.symbol]  # reserved at submit; cannot be missing
@@ -344,7 +379,7 @@ class SimBroker:
             qty=qty,
             price=price,
             fee=fee,
-            fee_asset="quote",
+            fee_asset=fee_asset,
             ts=ts,
         )
         self._fill_log[fill.fill_id] = fill
@@ -378,10 +413,14 @@ class SimBroker:
 
     def _estimated_cost(self, order: BrokerOrder, last: Decimal, qty: Decimal) -> Decimal:
         if order.limit_price is not None:
+            price = order.limit_price
             fee_bps = self.fees.taker_bps if order.time_in_force == "ioc" else self.fees.maker_bps
-            return order.limit_price * qty * (1 + fee_bps / _BPS)
-        price = last * (1 + self.slippage_bps / _BPS)
-        return price * qty * (1 + self.fees.taker_bps / _BPS)
+        else:
+            price = last * (1 + self.slippage_bps / _BPS)
+            fee_bps = self.fees.taker_bps
+        if self.fees.buy_fee_asset == "base":  # the fee comes out of the coin, not cash
+            return price * qty
+        return price * qty * (1 + fee_bps / _BPS)
 
     def _reserved_cash(self) -> Decimal:
         """Estimated cost of the unfilled remainder of every open buy."""

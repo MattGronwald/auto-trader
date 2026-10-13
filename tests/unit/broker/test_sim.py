@@ -37,16 +37,14 @@ RULES = {
 FEES = FeeSchedule(maker_bps=Decimal("15"), taker_bps=Decimal("25"), buy_fee_asset="quote")
 
 
-def test_sim_refuses_coin_denominated_buy_fees_until_it_models_them() -> None:
-    # SimBroker charges every fee in USD (until WP 1.R2). Accepting a "base" schedule
-    # would make the Risk Engine size for coin fees the simulator never applies.
-    with pytest.raises(ValueError, match="buy_fee_asset"):
-        make_sim(fees=FEES.model_copy(update={"buy_fee_asset": "base"}))
-
-
-def make_sim(cash: str = "1000", slippage_bps: str = "0", fees: FeeSchedule = FEES) -> SimBroker:
+def make_sim(
+    cash: str = "1000",
+    slippage_bps: str = "0",
+    fees: FeeSchedule = FEES,
+    rules: dict[str, AssetRules] = RULES,
+) -> SimBroker:
     return SimBroker(
-        cash=Decimal(cash), fees=fees, slippage_bps=Decimal(slippage_bps), asset_rules=RULES
+        cash=Decimal(cash), fees=fees, slippage_bps=Decimal(slippage_bps), asset_rules=rules
     )
 
 
@@ -813,3 +811,115 @@ async def test_pre_cancel_fill_is_delivered_after_cancel() -> None:
     assert (fill.order_id, fill.qty) == (ack.order_id, D("0.5"))
     sim.process_bar(bar(2, 100.0))
     assert await drain(sim) == []  # the cancel is final: no later execution
+
+
+# --- coin-denominated buy fees (WP 1.R2, D10) -----------------------------------------
+
+BASE = FEES.model_copy(update={"buy_fee_asset": "base"})
+FINE = {  # Alpaca's real BTC precision (docs/alpaca-notes.md, asset rules)
+    BTC: AssetRules(
+        min_qty=D("1e-9"), qty_increment=D("1e-9"), min_notional=D(0), price_increment=D("0.01")
+    )
+}
+
+
+async def test_base_buy_takes_the_fee_from_the_coin() -> None:
+    sim = make_sim(fees=BASE)
+    sim.process_bar(bar(0, 100.0))
+    ack = await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(1, 100.0))
+
+    assert sim.cash == D("900")  # exactly the notional
+    (pos,) = await sim.get_positions()
+    assert (pos.qty, pos.avg_entry_price) == (D("0.9975"), D("100"))
+    (fill,) = await drain(sim)
+    assert (fill.qty, fill.fee, fill.fee_asset) == (D(1), D("0.0025"), "base")
+    assert (await sim.get_order(ack.order_id)).filled_qty == D(1)  # gross
+
+
+async def test_base_fee_rounds_up_like_the_paper_fill() -> None:
+    # Fee check step 1 (2026-10-11): 0.000118113 BTC at 82994.2 left 0.000117817.
+    sim = make_sim(fees=BASE, rules=FINE)
+    sim.process_bar(bar(0, 82994.2))
+    await sim.submit_order(ioc_buy("0.000118113", "82994.2"))
+    sim.process_bar(bar(1, 82994.2))
+
+    (pos,) = await sim.get_positions()
+    assert pos.qty == D("0.000117817")  # fee 2.952825e-7 rounded up to 2.96e-7
+    assert sim.cash == D("1000") - D("0.000118113") * D("82994.2")
+
+
+async def test_base_sell_still_pays_usd() -> None:
+    sim = make_sim(fees=BASE)
+    sim.process_bar(bar(0, 100.0))
+    await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(1, 100.0))
+    await sim.submit_order(market("sell", "0.9975"))
+    sim.process_bar(bar(2, 100.0))
+
+    assert sim.cash == D("900") + D("99.75") * D("0.9975")
+    fills = await drain(sim)
+    assert (fills[-1].fee, fills[-1].fee_asset) == (D("99.75") * D("0.0025"), "quote")
+
+
+async def test_base_buy_adds_to_existing_position() -> None:
+    sim = make_sim(fees=BASE)
+    sim.process_bar(bar(0, 100.0))
+    await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(1, 100.0))
+    await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(2, 200.0))
+
+    (pos,) = await sim.get_positions()
+    assert pos.qty == D("1.995")
+    assert pos.avg_entry_price == D("150")  # (0.9975*100 + 0.9975*200) / 1.995
+
+
+async def test_base_cash_checks_need_only_the_notional() -> None:
+    sim = make_sim(cash="100", fees=BASE)
+    sim.process_bar(bar(0, 100.0))
+    ack = await sim.submit_order(limit("buy", "1", "100"))  # quote fees would need 100.15
+    sim.process_bar(bar(1, 100.0))
+
+    assert (await sim.get_order(ack.order_id)).status == "filled"
+    assert sim.cash == D(0)
+    (pos,) = await sim.get_positions()
+    assert pos.qty == D("0.9985")  # 15 bps maker fee taken from the coin
+
+
+async def test_base_slice_too_small_for_its_fee_is_rejected_before_any_change() -> None:
+    sim = make_sim(fees=BASE, rules=FINE)
+    sim.process_bar(bar(0, 100.0))
+    sim.script(BTC, "buy", FillPlan((D("0.5"),)))
+    ack = await sim.submit_order(market("buy", "0.000000003"))  # 3 quanta
+    sim.process_bar(bar(1, 100.0))  # slice of 1 quantum: fee rounds up to 1 quantum
+    status = await sim.get_order(ack.order_id)
+
+    assert (status.status, status.filled_qty, status.reason) == (
+        "rejected",
+        D(0),
+        "fill too small for coin fee",
+    )
+    assert sim.cash == D("1000")
+    assert await sim.get_positions() == []
+    assert await drain(sim) == []
+
+
+def test_increment_must_be_a_multiple_of_coin_precision() -> None:
+    finer = {BTC: FINE[BTC].model_copy(update={"qty_increment": D("1e-10")})}
+    with pytest.raises(ValueError, match="coin_precision"):
+        make_sim(fees=BASE, rules=finer)
+
+
+@pytest.mark.parametrize("precision", [D("-1e-9"), D(0), D("NaN"), D("Infinity"), 1e-9, True])
+def test_coin_precision_must_be_a_finite_positive_decimal(precision: object) -> None:
+    # A negative quantum passes the divisibility check and turns the fee's round-up into a
+    # round-down (PR #21 plan review); floats/bools are refused at the money/qty boundary.
+    with pytest.raises(ValueError, match="coin_precision"):
+        SimBroker(
+            cash=D("1000"),
+            fees=BASE,
+            slippage_bps=D(0),
+            asset_rules=FINE,
+            coin_precision=precision,  # type: ignore[arg-type]
+        )
