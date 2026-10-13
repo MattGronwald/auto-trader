@@ -17,6 +17,7 @@ from autotrader.broker.base import (
 )
 from autotrader.broker.sim import FillPlan, SimBroker
 from autotrader.core.types import Bar
+from autotrader.risk.checks import net_pnl_per_unit
 
 T0 = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 BTC = "BTC/USD"
@@ -952,3 +953,123 @@ async def test_close_of_dust_is_rejected_and_the_position_stays() -> None:
         await sim.close_position(BTC)
     (pos,) = await sim.get_positions()
     assert pos.qty == D("0.00009975")
+
+
+# --- properties (WP 1.R2) ---------------------------------------------------------------
+
+_scripted_actions = st.lists(
+    st.tuples(
+        st.sampled_from(["buy", "sell", "limit_buy", "script_buy", "script_sell", "close", "bar"]),
+        st.integers(min_value=1, max_value=50),
+        st.floats(min_value=50, max_value=150, allow_nan=False),
+    ),
+    max_size=40,
+)
+
+
+@given(_scripted_actions, st.sampled_from(["base", "quote"]))
+@settings(max_examples=200, deadline=None)
+def test_replaying_fills_reproduces_cash_and_positions(
+    actions: list[tuple[str, int, float]], fee_asset: str
+) -> None:
+    async def run() -> None:
+        fees = FEES.model_copy(update={"buy_fee_asset": fee_asset})
+        sim = make_sim(cash="2000", slippage_bps="5", fees=fees)
+        sim.process_bar(bar(0, 100.0))
+        for i, (kind, n, price) in enumerate(actions, start=1):
+            qty = str(D(n) / 100)
+            try:
+                if kind == "bar":
+                    sim.process_bar(bar(i, price, h=price * 1.01, low=price * 0.99))
+                elif kind in ("buy", "sell"):
+                    await sim.submit_order(market(kind, qty))
+                elif kind == "limit_buy":
+                    await sim.submit_order(limit("buy", qty, str(round(price, 2))))
+                elif kind == "close":
+                    await sim.close_position(BTC)
+                else:
+                    side = kind.removeprefix("script_")
+                    sim.script(BTC, side, FillPlan((D(n) / 50,)))  # type: ignore[arg-type]
+            except OrderRejected:
+                pass
+        cash, coins = D("2000"), D(0)
+        for f in await drain(sim):
+            if f.side == "buy":
+                cash -= f.qty * f.price + (f.fee if f.fee_asset == "quote" else 0)
+                coins += f.qty - (f.fee if f.fee_asset == "base" else 0)
+            else:
+                cash += f.qty * f.price - f.fee
+                coins -= f.qty
+        # Cash: exact up to Decimal's 28-digit rounding (summation order differs).
+        assert abs(sim.cash - cash) < D("1e-18")
+        held = {p.symbol: p.qty for p in await sim.get_positions()}
+        assert held.get(BTC, D(0)) == coins  # coin quantities are exact
+        assert sim.cash >= 0 and all(q > 0 for q in held.values())
+
+    asyncio.run(run())
+
+
+async def stop_out(
+    entry: Decimal, stop: Decimal, qty: Decimal, fees: FeeSchedule, rules: dict[str, AssetRules]
+) -> tuple[Decimal, Decimal, Decimal]:
+    """IOC buy at `entry`, full close on a bar opening at `stop`. Returns (simulated loss,
+    D16 expected loss, one-quantum bound)."""
+    exit_slippage = D(10)  # the profile's risk.exit_slippage_bps
+    sim = SimBroker(cash=D("1000000"), fees=fees, slippage_bps=exit_slippage, asset_rules=rules)
+    sim.process_bar(bar(0, float(entry)))
+    await sim.submit_order(ioc_buy(str(qty), str(entry)))
+    sim.process_bar(bar(1, float(entry)))  # IOC limit fills at entry, taker, no slip
+    await sim.close_position(BTC)
+    sim.process_bar(bar(2, float(stop)))  # market sell at stop x (1 - 10 bps)
+    loss = D("1000000") - sim.cash
+    expected = -net_pnl_per_unit(entry, stop, fees, exit_slippage) * qty
+    return loss, expected, sim.coin_precision * stop
+
+
+TINY = D("1e-18")  # Decimal's 28-digit rounding: summation order differs from the formula
+
+
+def check_d16(loss: Decimal, expected: Decimal, bound: Decimal, fee_asset: str) -> None:
+    if fee_asset == "quote":
+        assert abs(loss - expected) < TINY
+    else:  # one execution: the rounded-up coin fee costs at most one quantum of coin
+        assert -TINY <= loss - expected <= bound + TINY
+
+
+@given(
+    entry=st.decimals(min_value=D("10"), max_value=D("1000"), places=2),
+    drop=st.decimals(min_value=D("0.01"), max_value=D("0.10"), places=3),
+    qty_steps=st.integers(min_value=2_000, max_value=50_000),  # close notional >= 1 at entry 10
+    fee_asset=st.sampled_from(["base", "quote"]),
+)
+@settings(max_examples=200, deadline=None)
+def test_ioc_buy_then_stop_sale_matches_d16_net_loss(
+    entry: Decimal, drop: Decimal, qty_steps: int, fee_asset: str
+) -> None:
+    # 0.0001 steps at 25 bps: the coin fee is always a whole number of quanta (no rounding).
+    fees = FEES.model_copy(update={"buy_fee_asset": fee_asset})
+    stop = (entry * (1 - drop)).quantize(D("0.01"))
+    qty = D(qty_steps) * D("0.0001")
+    check_d16(*asyncio.run(stop_out(entry, stop, qty, fees, RULES)), fee_asset)
+
+
+@given(
+    entry=st.decimals(min_value=D("10"), max_value=D("1000"), places=2),
+    drop=st.decimals(min_value=D("0.01"), max_value=D("0.10"), places=3),
+    qty_nanos=st.integers(min_value=1_000_000, max_value=5_000_000_000),
+)
+@settings(max_examples=200, deadline=None)
+def test_d16_bound_holds_on_the_fine_grid_with_fee_rounding(
+    entry: Decimal, drop: Decimal, qty_nanos: int
+) -> None:
+    # Alpaca's 1e-9 grid (FINE, min_notional 0): fees with a fractional quantum get rounded.
+    stop = (entry * (1 - drop)).quantize(D("0.01"))
+    qty = D(qty_nanos) * D("1e-9")
+    check_d16(*asyncio.run(stop_out(entry, stop, qty, BASE, FINE)), "base")
+
+
+async def test_paper_fill_rounding_makes_the_loss_strictly_larger() -> None:
+    # 0.000118113 x 25 bps = 2.952825e-7 rounds up to 2.96e-7: a fractional quantum, so the
+    # simulated loss must exceed the unrounded D16 estimate, by at most one quantum.
+    loss, expected, bound = await stop_out(D("82994.2"), D("80000"), D("0.000118113"), BASE, FINE)
+    assert TINY < loss - expected <= bound
