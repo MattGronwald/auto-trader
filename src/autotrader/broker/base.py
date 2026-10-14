@@ -15,7 +15,9 @@ from pydantic import AwareDatetime, BaseModel, BeforeValidator, ConfigDict, Fiel
 Side = Literal["buy", "sell"]
 OrderType = Literal["market", "limit"]
 TimeInForce = Literal["gtc", "ioc"]
-OrderState = Literal["new", "filled", "canceled", "rejected"]
+# "partially_filled": some qty filled, the rest still open (not final). A partly filled
+# order can end canceled or rejected with filled_qty > 0 (PLAN 3.2 item 3).
+OrderState = Literal["new", "partially_filled", "filled", "canceled", "rejected"]
 Mode = Literal["paper", "live"]
 
 
@@ -69,14 +71,20 @@ class OrderStatus(_Frozen):
 
 
 class Fill(_Frozen):
+    """One broker execution. `fill_id` is unique and stable per execution, so a consumer
+    applies each fill once (WP 1.5). `qty` is the gross qty traded at `price`; `fee` is
+    denominated in `fee_asset`: a buy with `FeeSchedule.buy_fee_asset == "base"` pays
+    it in the coin (net coins received = qty - fee), every sell and every "quote" buy
+    pays it in USD (G10, D10, docs/alpaca-notes.md)."""
+
+    fill_id: str
     order_id: str
     symbol: str
     side: Side
     qty: Dec
     price: Dec
-    # USD in SimBroker. Alpaca charges buy fees in the received asset and posts them end
-    # of day (G10, docs/alpaca-notes.md); the model change is an open decision (PLAN.md).
     fee: Dec
+    fee_asset: Literal["base", "quote"]
     ts: AwareDatetime
 
 
@@ -96,7 +104,7 @@ class FeeSchedule(_Frozen):
     taker_bps: Dec = Field(ge=0, lt=10_000)  # < 100 %: D16 net stop loss stays positive
     # Which asset a buy's fee is taken from (G10, D10). "base": Alpaca deducts it from the
     # coin received, so the position is smaller than the fill. "quote": charged in USD on
-    # top of the fill value (SimBroker until WP 1.R2). Sells always pay in the quote
+    # top of the fill value. SimBroker models both (WP 1.R2). Sells always pay in the quote
     # currency. Sizing and expectancy (D16) use the matching cash-flow equation.
     buy_fee_asset: Literal["base", "quote"]
 

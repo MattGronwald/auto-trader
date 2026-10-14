@@ -296,9 +296,10 @@ async def set_control(session: AsyncSession, key: str, value: Any) -> None:
 
 # --- risk decisions / orders / equity (WP 1.3) ---------------------------------------
 
-# Entry orders that may still fill: not yet acked, acked and not final, or unknown
-# after an ambiguous submit failure (WP 1.5 reconciles those by client_order_id).
-OPEN_ENTRY_STATUSES = ("pending", "new", "unknown")
+# Entry orders that may still fill: not yet acked, acked and not final (including partly
+# filled with the rest still open), or unknown after an ambiguous submit failure (WP 1.5
+# reconciles those by client_order_id). "partially_filled" fits orders.status String(16).
+OPEN_ENTRY_STATUSES = ("pending", "new", "partially_filled", "unknown")
 
 
 async def record_risk_decision(
