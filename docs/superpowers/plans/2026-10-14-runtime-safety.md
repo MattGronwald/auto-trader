@@ -4,8 +4,8 @@
 
 **Goal:** Make `run core` safe to leave running. This adds:
 - a single-writer journal lock taken before the migration;
-- independent supervised loops (feed tick, kill polling, equity snapshots) with stall and snapshot-freshness logging;
-- one bounded shutdown coordinator for every exit cause, with a synchronous trigger, a second-signal hard exit and a watchdog thread.
+- independent supervised loops (feed tick, kill polling, a DB-free kill-file check, equity snapshots) with stall and snapshot-freshness logging;
+- one bounded shutdown coordinator for every exit cause, startup included, with a synchronous trigger, a second-signal hard exit and a watchdog thread that is never cancelled.
 
 **Architecture:** The plan adds three small modules and then rewires two existing ones:
 - `core/lock.py`: the `flock` lock on the canonical journal path.
@@ -18,7 +18,7 @@
 
 **Tech Stack:** Python 3.12, asyncio, `fcntl`, `threading`, `signal`, structlog, SQLAlchemy 2 async + aiosqlite, pytest + pytest-asyncio, typer, uv.
 
-**Spec:** `docs/superpowers/specs/2026-10-14-runtime-safety-design.md` (approved 2026-10-14 after three Codex rounds on PR #23). Read it before starting; this plan implements it section by section.
+**Spec:** `docs/superpowers/specs/2026-10-14-runtime-safety-design.md` (approved 2026-10-14 after three Codex rounds on PR #23; revised by the 2026-10-14 self-review, see the end of this plan). Read it before starting; this plan implements it section by section.
 
 ## Global Constraints
 
@@ -34,11 +34,12 @@
 - **Exit codes:** 0 clean; 1 for startup failure (including lock timeout), stream death or a forced graceful deadline; 130 for the second signal; 70 for the watchdog.
 - **Lock error text** contains `journal locked by PID <pid> since <ts>`. The non-file DB error is `single-writer lock needs a file journal; cross-host ownership is WP 3.5`.
 - **Log event names** (verbatim):
-  - `core.started`, `core.stopping`, `core.stopped`, `core.shutdown_forced`, `core.shutdown_abandoned`, `core.kill_detected`, `core.kill_cleared`;
+  - `core.started`, `core.stopping`, `core.stopped`, `core.shutdown_forced`, `core.shutdown_abandoned`, `core.shutdown_failed`, `core.failed`, `core.kill_detected`, `core.kill_cleared`;
   - `<loop>.stalled`, `<loop>.recovered`, `<loop>.step_failed`, `<loop>.task_died`;
   - `risk.snapshot_overdue`, `risk.snapshot_fresh`, `risk.snapshot_written`, `risk.snapshot_failed`;
   - `core.watchdog_exit` (written to stderr).
 - **The lock is never released on a production path;** process death releases it. `JournalLock.release()` exists for tests only.
+- **The watchdog is never cancelled** once armed (self-review 2026-10-14). It is a daemon thread, so it never delays a normal exit; it must still fire if the interpreter's exit hangs, because aiosqlite 0.22 worker threads are non-daemon and are joined there. Verified in a scratch run: an unclosed, still-referenced aiosqlite connection kept the process alive after `asyncio.run` returned, and the armed watchdog ended it with 70.
 - **Tests:**
   - Never assert wall-clock timing; use injected clocks/events (lesson from PR #13).
   - Never call the real `os._exit`.
@@ -59,6 +60,9 @@ Conditions the spec implies that no task would otherwise exercise. Each one has 
 3. **A shutdown requested before `run_core` starts**, e.g. a signal during the migration. Expected: no broker connect, no stream, no loops; teardown still disposes the engine; exit 0. Owner: Task 6 (`test_shutdown_requested_before_start_skips_startup`).
 4. **`run_core` given a lock for a different journal.** Expected: `ValueError` before anything opens the journal. Owner: Task 6 (`test_run_core_rejects_a_lock_for_another_journal`).
 5. **A watchdog armed twice** (`begin` after a startup failure following a signal). Expected: one timer, the original deadline. Owner: Task 3 (`test_begin_is_idempotent_and_never_rearms`).
+6. **A stop request during startup** (a hung or slow backfill). Expected: hung, it is forced at the deadline (`startup`, exit 1); finishing within the budget, it starts no stream or loop (exit 0). Owner: Task 6 (`test_stop_during_startup_is_bounded_by_the_deadline`, `test_startup_finishing_after_the_stop_request_starts_nothing`).
+7. **A kill file created while the journal read hangs.** Expected: `core.kill_detected` from `control.kill_file`; no `kill_cleared` flapping when a stale journal read returns "not killed" while the file exists. Owner: Task 6 (`test_kill_file_is_seen_while_the_journal_read_hangs`, `test_poller_never_clears_a_kill_while_the_file_is_present`).
+8. **The lock across a stuck shutdown.** Expected: a second acquirer fails while the old process is shutting down, and succeeds once the second signal ended it (exit 130). Real handlers, in a subprocess. Owner: Task 3 (`test_lock_is_held_through_a_stuck_shutdown_until_the_second_signal`).
 
 ---
 
@@ -402,7 +406,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces:
   - Constants: `WATCHDOG_GRACE_S = 5.0`, `EXIT_CLEAN = 0`, `EXIT_FAILED = 1`, `EXIT_HARD = 130`, `EXIT_WATCHDOG = 70`.
-  - `Watchdog(*, timer_factory=threading.Timer, exit=os._exit, stderr=None, log_wait_s=0.5)`. Firing always exits 70; the stderr line is best-effort and bounded. with `arm(seconds: float) -> None` (once only), `cancel() -> None` and the property `armed: bool`.
+  - `Watchdog(*, timer_factory=threading.Timer, exit=os._exit, stderr=None, log_wait_s=0.5)`, with `arm(seconds: float) -> None` (once only) and the property `armed: bool`. Firing always exits 70; the stderr line is best-effort and bounded. There is no `cancel()`: once armed, the watchdog stays armed until the process ends (self-review 2026-10-14).
   - `ShutdownControl(timeout_s: float, *, arm_watchdog: Callable[[float], None], monotonic=time.monotonic)`, with:
     - attributes `cause: str | None`, `deadline: float | None` and `timeout_s`;
     - property `requested: bool`;
@@ -419,11 +423,15 @@ import asyncio
 import io
 import json
 import signal
+import subprocess
+import sys
 import threading
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
+from autotrader.core.lock import JournalLockError, acquire
 from autotrader.core.shutdown import (
     EXIT_HARD,
     EXIT_WATCHDOG,
@@ -438,13 +446,10 @@ class FakeTimer:
     def __init__(self, seconds: float, fn: Callable[[], None]) -> None:
         self.seconds, self.fn = seconds, fn
         self.daemon = False
-        self.started = self.cancelled = False
+        self.started = False
 
     def start(self) -> None:
         self.started = True
-
-    def cancel(self) -> None:
-        self.cancelled = True
 
 
 class Timers:
@@ -478,8 +483,6 @@ def test_watchdog_arms_once_as_a_daemon_and_exits_70_with_a_stderr_line() -> Non
     timer.fn()
     assert exits == [EXIT_WATCHDOG]
     assert json.loads(err.getvalue())["event"] == "core.watchdog_exit"
-    dog.cancel()
-    assert timer.cancelled
 
 
 class RaisingStream(io.StringIO):
@@ -606,6 +609,46 @@ def test_install_signal_handlers_targets_sigint_and_sigterm(
     install_signal_handlers(lambda signum, frame: None)
 
     assert installed == [signal.SIGINT, signal.SIGTERM]
+
+
+HOLD_THEN_HANG = """
+import sys, time
+from autotrader.core.lock import acquire
+from autotrader.core.shutdown import ShutdownControl, install_signal_handlers, make_signal_handler
+lock = acquire(sys.argv[1], wait_s=0)
+control = ShutdownControl(30, arm_watchdog=lambda seconds: None)
+install_signal_handlers(make_signal_handler(control))
+print("held", flush=True)
+while not control.requested:
+    time.sleep(0.01)
+print("stopping", flush=True)
+while True:  # a teardown that never finishes
+    time.sleep(0.01)
+"""
+
+
+def test_lock_is_held_through_a_stuck_shutdown_until_the_second_signal(tmp_path: Path) -> None:
+    url = f"sqlite+aiosqlite:///{tmp_path / 'j.db'}"
+    proc = subprocess.Popen(  # noqa: S603  (fixed argv: this interpreter + a constant script)
+        [sys.executable, "-c", HOLD_THEN_HANG, url],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+    try:
+        assert proc.stdout.readline().strip() == "held"
+        proc.send_signal(signal.SIGINT)
+        assert proc.stdout.readline().strip() == "stopping"
+        with pytest.raises(JournalLockError):  # shutting down still owns the journal
+            acquire(url, wait_s=0)
+        proc.send_signal(signal.SIGINT)
+        assert proc.wait(timeout=10) == EXIT_HARD
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+        proc.stdout.close()
+    acquire(url, wait_s=0).release()  # process death released it
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -624,7 +667,15 @@ is stuck in synchronous Python code. It records the monotonic deadline (T from t
 and starts the watchdog thread *before* asking the loop for the async teardown. Every exit
 cause uses it; later calls are no-ops. A second signal calls `os._exit(130)` at once: no
 async cleanup and no lock release (process death releases the journal lock). The watchdog
-thread ends the process with `os._exit(70)` at T + 5 s if teardown still hangs.
+thread ends the process with `os._exit(70)` at T + 5 s if teardown still hangs. It is never
+cancelled: it is a daemon thread, so it never delays a normal exit, and it still fires if the
+interpreter's own exit hangs (aiosqlite worker threads are non-daemon and are joined there).
+
+Limits: a Python-level handler runs only when the main thread executes bytecode, so a first
+signal that arrives while the main thread is stuck in a C call that never returns arms
+nothing; only SIGKILL ends that process. A signal that arrives after another cause (stream
+death, startup failure, programmatic stop) began shutdown counts as the first one: it is a
+no-op, and the next signal exits 130.
 """
 
 import asyncio
@@ -650,7 +701,6 @@ class _Timer(Protocol):
     daemon: bool
 
     def start(self) -> None: ...
-    def cancel(self) -> None: ...
 
 
 TimerFactory = Callable[[float, Callable[[], None]], _Timer]
@@ -687,10 +737,6 @@ class Watchdog:
         timer.daemon = True
         timer.start()
         self._timer = timer
-
-    def cancel(self) -> None:
-        if self._timer is not None:
-            self._timer.cancel()
 
     def _fire(self) -> None:
         """Exit 70, whatever happens to the diagnostic line. The line is best-effort: it is
@@ -1289,6 +1335,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - It raises the original error after teardown on startup failure or stream death.
   - The `stop` parameter is removed: programmatic stop is `control.begin("stop")`.
   - Module constants: `TICK_S = 1.0`, `SNAPSHOT_S = 60.0`, `SUPERVISE_S = 1.0`, `FEED_STALL_S = 30.0`, `CONTROL_STALL_S = 10.0`.
+  - `ControlPoller(gate, kill_file)` with `step()` (the gate, journal included), `file_step()` (the kill file only, sync and DB-free) and `latest: ControlStatus | None`. A kill file seen by either step keeps the status killed; only `step()` with no file present clears it.
+  - Four loops: `feed.tick`, `control.poll`, `control.kill_file` (both error-level stalls) and `risk.snapshot`.
+  - Startup (strategy registration, broker connect, backfill, wiring) runs as a task raced against the stop request. If shutdown is requested first, the unfinished startup is teardown step 0 (`startup`), bounded by the deadline like every other step. Startup checks the request again right before starting the stream and the loops, so a startup that finishes after the request starts neither.
+  - A startup failure or stream death is logged as `core.failed` (cause, traceback) before teardown, because the watchdog may cut teardown short.
 
 - [ ] **Step 1: Rewrite the runtime tests** (`tests/unit/core/test_runtime.py`)
 
@@ -1298,8 +1348,9 @@ Change the imports at the top:
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from autotrader.core.bus import EventBus
+from autotrader.core.kill import ControlStatus
 from autotrader.core.lock import JournalLock, acquire
-from autotrader.core.runtime import _snapshot_step, run_core
+from autotrader.core.runtime import ControlPoller, _snapshot_step, run_core
 from autotrader.core.shutdown import EXIT_CLEAN, EXIT_FAILED, ShutdownControl
 ```
 
@@ -1375,6 +1426,8 @@ Then update the existing tests as follows:
 
 ```python
 async def test_dead_stream_stops_the_core_with_an_error(cfg: AppConfig, lock: JournalLock) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
     control, dog = make_control()
 
     with pytest.raises(ConnectionError, match="stream died"):
@@ -1383,6 +1436,8 @@ async def test_dead_stream_stops_the_core_with_an_error(cfg: AppConfig, lock: Jo
         )
     assert control.cause == "stream_death"
     assert dog.armed  # the coordinator armed the watchdog for this exit cause too
+    failed = next(ln for ln in _log_lines(buf) if ln["event"] == "core.failed")
+    assert failed["cause"] == "stream_death" and "stream died" in failed["exception"]
 ```
 
 - **`test_broker_connect_failure_aborts_startup`:** add the `lock` parameter, then:
@@ -1434,9 +1489,7 @@ async def test_shutdown_requested_before_start_skips_startup(
     assert connected == [] and source.stopped.is_set()
 
 
-async def test_run_core_rejects_a_lock_for_another_journal(
-    cfg: AppConfig, tmp_path: Path
-) -> None:
+async def test_run_core_rejects_a_lock_for_another_journal(cfg: AppConfig, tmp_path: Path) -> None:
     other = acquire(f"sqlite+aiosqlite:///{tmp_path / 'other.db'}", wait_s=0)
     try:
         control, _ = make_control()
@@ -1466,9 +1519,158 @@ async def test_cancellation_resistant_cleanup_is_left_behind_at_the_deadline(
         await asyncio.sleep(0.01)
     forced = next(ln for ln in _log_lines(buf) if ln["event"] == "core.shutdown_forced")
     assert "source.stop" in forced["steps"]
-    assert "engine.dispose" not in forced["steps"]  # the dispose floor still closes the journal
+    assert "engine.dispose" not in forced["steps"]
     assert stubborn.cancels == 1
     assert lock.held  # run_core never releases the journal lock
+
+
+async def test_stream_death_with_stuck_cleanup_still_ends_within_the_deadline(
+    cfg: AppConfig, lock: JournalLock
+) -> None:
+    stubborn = Stubborn()
+    source = StreamingSource(fail_stream=True)
+    source.stop = stubborn.wait  # type: ignore[method-assign]
+    control, dog = make_control(timeout_s=0.2)
+
+    try:
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(start_core(cfg, lock, control, source=source), timeout=5)
+    finally:
+        stubborn.release.set()
+        await asyncio.sleep(0.01)
+    assert dog.armed and control.cause == "stream_death"
+
+
+class QuietSource(StreamingSource):
+    """Connected, but no bars arrive and the REST price refresh hangs forever."""
+
+    async def stream(
+        self, on_bar: Callable[[Bar], Awaitable[None]], on_quote: Callable[[Quote], Awaitable[None]]
+    ) -> None:
+        await self.stopped.wait()
+
+    async def latest(self, symbol: str) -> Latest:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+async def test_hanging_rest_refresh_never_delays_kill_detection(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    monkeypatch.setattr("autotrader.core.runtime.FEED_STALL_S", 0.05)
+    control, _ = make_control(timeout_s=0.5)
+    task = start_core(cfg, lock, control, source=QuietSource())
+    try:
+        await _wait_for(lambda: any(ln["event"] == "feed.tick.stalled" for ln in _log_lines(buf)))
+        cfg.control.kill_file.parent.mkdir(parents=True, exist_ok=True)
+        cfg.control.kill_file.touch()
+        await _wait_for(lambda: any(ln["event"] == "core.kill_detected" for ln in _log_lines(buf)))
+    finally:
+        control.begin("stop")
+        await asyncio.wait_for(task, timeout=5)
+
+
+async def test_kill_file_is_seen_while_the_journal_read_hangs(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+
+    async def hung_status(self: Any, now: Any = None) -> ControlStatus:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr("autotrader.core.runtime.ControlGate.status", hung_status)
+    monkeypatch.setattr("autotrader.core.runtime.CONTROL_STALL_S", 0.05)
+    control, _ = make_control(timeout_s=0.5)
+    task = start_core(cfg, lock, control)
+    try:
+        await _wait_for(
+            lambda: any(ln["event"] == "control.poll.stalled" for ln in _log_lines(buf))
+        )
+        cfg.control.kill_file.parent.mkdir(parents=True, exist_ok=True)
+        cfg.control.kill_file.touch()
+        await _wait_for(lambda: any(ln["event"] == "core.kill_detected" for ln in _log_lines(buf)))
+    finally:
+        control.begin("stop")
+        await asyncio.wait_for(task, timeout=5)
+    detected = next(ln for ln in _log_lines(buf) if ln["event"] == "core.kill_detected")
+    assert detected["reasons"] == [f"kill file present: {cfg.control.kill_file}"]
+
+
+class FixedGate:
+    def __init__(self, status: ControlStatus) -> None:
+        self.status_ = status
+
+    async def status(self) -> ControlStatus:
+        return self.status_
+
+
+async def test_poller_never_clears_a_kill_while_the_file_is_present(tmp_path: Path) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    kill_file = tmp_path / "KILL"
+    kill_file.touch()  # e.g. created while the journal read was in flight
+    poller = ControlPoller(FixedGate(ControlStatus(False, ())), kill_file)  # type: ignore[arg-type]
+
+    await poller.file_step()
+    await poller.step()  # the journal says "not killed", but the file is there
+    await poller.file_step()
+    assert poller.latest is not None and poller.latest.killed
+
+    kill_file.unlink()
+    await poller.step()
+    events = [ln["event"] for ln in _log_lines(buf)]
+    assert events == ["core.kill_detected", "core.kill_cleared"]  # no flapping
+
+
+async def test_stop_during_startup_is_bounded_by_the_deadline(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    in_backfill = asyncio.Event()
+
+    async def hung_backfill(self: Any) -> None:
+        in_backfill.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("autotrader.core.runtime.MarketFeed.backfill", hung_backfill)
+    control, _ = make_control(timeout_s=0.2)
+    task = start_core(cfg, lock, control)
+    await asyncio.wait_for(in_backfill.wait(), timeout=5)
+    control.begin("signal")
+
+    assert await asyncio.wait_for(task, timeout=5) == EXIT_FAILED
+    forced = next(ln for ln in _log_lines(buf) if ln["event"] == "core.shutdown_forced")
+    assert forced["steps"] == ["startup"]
+    assert "core.started" not in [ln["event"] for ln in _log_lines(buf)]
+
+
+async def test_startup_finishing_after_the_stop_request_starts_nothing(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    in_backfill, go = asyncio.Event(), asyncio.Event()
+
+    async def slow_backfill(self: Any) -> None:
+        in_backfill.set()
+        await go.wait()
+
+    monkeypatch.setattr("autotrader.core.runtime.MarketFeed.backfill", slow_backfill)
+    control, _ = make_control()
+    task = start_core(cfg, lock, control)
+    await asyncio.wait_for(in_backfill.wait(), timeout=5)
+    control.begin("signal")
+    await asyncio.sleep(0)
+    go.set()  # the backfill finishes within the budget, after the stop request
+
+    assert await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN
+    events = [ln["event"] for ln in _log_lines(buf)]
+    assert "core.started" not in events and "core.stopped" in events
 
 
 @pytest.mark.parametrize("target", ["bus.close", "engine.dispose", "source.stop"])
@@ -1513,47 +1715,6 @@ async def test_unsuccessful_cleanup_step_exits_1_and_cleanup_continues(
     events = [ln["event"] for ln in _log_lines(buf)]
     assert "core.stopped" not in events and "core.shutdown_forced" not in events
     assert source.stopped.is_set()
-
-
-async def test_stream_death_with_stuck_cleanup_still_ends_within_the_deadline(
-    cfg: AppConfig, lock: JournalLock
-) -> None:
-    stubborn = Stubborn()
-    source = StreamingSource(fail_stream=True)
-    source.stop = stubborn.wait  # type: ignore[method-assign]
-    control, dog = make_control(timeout_s=0.2)
-
-    try:
-        with pytest.raises(ConnectionError):
-            await asyncio.wait_for(start_core(cfg, lock, control, source=source), timeout=5)
-    finally:
-        stubborn.release.set()
-        await asyncio.sleep(0.01)
-    assert dog.armed and control.cause == "stream_death"
-
-
-async def test_hung_feed_tick_never_delays_kill_detection(
-    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    buf = io.StringIO()
-    configure_logging(stream=buf)
-
-    async def hung_tick(self: Any) -> None:
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr("autotrader.core.runtime.MarketFeed.tick", hung_tick)
-    monkeypatch.setattr("autotrader.core.runtime.FEED_STALL_S", 0.05)
-    control, _ = make_control(timeout_s=0.5)
-    task = start_core(cfg, lock, control)
-    try:
-        await _wait_for(lambda: any(ln["event"] == "core.started" for ln in _log_lines(buf)))
-        cfg.control.kill_file.parent.mkdir(parents=True, exist_ok=True)
-        cfg.control.kill_file.touch()
-        await _wait_for(lambda: any(ln["event"] == "core.kill_detected" for ln in _log_lines(buf)))
-        await _wait_for(lambda: any(ln["event"] == "feed.tick.stalled" for ln in _log_lines(buf)))
-    finally:
-        control.begin("stop")
-        await asyncio.wait_for(task, timeout=5)
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -1576,20 +1737,24 @@ WP 1.5a (spec 2026-10-14):
 - The caller (the CLI) holds the single-writer journal lock (`core/lock.py`) before the
   migration and passes it in; `run_core` opens the journal through `lock.url` and never
   releases the lock (process death does).
-- Feed ticks, kill/control polling and equity snapshots run as independent supervised loops
-  (`core/supervise.py`): a hung step in one never delays the others. Stalls are logged;
+- Feed ticks, kill/control polling, a DB-free kill-file check and equity snapshots run as
+  independent supervised loops (`core/supervise.py`): a hung await in one never delays the
+  others (they still share the event loop and the journal). Stalls are logged;
   `risk.snapshot_overdue` follows the last *committed* snapshot.
 - Every exit cause (signal, programmatic stop, startup failure, stream death) goes through
   `ShutdownControl` (`core/shutdown.py`), whose deadline and watchdog are set before any
-  async work. Teardown is ordered and bounded: a step still running at the deadline is
-  cancelled once and left behind (`core.shutdown_forced`), and abandoned work stays in the
-  journal for startup recovery (WP 1.5d).
+  async work. Startup races the stop request, so a signal during the broker connect or the
+  backfill is bounded too. Teardown is ordered and bounded: a step still running at the
+  deadline is cancelled once and left behind (`core.shutdown_forced`), and abandoned work
+  stays in the journal for startup recovery (WP 1.5d). A startup failure or stream death is
+  logged as `core.failed` (with the traceback) before teardown.
 """
 
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
 from functools import partial
+from pathlib import Path
 from typing import Any, Protocol
 
 import structlog
@@ -1622,14 +1787,34 @@ class _Snapshotter(Protocol):
 
 
 class ControlPoller:
-    """Polls the kill/pause gate and logs changes; keeps the latest status for WP 1.5c."""
+    """Polls the kill/pause gate and logs kill changes; keeps the latest status for WP 1.5c.
 
-    def __init__(self, gate: ControlGate) -> None:
+    `file_step` checks the kill file on its own (sync, DB-free) in a separate loop, so a hung
+    journal read in `step` never hides a kill file: the file latch is the fallback for a broken
+    journal. A file seen there only ever raises the kill; clearing it is `step`'s job."""
+
+    def __init__(self, gate: ControlGate, kill_file: Path) -> None:
         self._gate = gate
+        self._kill_file = kill_file
         self.latest: ControlStatus | None = None
 
     async def step(self) -> None:
         status = await self._gate.status()
+        if not status.killed and self._file_present():  # created during the journal read
+            status = self._file_status()
+        self._report(status)
+
+    async def file_step(self) -> None:
+        if self._file_present() and not (self.latest is not None and self.latest.killed):
+            self._report(self._file_status())
+
+    def _file_present(self) -> bool:
+        return ControlGate.kill_file_present(self._kill_file)
+
+    def _file_status(self) -> ControlStatus:
+        return ControlStatus(True, (f"kill file present: {self._kill_file}",))
+
+    def _report(self, status: ControlStatus) -> None:
         previous, self.latest = self.latest, status
         if previous is not None and status.killed == previous.killed:
             return
@@ -1666,9 +1851,9 @@ async def run_core(
     snapshot_s: float = SNAPSHOT_S,
     supervise_s: float = SUPERVISE_S,
 ) -> int:
-    """Run until shutdown is requested. Returns EXIT_CLEAN, or EXIT_FAILED when teardown
-    was forced at the deadline. Startup failures and stream death are re-raised after
-    teardown."""
+    """Run until shutdown is requested. Returns EXIT_CLEAN, or EXIT_FAILED when a teardown
+    step was forced at the deadline or failed. Startup failures and stream death are logged
+    (`core.failed`) and re-raised after teardown."""
     if not lock.held:
         raise ValueError("run_core needs the held single-writer journal lock")
     if lock.url != canonical_journal(cfg.database.url)[0]:
@@ -1677,72 +1862,89 @@ async def run_core(
     engine = make_engine(lock.url)
     sessions = make_sessionmaker(engine)
     bus = EventBus(sessions)
+
+    async def start() -> tuple[Supervisor, "asyncio.Task[None]"] | None:
+        """Startup up to the first loop; None if shutdown was requested meanwhile."""
+        async with sessions() as session:
+            strategy = await repo.register_strategy(session, profile, profile_yaml)
+        broker = await _check_broker(connect_broker, settings)
+        timeframes = [
+            profile.timeframes.signal,
+            *profile.timeframes.context,
+            profile.timeframes.trend,
+        ]
+        feed = MarketFeed(
+            source,
+            sessions,
+            bus,
+            symbols=list(profile.universe),
+            timeframes=timeframes,
+            stale_alert_s=cfg.feed.stale_alert_s,
+        )
+        await feed.backfill()  # publishes no events, so the scanner can subscribe after it
+        gate = ControlGate(cfg.control.kill_file, sessions)
+        scanner = Scanner(profile, feed, gate, sessions, bus, trading_day_tz=cfg.trading_day_tz)
+        bus.subscribe(BarClosed, scanner.on_bar_closed)
+        log.info(
+            "scanner.subscribed",
+            timeframe=profile.timeframes.signal,
+            rules=[r.id for r in profile.signal_rules],
+        )
+        risk = RiskEngine(
+            broker,
+            profile=profile,
+            strategy_id=strategy.id,
+            mode=cfg.mode,
+            gate=gate,
+            market=feed,
+            sessions=sessions,
+            trading_day_tz=cfg.trading_day_tz,
+        )
+        log.info("risk.engine_ready", mode=cfg.mode)
+        if control.requested:  # no await from here on: nothing starts after a stop request
+            return None
+        poller = ControlPoller(gate, cfg.control.kill_file)
+        supervisor = Supervisor(
+            [
+                Loop("feed.tick", feed.tick, tick_s, FEED_STALL_S),
+                Loop("control.poll", poller.step, tick_s, CONTROL_STALL_S, "error"),
+                Loop("control.kill_file", poller.file_step, tick_s, CONTROL_STALL_S, "error"),
+                Loop("risk.snapshot", partial(_snapshot_step, risk), snapshot_s, 2 * snapshot_s),
+            ],
+            [Freshness("risk.snapshot", lambda: risk.last_snapshot_at, 2 * snapshot_s)],
+        )
+        stream_task = asyncio.create_task(source.stream(feed.on_bar, feed.on_quote), name="feed")
+        supervisor.start()
+        log.info(
+            "core.started",
+            mode=cfg.mode,
+            profile=profile.name,
+            profile_hash=profile.hash,
+            strategy_id=strategy.id,
+            symbols=list(profile.universe),
+            timeframes=timeframes,
+        )
+        return supervisor, stream_task
+
+    startup: asyncio.Task[tuple[Supervisor, asyncio.Task[None]] | None] | None = None
     supervisor: Supervisor | None = None
     stream_task: asyncio.Task[None] | None = None
     failure: BaseException | None = None
     try:
         if not control.requested:
-            async with sessions() as session:
-                strategy = await repo.register_strategy(session, profile, profile_yaml)
-            broker = await _check_broker(connect_broker, settings)
-            timeframes = [
-                profile.timeframes.signal,
-                *profile.timeframes.context,
-                profile.timeframes.trend,
-            ]
-            feed = MarketFeed(
-                source,
-                sessions,
-                bus,
-                symbols=list(profile.universe),
-                timeframes=timeframes,
-                stale_alert_s=cfg.feed.stale_alert_s,
-            )
-            await feed.backfill()  # publishes no events, so the scanner can subscribe after
-            gate = ControlGate(cfg.control.kill_file, sessions)
-            scanner = Scanner(
-                profile, feed, gate, sessions, bus, trading_day_tz=cfg.trading_day_tz
-            )
-            bus.subscribe(BarClosed, scanner.on_bar_closed)
-            log.info(
-                "scanner.subscribed",
-                timeframe=profile.timeframes.signal,
-                rules=[r.id for r in profile.signal_rules],
-            )
-            risk = RiskEngine(
-                broker,
-                profile=profile,
-                strategy_id=strategy.id,
-                mode=cfg.mode,
-                gate=gate,
-                market=feed,
-                sessions=sessions,
-                trading_day_tz=cfg.trading_day_tz,
-            )
-            log.info("risk.engine_ready", mode=cfg.mode)
-            poller = ControlPoller(gate)
-            supervisor = Supervisor(
-                [
-                    Loop("feed.tick", feed.tick, tick_s, FEED_STALL_S),
-                    Loop("control.poll", poller.step, tick_s, CONTROL_STALL_S, "error"),
-                    Loop("risk.snapshot", partial(_snapshot_step, risk), snapshot_s, 2 * snapshot_s),
-                ],
-                [Freshness("risk.snapshot", lambda: risk.last_snapshot_at, 2 * snapshot_s)],
-            )
-            stream_task = asyncio.create_task(
-                source.stream(feed.on_bar, feed.on_quote), name="feed"
-            )
-            supervisor.start()
-            log.info(
-                "core.started",
-                mode=cfg.mode,
-                profile=profile.name,
-                profile_hash=profile.hash,
-                strategy_id=strategy.id,
-                symbols=list(profile.universe),
-                timeframes=timeframes,
-            )
-            while not control.requested:
+            # Startup races the stop request: a signal during the broker connect or the
+            # backfill must not wait for them. An unfinished startup becomes the first
+            # teardown step, bounded by the deadline like every other step.
+            startup = asyncio.create_task(start(), name="startup")
+            waiter = asyncio.create_task(wakeup.wait(), name="startup-stop")
+            try:
+                await asyncio.wait({startup, waiter}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                waiter.cancel()
+            started = startup.result() if startup.done() else None  # raises a startup failure
+            if started is not None:
+                supervisor, stream_task = started
+            while supervisor is not None and stream_task is not None and not control.requested:
                 if stream_task.done():
                     control.begin("stream_death")
                     error = None if stream_task.cancelled() else stream_task.exception()
@@ -1754,7 +1956,9 @@ async def run_core(
     except Exception as e:
         control.begin("startup_failure")  # a no-op if another cause came first
         failure = e
-    forced = await _teardown(control, source, supervisor, stream_task, bus, engine)
+    if failure is not None:  # logged before teardown, which the watchdog may cut short
+        log.error("core.failed", cause=control.cause, exc_info=failure)
+    forced = await _teardown(control, source, startup, supervisor, stream_task, bus, engine)
     if failure is not None:
         raise failure
     return EXIT_FAILED if forced else EXIT_CLEAN
@@ -1763,6 +1967,7 @@ async def run_core(
 async def _teardown(
     control: ShutdownControl,
     source: BarSource,
+    startup: "asyncio.Task[Any] | None",
     supervisor: Supervisor | None,
     stream_task: "asyncio.Task[None] | None",
     bus: EventBus,
@@ -1795,6 +2000,10 @@ async def _teardown(
             failed.append(name)
             log.error("core.shutdown_step_failed", step=name, error=repr(error))
 
+    # 0. An unfinished startup (stop requested during it) gets what is left of the budget.
+    # It checks the request before starting the stream or any loop, so it built neither.
+    if startup is not None and not startup.done():
+        await bounded("startup", startup)
     # 1. Admission: nothing to close in 1.5a (WP 1.5d: close admission, runner.close()).
     await bounded("source.stop", source.stop())
     if supervisor is not None:
@@ -1835,7 +2044,7 @@ async def _check_broker(connect_broker: BrokerConnect, settings: Settings) -> An
     return broker
 ```
 
-Note: the `stream_task` annotation in `_teardown` is quoted. If `ruff` prefers it unquoted, unquote it.
+Note: some `asyncio.Task` annotations are quoted. If `ruff` prefers them unquoted, unquote them.
 
 - [ ] **Step 4: Run all tests** with `uv run pytest -q` (redirect the output, check the exit code). Expected: PASS. `tests/integration/test_scanner_feed.py` and other callers of `run_core` must also pass. Check with `rg -n "run_core\(" tests src`, and update any other caller the same way: a `lock` fixture, `make_control()`, `control.begin("stop")`.
 
@@ -1893,13 +2102,10 @@ class FakeTimer:
     def __init__(self, seconds: float, fn: Callable[[], None]) -> None:
         self.seconds = seconds
         self.daemon = False
-        self.started = self.cancelled = False
+        self.started = False
 
     def start(self) -> None:
         self.started = True
-
-    def cancel(self) -> None:
-        self.cancelled = True
 
 
 class Locks:
@@ -1993,10 +2199,9 @@ def test_signal_during_migration_arms_the_watchdog_and_skips_startup(tmp_path: P
     assert code == 0
     assert timers and timers[0].started and timers[0].seconds == 34.5  # exit by T + 5 = 35
     assert Source.stopped
-    assert timers[0].cancelled  # only after asyncio.run returned
 
 
-def test_failure_inside_run_exits_1_and_cancels_the_watchdog_after_run(tmp_path: Path) -> None:
+def test_failure_inside_run_exits_1_and_leaves_the_watchdog_armed(tmp_path: Path) -> None:
     cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
     locks = Locks()
     timers: list[FakeTimer] = []
@@ -2025,7 +2230,8 @@ def test_failure_inside_run_exits_1_and_cancels_the_watchdog_after_run(tmp_path:
     locks.release()
 
     assert code == 1
-    assert order == ["run"] and timers[0].cancelled
+    assert order == ["run"]
+    assert len(timers) == 1 and timers[0].started  # armed for the exit; never cancelled
 
 
 def test_ctrl_c_while_waiting_for_the_lock_exits_130(tmp_path: Path) -> None:
@@ -2108,8 +2314,9 @@ def _run_core_process(
     """WP 1.5a ownership and shutdown boundary (spec 2026-10-14 sections 2 and 4).
 
     The journal lock comes first, before the migration; the signal handlers right after it.
-    The lock is never released here: process exit releases it. The watchdog is cancelled
-    only after `run` (asyncio.run) has fully returned."""
+    The lock is never released here: process exit releases it. The watchdog, once armed, is
+    never cancelled: a daemon thread doesn't delay a normal exit, and it still ends the
+    process if the interpreter's exit hangs on a left-behind non-daemon thread."""
     timeout_s = cfg.shutdown.timeout_s
     try:
         lock = acquire(cfg.database.url, wait_s=timeout_s + shutdown.WATCHDOG_GRACE_S)
@@ -2141,7 +2348,6 @@ def _run_core_process(
         control.begin("startup_failure")  # no-op if teardown already began
         typer.echo(f"run core failed: {type(e).__name__}: {e}", err=True)
         code = EXIT_FAILED
-    dog.cancel()
     return code
 ```
 
@@ -2177,7 +2383,7 @@ Fix every hit that describes the old behaviour as current: kill detection inline
 - [ ] **Step 2: Apply the known edits**
 
 - **`SPEC.md` §4.11:** add a bullet after the **Kill-switch** bullet:
-  `- **Single writer and bounded shutdown (WP 1.5a):** \`run core\` holds an exclusive lock on \`<canonical journal path>.lock\` for its lifetime, taken before the migration; a second core waits up to \`shutdown.timeout_s\` + 5 s and fails. Feed ticks, kill polling and equity snapshots are independent supervised loops (stalls and \`risk.snapshot_overdue\` are logged). Every exit cause runs one bounded teardown (\`shutdown.timeout_s\`, exit 1 if forced); a second signal exits 130 immediately; a watchdog thread exits 70 at timeout + 5 s.`
+  `- **Single writer and bounded shutdown (WP 1.5a):** \`run core\` holds an exclusive lock on \`<canonical journal path>.lock\` for its lifetime, taken before the migration; a second core waits up to \`shutdown.timeout_s\` + 5 s and fails. Feed ticks, kill polling, a DB-free kill-file check and equity snapshots are independent supervised loops (stalls and \`risk.snapshot_overdue\` are logged). Every exit cause, startup included, runs one bounded teardown (\`shutdown.timeout_s\`, exit 1 if forced or failed); a second signal exits 130 immediately; a watchdog thread, never cancelled once armed, exits 70 at timeout + 5 s.`
 - **`PLAN.md` 1.5 row:** append inside the last cell, before the final ` |`:
   ` **2026-10-14, 1.5a done:** single-writer lock, supervised loops, bounded shutdown coordinator, second-signal exit and watchdog (spec/plan 2026-10-14-runtime-safety). Next: 1.5b.`
 - **`PLAN.md` "Current repo state":** change `Next: WP 1.5` to `WP 1.5a (runtime safety) done. Next: WP 1.5b`. Read the line first; if the wording differs, change the "Next" sentence equivalently.
@@ -2229,3 +2435,12 @@ A Codex plan review (2026-10-14) then added three fixes:
 - loop cadence is start-to-start with no catch-up.
 
 The revised modules and tests were re-run in the dry-run worktree: 798 passed, ruff and mypy clean, `risk/` at 100 %, three repeated runs of the shutdown/supervise/runtime tests green.
+
+A self-review of spec and plan against the code (2026-10-14, before implementation) added these fixes:
+- the watchdog is never cancelled: aiosqlite worker threads are non-daemon, so interpreter exit could hang after a forced teardown (reproduced in a scratch run);
+- startup races the stop request, and an unfinished startup is teardown step 0, bounded by the deadline;
+- a `control.kill_file` loop checks the kill file without the journal, so a hung journal read can't hide it;
+- `core.failed` logs startup failures and stream death with the traceback before teardown;
+- tests for these, the independence test now hangs the REST refresh (`latest()`) instead of stubbing `MarketFeed.tick`, and a subprocess test proves the lock is held through a stuck shutdown until the second signal.
+
+The plan's code blocks were re-synced from the dry-run worktree and re-run there: 804 passed, ruff and mypy clean, `risk/` at 100 %, five repeated runs of the lock/shutdown/supervise/runtime/CLI tests green.

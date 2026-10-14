@@ -1,6 +1,14 @@
 # Runtime safety design (WP 1.5a)
 
-Date: 2026-10-14. Status: approved in conversation (sections 1-3), pending written-spec review.
+Date: 2026-10-14. Status: approved (three Codex spec rounds and two plan rounds on PR #23), then revised by the self-review below.
+
+Revised 2026-10-14 after a self-review against the code, before implementation:
+- the watchdog is never cancelled once armed, because interpreter exit can hang on non-daemon aiosqlite threads;
+- startup races the stop request, so a signal during the broker connect or the backfill is bounded too;
+- a separate `control.kill_file` loop checks the kill file without the journal;
+- `core.failed` logs startup failures and stream death with the traceback;
+- item 8's "fail entry checks closed" is explicitly deferred to 1.5d (section 6);
+- the limits of Python-level signal handlers are stated, and the section 5 tests match the plan.
 Revised 2026-10-14 after the second Codex plan review: the watchdog fires `log_wait_s` early so the exit, including the diagnostic wait, stays within T + 5 s.
 
 Revised 2026-10-14 after the Codex plan review:
@@ -38,8 +46,8 @@ WP 1.5 is split into four sub-PRs (owner, 2026-10-14):
 
 Done means:
 - **One writer per journal.** Only one `run core` process can hold a given journal, identified by its canonical file path. A second one waits a bounded time, then fails startup with the holder's PID. It never migrates or opens the journal before it holds the lock.
-- **Independent loops.** Kill/control polling, feed ticks and equity snapshots run as independent supervised loops, and a hung step in one never delays the others. Stalls are logged. `risk.snapshot_overdue` is logged when the last *committed* snapshot is older than 2 x its interval.
-- **Bounded shutdown.** Every way the core stops (first SIGINT/SIGTERM, programmatic stop, startup failure, stream death) runs one coordinated teardown with two bounds:
+- **Independent loops.** Kill/control polling, a journal-free kill-file check, feed ticks and equity snapshots run as independent supervised loops, and a hung await in one never delays the others. They still share the event loop and the journal: a step that blocks the event loop synchronously stalls all of them, and a hung journal stalls every loop that reads it, which is why the kill file has its own loop. Stalls are logged. `risk.snapshot_overdue` is logged when the last *committed* snapshot is older than 2 x its interval.
+- **Bounded shutdown.** Every way the core stops (first SIGINT/SIGTERM, programmatic stop, startup failure, stream death), including a stop requested during startup, runs one coordinated teardown with two bounds:
   - **graceful:** teardown is abandoned at `shutdown.timeout_s` (T) and the process exits 1;
   - **last resort:** a watchdog thread ends the process at T + 5 s if even that hangs.
   - A second signal ends the process at once.
@@ -90,6 +98,7 @@ Loops registered in 1.5a:
 |---|---|---|---|---|
 | `feed.tick` | `feed.tick()` | 1 s | 30 s | warning |
 | `control.poll` | `gate.status()`; log kill/pause changes (`core.kill_detected` / `core.kill_cleared`, as today) | 1 s | 10 s | **error** |
+| `control.kill_file` | the kill file only (sync, no journal); raises the kill, never clears it | 1 s | 10 s | **error** |
 | `risk.snapshot` | `risk.snapshot_equity()` | 60 s | 120 s (`risk.snapshot.stalled`) | warning |
 
 - **Snapshot freshness is separate from loop liveness.** PLAN item 8 asks for the age of the last *persisted* snapshot, not the last finished loop step. The two differ:
@@ -97,10 +106,16 @@ Loops registered in 1.5a:
   - `RiskEngine.snapshot_equity()` commits a snapshot (equity and peak, exposure `NULL`) and *then* raises when the position read fails.
 - So `RiskEngine` keeps `last_snapshot_at`, set right after each successful `_write_snapshot` commit, on both the full and the partial path. It is an attribute of the engine, so it survives loop restarts.
 - The supervisor's stall check logs `risk.snapshot_overdue` once when `now - last_snapshot_at > 120 s` and `risk.snapshot_fresh` when it recovers. Before the first write, the age is measured from core start, so "no snapshot within 120 s of start" also warns.
-- The `control.poll` loop keeps the latest `ControlStatus` so that 1.5c can act on kill changes without a second poller. In 1.5a, a kill is only logged, as today.
+- **The kill file has its own loop.** The kill file is the fallback for a broken journal, but `gate.status()` reads the journal after checking the file, so a hung journal read would hide a kill file created meanwhile. `control.kill_file` checks only the file. Both loops update one `ControlPoller` state:
+  - a kill file seen by either loop keeps the status killed;
+  - only `control.poll` clears a kill, and only when the file is absent at that moment, so a journal read that started before the file appeared can't flap the status back.
+- The poller keeps the latest `ControlStatus` so that 1.5c can act on kill changes without another poller. In 1.5a, a kill is only logged, as today. A status raised by the file loop carries only the file reason; 1.5c should act on `killed`, not on the reasons list.
 - The intervals and thresholds are constants in `runtime.py`, with no new config keys apart from `shutdown.timeout_s`.
 - The entry fail-closed behaviour is unchanged: `ControlGate` already fails closed, and no entries run until 1.5d.
 - The main loop becomes "supervise until stop or stream death". It raises on stream death and runs the stall check about once a second.
+- **Startup races the stop request.** Strategy registration, the broker connect, the backfill and the wiring run as one startup task, raced against the stop request. A signal during a long backfill therefore doesn't wait for it.
+  - If the stop request comes first, the unfinished startup becomes teardown step 0 (`startup`): it gets the remaining budget, then it is cancelled once and left behind (forced, exit 1).
+  - Startup checks the request again right before starting the stream and the loops, with no await in between. A startup that finishes after the request therefore starts neither, and the exit is clean.
 
 ## 4. Bounded shutdown, second signal, watchdog
 
@@ -120,6 +135,7 @@ Loops registered in 1.5a:
 **Shutdown coordinator.** The async `Shutdown.run()` in `runtime.py` performs the teardown.
 - It reads the deadline and cause recorded by `begin_shutdown`, and never sets its own. When it is reached by a programmatic stop or stream death, it calls `begin_shutdown` first, which is a no-op if a signal already did.
 - It then runs the ordered teardown:
+  0. An unfinished startup (see section 3), bounded by the remaining time.
   1. Admission: nothing to close in 1.5a. 1.5d inserts "close admission, then `runner.close()`" here.
   2. `source.stop()`, then `supervisor.stop(deadline)`.
   3. `bus.close()`, bounded by the remaining time.
@@ -129,17 +145,20 @@ Loops registered in 1.5a:
   - A step that completes but raises, or is cancelled, is **failed**: `core.shutdown_failed` is logged with the step names, and the remaining steps still run.
   - The process exits 1 for a forced or failed step, startup failure or stream death, and 0 only for a clean stop (`core.stopped`).
 - **Abandoned work** stays in the journal for 1.5d's startup recovery: open cycles, `pending`/`unknown` orders, and any queued aiosqlite write that may still finish. It is logged as `core.shutdown_abandoned`. Forced cancellation does not prove that broker work stopped.
-- **After `run_core` returns:** `asyncio.run` teardown can itself block on tasks or executor work that were left behind. The watchdog stays armed through it (see below), so the process still ends by T + 5.
+- **Failures are logged first.** A startup failure or stream death is logged as `core.failed`, with the cause and the traceback, *before* teardown, because the watchdog may cut teardown short. The CLI then prints a one-line summary and exits 1.
+- **After `run_core` returns:** `asyncio.run` teardown can itself block on tasks or executor work that were left behind, and so can interpreter exit, which joins non-daemon threads (aiosqlite's worker threads are non-daemon). The watchdog stays armed through both (see below), so the process still ends by T + 5.
 
 **Second signal (hard):** the CLI installs the second-signal path with `signal.signal`, the Python-level handler, not the event loop's `add_signal_handler`.
 - The first signal calls `begin_shutdown("signal")` synchronously in the handler (watchdog armed, deadline recorded, then the async teardown is queued). The second calls `os._exit(130)` directly in the handler.
 - There is no async cleanup, no engine dispose and no explicit lock release. Process death releases the lock, so no other core can start while a queued write of this one is still running.
-- Python-level handlers run in the main thread between bytecodes, so this works while the event loop is stuck in Python code. A stall inside a C call is the watchdog's job.
+- Python-level handlers run in the main thread between bytecodes, so this works while the event loop is stuck in Python code. A blocking call that is interrupted by the signal (for example `select`, `sleep` or a lock wait) runs the handler too.
+- **Limit:** if the main thread is stuck in a C call that neither returns nor is interrupted, no Python-level handler runs: the first signal arms nothing and the second can't exit. Only SIGKILL ends that process. Once the first handler has run, the watchdog covers any later stall, C calls included.
+- A signal that arrives after another cause (stream death, startup failure, programmatic stop) began shutdown counts as the *first* signal: it is a no-op, because shutdown is already running. The next one exits 130. So when shutdown is already under way, it takes two Ctrl-C to force an exit.
 
 **Watchdog (last resort):**
 - `begin_shutdown` arms it on its first call, for **every** exit cause, through the CLI's callback, before any event-loop work. It is a daemon `threading.Timer`, armed once, that guarantees exit by T + 5 s from the trigger time. It fires 0.5 s early (the diagnostic wait below), so the wait is inside the bound. The thread is needed because a timer on the event loop can't fire while the loop is blocked.
 - If the timer fires, it calls `os._exit(70)` in all cases. Before that it tries to write `core.watchdog_exit` to stderr (directly, not through the event loop). The write runs in a separate daemon thread that gets at most 0.5 s and whose errors are ignored, so a closed, broken or blocking stderr can't keep the process alive.
-- It is cancelled only after `asyncio.run(...)` has fully returned, immediately before the CLI's normal exit, so it covers asyncio and executor teardown too.
+- **It is never cancelled.** It is a daemon thread, so it never delays a normal exit. It must outlive `asyncio.run(...)`, because interpreter exit joins non-daemon threads: a scratch run showed that an unclosed, still-referenced aiosqlite connection keeps the process alive after `asyncio.run` returns, and that the armed watchdog then ends it with 70. A clean exit that hangs there is therefore ended too.
 
 | Exit code | Meaning |
 |---|---|
@@ -157,6 +176,7 @@ Loops registered in 1.5a:
   - Postgres, `:memory:` and other non-file URLs fail with the documented error.
   - **CLI level:** while a subprocess holds the lock, a second `run core` exits 1, and `db.upgrade` and the engine are never called. Both are injected and asserted not called.
   - Ownership is released only by process exit: after a forced shutdown and after a second signal, a fresh process can acquire the lock only once the old one has exited.
+- **Lock across a stuck shutdown** (real handlers, in a subprocess): after the first signal a second acquirer still fails; after the second signal the process exits 130 and the lock can be taken.
 - **Supervisor**, driven by an injected clock and events, never by wall-clock assertions (lesson from PR #13):
   - Stall and recovery logging happens once per transition.
   - `risk.snapshot_overdue` is driven by `last_snapshot_at`, not by the loop heartbeat:
@@ -166,11 +186,17 @@ Loops registered in 1.5a:
   - A raising `step()` keeps its loop running.
   - A dead task is restarted.
   - `stop(deadline)` cancels the steps that are still hanging and returns their names.
-- **Independence:** a fake bar source whose REST `latest()` hangs forever. A kill-file change is still logged by `control.poll`, and `feed.tick.stalled` is logged.
+- **Independence:**
+  - A fake bar source whose REST `latest()` hangs forever: `feed.tick.stalled` is logged, and a kill file created afterwards is still logged as `core.kill_detected`.
+  - A hung journal read in `gate.status()`: `control.poll.stalled` is logged, and a kill file created afterwards is still detected by `control.kill_file`.
+  - The poller never clears a kill while the kill file is present, even when a journal read returns "not killed".
+- **Startup:**
+  - A stop request during a hung backfill is forced at the deadline (`startup`, exit 1), and `core.started` is never logged.
+  - A backfill that finishes after the stop request starts no stream or loop, and the exit is clean.
 - **Shutdown:**
   - A **cancellation-resistant** step (catches `CancelledError` and keeps waiting) and a hanging `bus.close()` are left behind at the deadline: teardown completes, exit 1, and `core.shutdown_forced` is logged.
-  - **Stream death followed by cancellation-resistant cleanup** goes through the same coordinator: the deadline holds, the watchdog is armed, exit 1.
-  - A **pending aiosqlite worker write** at a forced shutdown: the lock is not released by the process (a fresh acquirer in a subprocess fails until the process exits).
+  - **Stream death followed by cancellation-resistant cleanup** goes through the same coordinator: the deadline holds, the watchdog is armed, exit 1. Stream death is logged as `core.failed` with the error.
+  - `run_core` never releases the lock, including after a forced teardown (`lock.held` stays true). The earlier idea of a separate test with a pending aiosqlite write is dropped: the lock is a descriptor that nothing on a production path closes, so a pending write can't affect it. The subprocess test above covers release on process death.
   - The second-signal handler calls the injected exit function with 130, without awaiting anything, and also while the loop is blocked.
   - Re-entering the coordinator (a signal during stream-death teardown) is a no-op apart from the second-signal path.
   - **First signal while the loop is blocked:** the handler is invoked directly while the test holds the loop in synchronous code. The injected timer must already be armed and the deadline recorded **before any loop callback has run**. When the loop is released, the coordinator uses that same deadline, and its remaining time is measured from the signal, not from coordinator entry.
@@ -179,7 +205,7 @@ Loops registered in 1.5a:
 - **Watchdog:** with the timer factory and exit function injected:
   - It is armed on every exit cause.
   - It fires once at T + 5.
-  - It is cancelled only after `asyncio.run` returns cleanly.
+  - It stays armed after `asyncio.run` returns; there is no cancel.
   - Tests never call the real `os._exit`.
 - **Config:** a missing `shutdown.timeout_s`, 0, a negative value, NaN, infinity and 301 are all rejected; 30 loads.
 
@@ -187,6 +213,10 @@ Loops registered in 1.5a:
 
 - Cross-host or Postgres ownership and persistent account binding (WP 3.5).
 - Acting on a kill: cancelling entries and flatten (1.5c).
+- **Item 8's "fail entry checks closed when required state is unavailable"** (deferred to 1.5d, before admission opens). Entries can't run until 1.5d, but `check()` doesn't yet fail closed on stale risk state:
+  - It takes the daily-loss baseline from the last snapshot at or before the day start. If the snapshot loop was dead for days, that baseline is days old.
+  - With no snapshot at all, it uses current equity, which makes the daily-loss check a no-op.
+  - 1.5d must define a freshness bound for that baseline and reject entries when it is missing or stale, and while `risk.snapshot_overdue` is active.
 - Wiring the runner, closing admission, startup recovery (1.5d).
 - Windows support.
 
