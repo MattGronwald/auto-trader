@@ -27,6 +27,9 @@
 - **ASCII only** in Python code, comments and docstrings. ruff `RUF001`-`RUF003` reject characters like `−` or `×`. `ruff format` doesn't wrap docstrings, so wrap them by hand at 100 characters.
 - **Config:** `shutdown.timeout_s` is required, finite, `0 < v <= 300`, and `config.yaml` sets 30.
 - **Constants:** `WATCHDOG_GRACE_S = 5.0` (last resort at T + 5 s), and lock poll 1.0 s.
+- **Teardown outcome (Codex plan review):** a teardown step that times out is *forced*; one that raises or is cancelled is *failed* (`core.shutdown_failed`). Either makes the exit 1, the remaining steps still run, and `core.stopped` is logged only when nothing was forced or failed.
+- **Loop cadence:** start to start. Pause `max(0, interval - step duration)`; an overrun starts the next step immediately, with no catch-up.
+- **Watchdog line:** best-effort, written by a daemon thread with a bounded wait (`log_wait_s=0.5`); `exit(70)` runs in a `finally`, whatever happens to stderr.
 - **Teardown floor (dry-run finding, spec revision 2026-10-14):** `engine.dispose` gets at least 1.0 s even after the deadline, still inside the 5 s watchdog grace, so a forced teardown still closes the journal's connections. No other step gets a floor.
 - **Exit codes:** 0 clean; 1 for startup failure (including lock timeout), stream death or a forced graceful deadline; 130 for the second signal; 70 for the watchdog.
 - **Lock error text** contains `journal locked by PID <pid> since <ts>`. The non-file DB error is `single-writer lock needs a file journal; cross-host ownership is WP 3.5`.
@@ -399,7 +402,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces:
   - Constants: `WATCHDOG_GRACE_S = 5.0`, `EXIT_CLEAN = 0`, `EXIT_FAILED = 1`, `EXIT_HARD = 130`, `EXIT_WATCHDOG = 70`.
-  - `Watchdog(*, timer_factory=threading.Timer, exit=os._exit, stderr=None)`, with `arm(seconds: float) -> None` (once only), `cancel() -> None` and the property `armed: bool`.
+  - `Watchdog(*, timer_factory=threading.Timer, exit=os._exit, stderr=None, log_wait_s=0.5)`. Firing always exits 70; the stderr line is best-effort and bounded. with `arm(seconds: float) -> None` (once only), `cancel() -> None` and the property `armed: bool`.
   - `ShutdownControl(timeout_s: float, *, arm_watchdog: Callable[[float], None], monotonic=time.monotonic)`, with:
     - attributes `cause: str | None`, `deadline: float | None` and `timeout_s`;
     - property `requested: bool`;
@@ -416,6 +419,7 @@ import asyncio
 import io
 import json
 import signal
+import threading
 from collections.abc import Callable
 
 import pytest
@@ -476,6 +480,44 @@ def test_watchdog_arms_once_as_a_daemon_and_exits_70_with_a_stderr_line() -> Non
     assert json.loads(err.getvalue())["event"] == "core.watchdog_exit"
     dog.cancel()
     assert timer.cancelled
+
+
+class RaisingStream(io.StringIO):
+    def write(self, s: str) -> int:
+        raise OSError("broken pipe")
+
+
+class BlockingStream(io.StringIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+
+    def write(self, s: str) -> int:
+        self.release.wait(5)  # stands in for a full pipe
+        return len(s)
+
+
+def test_watchdog_exits_70_even_if_stderr_raises() -> None:
+    timers = Timers()
+    exits: list[int] = []
+    Watchdog(timer_factory=timers, exit=exits.append, stderr=RaisingStream()).arm(35)
+
+    timers.made[0].fn()
+
+    assert exits == [EXIT_WATCHDOG]
+
+
+def test_watchdog_exits_70_even_if_stderr_blocks() -> None:
+    timers, stream = Timers(), BlockingStream()
+    exits: list[int] = []
+    dog = Watchdog(timer_factory=timers, exit=exits.append, stderr=stream, log_wait_s=0.01)
+    dog.arm(35)
+
+    try:
+        timers.made[0].fn()  # returns after the bounded wait, not when the write ends
+        assert exits == [EXIT_WATCHDOG]
+    finally:
+        stream.release.set()
 
 
 def test_begin_records_deadline_and_arms_before_anything_else() -> None:
@@ -578,6 +620,7 @@ thread ends the process with `os._exit(70)` at T + 5 s if teardown still hangs.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -615,10 +658,12 @@ class Watchdog:
         timer_factory: TimerFactory = threading.Timer,
         exit: Callable[[int], object] = os._exit,
         stderr: TextIO | None = None,
+        log_wait_s: float = 0.5,
     ) -> None:
         self._factory = timer_factory
         self._exit = exit
         self._stderr = stderr
+        self._log_wait_s = log_wait_s
         self._timer: _Timer | None = None
 
     @property
@@ -638,11 +683,22 @@ class Watchdog:
             self._timer.cancel()
 
     def _fire(self) -> None:
+        """Exit 70, whatever happens to the diagnostic line. The line is best-effort: it is
+        written by a throwaway daemon thread that gets at most `log_wait_s`, so a closed,
+        broken or blocking stderr can never keep the process alive."""
+        try:
+            writer = threading.Thread(target=self._write_line, name="watchdog-log", daemon=True)
+            writer.start()
+            writer.join(self._log_wait_s)
+        finally:
+            self._exit(EXIT_WATCHDOG)
+
+    def _write_line(self) -> None:
         # Not through structlog: the event loop (and anything it owns) may be stuck.
         stream = self._stderr if self._stderr is not None else sys.stderr
-        stream.write(json.dumps({"event": "core.watchdog_exit", "level": "critical"}) + "\n")
-        stream.flush()
-        self._exit(EXIT_WATCHDOG)
+        with contextlib.suppress(Exception):
+            stream.write(json.dumps({"event": "core.watchdog_exit", "level": "critical"}) + "\n")
+            stream.flush()
 
 
 class ShutdownControl:
@@ -912,6 +968,29 @@ async def test_stop_cancels_a_cancellation_resistant_step_once_and_leaves_it() -
     await asyncio.sleep(0.01)
 
 
+async def test_cadence_subtracts_step_duration_without_catch_up() -> None:
+    clock = Clock()
+    durations = iter([3.0, 12.0])
+    waits: list[float] = []
+
+    class Recording(Supervisor):
+        async def _pause(self, stopping: asyncio.Event, seconds: float) -> None:
+            waits.append(seconds)
+            if len(waits) == 2:
+                stopping.set()
+            await asyncio.sleep(0)
+
+    async def step() -> None:
+        clock.now += next(durations)
+
+    sup = Recording([Loop("risk.snapshot", step, 10, 120)], clock=clock)
+    sup.start()
+    await until(lambda: len(waits) == 2)
+
+    assert waits == [7.0, 0.0]  # 10 - 3; then a 12 s overrun: next step at once
+    await sup.stop(clock.now + 1)
+
+
 async def test_freshness_is_tracked_separately_from_liveness() -> None:
     buf = io.StringIO()
     configure_logging(stream=buf)
@@ -949,13 +1028,15 @@ Expected: collection error, `No module named 'autotrader.core.supervise'`.
 ```python
 """Supervised background loops (WP 1.5a, spec 2026-10-14 section 3).
 
-Each `Loop` runs `step()` every `interval_s` in its own task, so a hung step in one loop
-never delays another. The heartbeat is when `step()` last completed; `check()` logs a stall
-once per transition and never cancels a slow step (cancelling could cut a journal write
-mid-commit). A raising step is logged and the loop carries on; a task killed by an escaped
-`BaseException` is logged and restarted. `Freshness` probes track data age (e.g. the last
-committed equity snapshot) separately from loop liveness. `stop(deadline)` lets steps finish
-until the deadline, then cancels the rest once and leaves them behind.
+Each `Loop` runs `step()` every `interval_s` (start to start: the pause is the rest of the
+interval; an overrun starts the next step at once, no catch-up) in its own task, so a hung
+step in one loop never delays another. The heartbeat is when `step()` last completed;
+`check()` logs a stall once per transition and never cancels a slow step (cancelling could
+cut a journal write mid-commit). A raising step is logged and the loop carries on; a task
+killed by an escaped `BaseException` is logged and restarted. `Freshness` probes track data
+age (e.g. the last committed equity snapshot) separately from loop liveness.
+`stop(deadline)` lets steps finish until the deadline, then cancels the rest once and leaves
+them behind.
 """
 
 import asyncio
@@ -1066,13 +1147,19 @@ class Supervisor:
         if stopping is None:
             raise RuntimeError("Supervisor.start() was not called")
         while not stopping.is_set():
+            started = self._clock()
             try:
                 await loop.step()
             except Exception:
                 log.exception(f"{loop.name}.step_failed")
             self._beats[loop.name] = self._clock()
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stopping.wait(), timeout=loop.interval_s)
+            # Start-to-start cadence: sleep only for the rest of the interval. An overrun
+            # starts the next step at once, with no catch-up burst.
+            await self._pause(stopping, max(0.0, loop.interval_s - (self._clock() - started)))
+
+    async def _pause(self, stopping: asyncio.Event, seconds: float) -> None:
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stopping.wait(), timeout=seconds)
 ```
 
 - [ ] **Step 4: Run all tests** with `uv run pytest -q` (redirect the output, check the exit code). Expected: PASS.
@@ -1188,7 +1275,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `Loop`, `Freshness`, `Supervisor` (Task 4);
   - `RiskEngine.last_snapshot_at` (Task 5).
 - Produces: `async run_core(cfg, settings, profile, profile_yaml, *, source, connect_broker, lock: JournalLock, control: ShutdownControl, tick_s: float = TICK_S, snapshot_s: float = SNAPSHOT_S, supervise_s: float = SUPERVISE_S) -> int`.
-  - It returns `EXIT_CLEAN`, or `EXIT_FAILED` if teardown was forced.
+  - It returns `EXIT_CLEAN`, or `EXIT_FAILED` if any teardown step was forced (timed out) or failed (raised, or was cancelled). The remaining steps always run.
   - It raises the original error after teardown on startup failure or stream death.
   - The `stop` parameter is removed: programmatic stop is `control.begin("stop")`.
   - Module constants: `TICK_S = 1.0`, `SNAPSHOT_S = 60.0`, `SUPERVISE_S = 1.0`, `FEED_STALL_S = 30.0`, `CONTROL_STALL_S = 10.0`.
@@ -1198,6 +1285,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Change the imports at the top:
 
 ```python
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from autotrader.core.bus import EventBus
 from autotrader.core.lock import JournalLock, acquire
 from autotrader.core.runtime import _snapshot_step, run_core
 from autotrader.core.shutdown import EXIT_CLEAN, EXIT_FAILED, ShutdownControl
@@ -1369,6 +1459,50 @@ async def test_cancellation_resistant_cleanup_is_left_behind_at_the_deadline(
     assert "engine.dispose" not in forced["steps"]  # the dispose floor still closes the journal
     assert stubborn.cancels == 1
     assert lock.held  # run_core never releases the journal lock
+
+
+@pytest.mark.parametrize("target", ["bus.close", "engine.dispose", "source.stop"])
+async def test_unsuccessful_cleanup_step_exits_1_and_cleanup_continues(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    source = StreamingSource()
+    if target == "bus.close":
+        real_close = EventBus.close
+
+        async def close(self: EventBus, budget_s: float = 20.0) -> None:
+            await real_close(self, budget_s=budget_s)  # drain for real, then report failure
+            raise RuntimeError("bus close failed")
+
+        monkeypatch.setattr("autotrader.core.runtime.EventBus.close", close)
+    elif target == "engine.dispose":
+        real_dispose = AsyncEngine.dispose
+
+        async def dispose(self: AsyncEngine, close: bool = True) -> None:
+            await real_dispose(self, close)  # close the connections for real, then fail
+            raise RuntimeError("dispose failed")
+
+        monkeypatch.setattr(AsyncEngine, "dispose", dispose)
+    else:
+
+        async def cancelled_stop() -> None:
+            source.stopped.set()
+            raise asyncio.CancelledError
+
+        source.stop = cancelled_stop  # type: ignore[method-assign]
+    control, _ = make_control()
+
+    task = start_core(cfg, lock, control, source=source)
+    await _wait_for(lambda: any(ln["event"] == "core.started" for ln in _log_lines(buf)))
+    control.begin("stop")
+
+    assert await asyncio.wait_for(task, timeout=5) == EXIT_FAILED
+    failed = next(ln for ln in _log_lines(buf) if ln["event"] == "core.shutdown_failed")
+    assert failed["steps"] == [target]  # nothing else failed: the later steps still ran
+    events = [ln["event"] for ln in _log_lines(buf)]
+    assert "core.stopped" not in events and "core.shutdown_forced" not in events
+    assert source.stopped.is_set()
 
 
 async def test_stream_death_with_stuck_cleanup_still_ends_within_the_deadline(
@@ -1625,21 +1759,31 @@ async def _teardown(
     engine: Any,
 ) -> list[str]:
     """Ordered, bounded teardown (spec section 4). Each step gets what is left of the
-    deadline; a step still running then is cancelled once and left behind."""
+    deadline; a step still running then is cancelled once and left behind (forced). A step
+    that raises or is cancelled is failed. Either way the remaining steps still run, and
+    the returned list (forced + failed) makes the exit unclean."""
     deadline = control.deadline
     if deadline is None:
         raise RuntimeError("teardown before ShutdownControl.begin()")
     log.info("core.stopping", cause=control.cause)
-    forced: list[str] = []
+    forced: list[str] = []  # timed out: cancelled once and left behind
+    failed: list[str] = []  # completed, but raised or was cancelled
 
-    async def bounded(name: str, work: Awaitable[object], floor_s: float = 0.0) -> None:
+    async def bounded(
+        name: str, work: Awaitable[object], floor_s: float = 0.0, cancel_ok: bool = False
+    ) -> None:
         task = asyncio.ensure_future(work)
         done, _ = await asyncio.wait({task}, timeout=max(control.remaining(), floor_s))
         if not done:
             task.cancel()
             forced.append(name)
-        elif not task.cancelled() and task.exception() is not None:
-            log.error("core.shutdown_step_failed", step=name, error=repr(task.exception()))
+        elif task.cancelled():
+            if not cancel_ok:
+                failed.append(name)
+                log.error("core.shutdown_step_failed", step=name, error="cancelled")
+        elif (error := task.exception()) is not None:
+            failed.append(name)
+            log.error("core.shutdown_step_failed", step=name, error=repr(error))
 
     # 1. Admission: nothing to close in 1.5a (WP 1.5d: close admission, runner.close()).
     await bounded("source.stop", source.stop())
@@ -1647,7 +1791,7 @@ async def _teardown(
         forced += [f"loop:{name}" for name in await supervisor.stop(deadline)]
     if stream_task is not None and not stream_task.done():
         stream_task.cancel()
-        await bounded("stream", stream_task)
+        await bounded("stream", stream_task, cancel_ok=True)  # we cancelled it ourselves
     await bounded("bus.close", bus.close(budget_s=control.remaining()))
     # A floor even after the deadline (inside the watchdog's 5 s grace): a forced teardown
     # must still close the journal's connections (dry run, spec revision 2026-10-14).
@@ -1659,9 +1803,11 @@ async def _teardown(
             steps=forced,
             note="left for startup recovery (WP 1.5d); not proof that broker work stopped",
         )
-    else:
+    if failed:
+        log.error("core.shutdown_failed", steps=failed, cause=control.cause)
+    if not forced and not failed:
         log.info("core.stopped", cause=control.cause)
-    return forced
+    return forced + failed  # any entry makes the exit unclean
 
 
 async def _check_broker(connect_broker: BrokerConnect, settings: Settings) -> Any:
@@ -2066,3 +2212,10 @@ Design notes from the dry run:
 - Ctrl-C while waiting for the lock now exits 130 without a traceback.
 
 With all fixes, `uv run pytest -q` passed (791), ruff and mypy were clean, `risk/` had 100 % branch coverage, and five repeated runs of the new test files showed no flakiness.
+
+A Codex plan review (2026-10-14) then added three fixes:
+- the watchdog's stderr line is best-effort and bounded;
+- a failed or cancelled teardown step makes the exit unclean;
+- loop cadence is start-to-start with no catch-up.
+
+The revised modules and tests were re-run in the dry-run worktree: 798 passed, ruff and mypy clean, `risk/` at 100 %, three repeated runs of the shutdown/supervise/runtime tests green.

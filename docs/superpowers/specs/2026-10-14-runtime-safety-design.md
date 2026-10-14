@@ -1,6 +1,11 @@
 # Runtime safety design (WP 1.5a)
 
 Date: 2026-10-14. Status: approved in conversation (sections 1-3), pending written-spec review.
+Revised 2026-10-14 after the Codex plan review:
+- the watchdog's stderr line is best-effort and bounded, and the exit never waits for it;
+- a teardown step that raises or is cancelled makes the exit 1 (`core.shutdown_failed`), and the remaining steps still run;
+- loop cadence is start-to-start with no catch-up.
+
 Revised 2026-10-14 after the plan dry run:
 - `engine.dispose` gets a 1 s floor after the deadline, still inside the watchdog grace;
 - Ctrl-C while waiting for the lock exits 130 quietly;
@@ -66,7 +71,7 @@ Owner decisions taken while designing (2026-10-14, recorded in PLAN 1.5):
 
 ## 3. Supervised loops (`core/supervise.py`)
 
-- **`Loop(name, step, interval_s, stall_after_s)`:** the supervisor calls `await step()`, then sleeps for the rest of `interval_s`. The time it records is when `step()` last **completed**: the loop's heartbeat.
+- **`Loop(name, step, interval_s, stall_after_s)`:** the supervisor calls `await step()`, then sleeps for the rest of `interval_s`, measured from the step's start on the supervisor's clock. A step that overruns its interval is followed immediately by the next one, with no catch-up. The time it records is when `step()` last **completed**: the loop's heartbeat.
 - **Stall detection:**
   - A check that runs in the supervisor itself (not inside the loop's task) logs `<name>.stalled` with the heartbeat age, once per stall, when the age exceeds `stall_after_s`.
   - It logs `<name>.recovered` once the heartbeat is fresh again.
@@ -119,7 +124,8 @@ Loops registered in 1.5a:
   4. `engine.dispose()`, bounded by the remaining time but given **at least 1 s** even after the deadline (still inside the 5 s watchdog grace). Otherwise a stuck earlier step would leave the journal's connections open on every forced teardown.
 - **The deadline is enforced by not waiting.** Cancellation alone can't enforce it: a task that catches `CancelledError` keeps `wait_for` pending. So each step is waited on with `asyncio.wait(..., timeout=remaining)`. When time runs out, the step's task is cancelled once and then *left behind*, without awaiting it again.
   - `core.shutdown_forced` is logged with the step and the loops still running, and teardown moves on.
-  - The process exits 1 for a forced deadline, startup failure or stream death, and 0 for a clean stop.
+  - A step that completes but raises, or is cancelled, is **failed**: `core.shutdown_failed` is logged with the step names, and the remaining steps still run.
+  - The process exits 1 for a forced or failed step, startup failure or stream death, and 0 only for a clean stop (`core.stopped`).
 - **Abandoned work** stays in the journal for 1.5d's startup recovery: open cycles, `pending`/`unknown` orders, and any queued aiosqlite write that may still finish. It is logged as `core.shutdown_abandoned`. Forced cancellation does not prove that broker work stopped.
 - **After `run_core` returns:** `asyncio.run` teardown can itself block on tasks or executor work that were left behind. The watchdog stays armed through it (see below), so the process still ends by T + 5.
 
@@ -130,7 +136,7 @@ Loops registered in 1.5a:
 
 **Watchdog (last resort):**
 - `begin_shutdown` arms it on its first call, for **every** exit cause, through the CLI's callback, before any event-loop work. It is a daemon `threading.Timer` for T + 5 s from the trigger time, armed once. The thread is needed because a timer on the event loop can't fire while the loop is blocked.
-- If the timer fires, it writes `core.watchdog_exit` to stderr directly (not through the event loop) and calls `os._exit(70)`.
+- If the timer fires, it calls `os._exit(70)` in all cases. Before that it tries to write `core.watchdog_exit` to stderr (directly, not through the event loop). The write runs in a separate daemon thread that gets at most 0.5 s and whose errors are ignored, so a closed, broken or blocking stderr can't keep the process alive.
 - It is cancelled only after `asyncio.run(...)` has fully returned, immediately before the CLI's normal exit, so it covers asyncio and executor teardown too.
 
 | Exit code | Meaning |
