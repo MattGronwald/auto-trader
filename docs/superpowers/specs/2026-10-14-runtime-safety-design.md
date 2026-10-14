@@ -1,6 +1,11 @@
 # Runtime safety design (WP 1.5a)
 
 Date: 2026-10-14. Status: approved in conversation (sections 1-3), pending written-spec review.
+Revised 2026-10-14 after the plan dry run:
+- `engine.dispose` gets a 1 s floor after the deadline, still inside the watchdog grace;
+- Ctrl-C while waiting for the lock exits 130 quietly;
+- a slow migration interrupted by a signal is ended by the watchdog at T + 5 s, and SQLite rolls back the unfinished migration transaction.
+
 Revised 2026-10-14 after the PR #23 spec review:
 - the lock is taken in the CLI before the migration;
 - the journal path is canonicalised;
@@ -55,6 +60,7 @@ Owner decisions taken while designing (2026-10-14, recorded in PLAN 1.5):
 - **Contention:**
   - A second core retries the non-blocking lock once per second for `shutdown.timeout_s + 5` seconds, the old process's last-resort bound. That way a restart can begin while the previous process is still shutting down. The lock is released only when the old process has exited, so its SQLite work has been committed or rolled back.
   - On timeout, startup fails with `journal locked by PID <pid> since <ts>` and exit code 1. The losing core never calls `db.upgrade()` and never opens the journal.
+  - Ctrl-C while waiting exits 130 with a one-line message and no traceback. Nothing is owned yet, and the handlers are installed only after the lock.
 - **Scope:** only `run core` takes the lock. `autotrader kill`, `check-config` and `db upgrade` don't, so the kill switch keeps working while a core runs.
 - **Platform:** macOS and Linux (`fcntl`). Windows is not supported.
 
@@ -110,7 +116,7 @@ Loops registered in 1.5a:
   1. Admission: nothing to close in 1.5a. 1.5d inserts "close admission, then `runner.close()`" here.
   2. `source.stop()`, then `supervisor.stop(deadline)`.
   3. `bus.close()`, bounded by the remaining time.
-  4. `engine.dispose()`, bounded by the remaining time.
+  4. `engine.dispose()`, bounded by the remaining time but given **at least 1 s** even after the deadline (still inside the 5 s watchdog grace). Otherwise a stuck earlier step would leave the journal's connections open on every forced teardown.
 - **The deadline is enforced by not waiting.** Cancellation alone can't enforce it: a task that catches `CancelledError` keeps `wait_for` pending. So each step is waited on with `asyncio.wait(..., timeout=remaining)`. When time runs out, the step's task is cancelled once and then *left behind*, without awaiting it again.
   - `core.shutdown_forced` is logged with the step and the loops still running, and teardown moves on.
   - The process exits 1 for a forced deadline, startup failure or stream death, and 0 for a clean stop.

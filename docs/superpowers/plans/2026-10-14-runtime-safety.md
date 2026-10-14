@@ -27,6 +27,7 @@
 - **ASCII only** in Python code, comments and docstrings. ruff `RUF001`-`RUF003` reject characters like `−` or `×`. `ruff format` doesn't wrap docstrings, so wrap them by hand at 100 characters.
 - **Config:** `shutdown.timeout_s` is required, finite, `0 < v <= 300`, and `config.yaml` sets 30.
 - **Constants:** `WATCHDOG_GRACE_S = 5.0` (last resort at T + 5 s), and lock poll 1.0 s.
+- **Teardown floor (dry-run finding, spec revision 2026-10-14):** `engine.dispose` gets at least 1.0 s even after the deadline, still inside the 5 s watchdog grace, so a forced teardown still closes the journal's connections. No other step gets a floor.
 - **Exit codes:** 0 clean; 1 for startup failure (including lock timeout), stream death or a forced graceful deadline; 130 for the second signal; 70 for the watchdog.
 - **Lock error text** contains `journal locked by PID <pid> since <ts>`. The non-file DB error is `single-writer lock needs a file journal; cross-host ownership is WP 3.5`.
 - **Log event names** (verbatim):
@@ -39,7 +40,9 @@
   - Never assert wall-clock timing; use injected clocks/events (lesson from PR #13).
   - Never call the real `os._exit`.
   - Never install real process signal handlers in tests; inject `install`.
-- **Before every commit** these must exit 0: `uv run pytest -q`, `uv run ruff check`, `uv run ruff format --check`, `uv run mypy`. `src/autotrader/risk/` keeps 100 % branch coverage: `uv run pytest -q --cov=autotrader.risk --cov-branch --cov-report=term-missing`.
+- **Before every commit** these must exit 0: `uv run pytest -q`, `uv run ruff check`, `uv run ruff format --check`, `uv run mypy`. Run `uv run ruff check --fix` (import sorting, `I001`) and `uv run ruff format` before checking.
+- **No `assert` in `src/`:** ruff `S101` applies outside `tests/`; raise `RuntimeError` for internal invariants.
+- **Subprocesses in tests:** close `proc.stdout` after `proc.wait()` (pytest runs with `filterwarnings = error`, so an unclosed pipe is a `ResourceWarning` failure), and mark the `Popen` line `# noqa: S603  (fixed argv: this interpreter + a constant script)`. `src/autotrader/risk/` keeps 100 % branch coverage: `uv run pytest -q --cov=autotrader.risk --cov-branch --cov-report=term-missing`.
 - **Check output:** never pipe a check into `tail`; redirect to a file and read the real exit code. Chain `git commit` with `&&` after the checks.
 - **Never use `git stash`.** The stash stack is shared with other sessions.
 - **Known flake:** `tests/unit/risk/test_engine.py::test_hung_entry_submit_is_unknown` is a known pre-existing timing flake. If it fails, re-run it in isolation and note it.
@@ -103,7 +106,7 @@ def test_shutdown_timeout_is_required_finite_and_bounded(tmp_path: Path, value: 
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `uv run pytest tests/unit/core/test_config.py -k shutdown_timeout -q`
-Expected: FAIL. The repo config has no `timeout_s` (extra key forbidden / attribute missing).
+Expected: FAIL for `test_shutdown_timeout_loads_from_the_repo_config` and the `None` case. The other cases already raise, because the extra-key error also names `timeout_s`; that's expected, and they keep passing for the right reason after Step 3.
 
 - [ ] **Step 3: Implement**
 
@@ -178,7 +181,7 @@ sys.stdin.readline()
 @contextmanager
 def held_elsewhere(url: str) -> Iterator[subprocess.Popen[str]]:
     """Hold the journal lock in another process until the block ends."""
-    proc = subprocess.Popen(
+    proc = subprocess.Popen(  # noqa: S603  (fixed argv: this interpreter + a constant script)
         [sys.executable, "-c", HOLD, url],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -191,6 +194,7 @@ def held_elsewhere(url: str) -> Iterator[subprocess.Popen[str]]:
     finally:
         proc.stdin.close()
         proc.wait(timeout=10)
+        proc.stdout.close()
 
 
 def url_for(path: Path) -> str:
@@ -458,7 +462,8 @@ class Clock:
 
 
 def test_watchdog_arms_once_as_a_daemon_and_exits_70_with_a_stderr_line() -> None:
-    timers, exits, err = Timers(), [], io.StringIO()
+    timers, err = Timers(), io.StringIO()
+    exits: list[int] = []
     dog = Watchdog(timer_factory=timers, exit=exits.append, stderr=err)
 
     dog.arm(35)
@@ -474,7 +479,8 @@ def test_watchdog_arms_once_as_a_daemon_and_exits_70_with_a_stderr_line() -> Non
 
 
 def test_begin_records_deadline_and_arms_before_anything_else() -> None:
-    clock, armed = Clock(), []
+    clock = Clock()
+    armed: list[float] = []
     control = ShutdownControl(30, arm_watchdog=armed.append, monotonic=clock)
 
     control.begin("signal")
@@ -486,7 +492,8 @@ def test_begin_records_deadline_and_arms_before_anything_else() -> None:
 
 
 def test_begin_is_idempotent_and_never_rearms() -> None:
-    clock, armed = Clock(), []
+    clock = Clock()
+    armed: list[float] = []
     control = ShutdownControl(30, arm_watchdog=armed.append, monotonic=clock)
     control.begin("signal")
     clock.now = 125.0
@@ -498,7 +505,8 @@ def test_begin_is_idempotent_and_never_rearms() -> None:
 
 
 async def test_first_signal_arms_the_watchdog_while_the_loop_is_blocked() -> None:
-    clock, timers, exits = Clock(), Timers(), []
+    clock, timers = Clock(), Timers()
+    exits: list[int] = []
     dog = Watchdog(timer_factory=timers, exit=exits.append)
     control = ShutdownControl(30, arm_watchdog=dog.arm, monotonic=clock)
     wakeup = control.attach()
@@ -920,6 +928,7 @@ async def test_freshness_is_tracked_separately_from_liveness() -> None:
     )
     sup.start()  # no write yet: age measured from start
     clock.now += 121
+    await until(lambda: sup.heartbeat("risk.snapshot") == clock.now)  # the loop is alive
     sup.check()
     assert events(buf).count("risk.snapshot_overdue") == 1
     assert "risk.snapshot.stalled" not in events(buf)  # the loop itself is fine
@@ -1054,7 +1063,8 @@ class Supervisor:
 
     async def _run(self, loop: Loop) -> None:
         stopping = self._stopping
-        assert stopping is not None  # start() created it
+        if stopping is None:
+            raise RuntimeError("Supervisor.start() was not called")
         while not stopping.is_set():
             try:
                 await loop.step()
@@ -1109,23 +1119,26 @@ async def test_last_snapshot_at_tracks_committed_writes(
     sessions: async_sessionmaker[AsyncSession], gate: ControlGate
 ) -> None:
     mono = Mono()
+    mono.t = 2.0
     ok = make_engine_(_broker(SimBroker), sessions, gate, monotonic=mono)
     assert ok.last_snapshot_at is None
     await ok.snapshot_equity()
-    assert ok.last_snapshot_at == mono()
+    assert ok.last_snapshot_at == 2.0
 
     no_account = make_engine_(_broker(AccountDown), sessions, gate, monotonic=mono)
     with pytest.raises(ConnectionError):
         await no_account.snapshot_equity()
     assert no_account.last_snapshot_at is None  # nothing was written
 
-    partial = make_engine_(_broker(PositionsDown), sessions, gate, monotonic=mono)
+    mono.t = 5.0  # advance, so the assertion shows the value was set by this write
+    later = Clock(NOW + timedelta(minutes=1))  # equity_snapshots.ts is unique
+    partial = make_engine_(_broker(PositionsDown), sessions, gate, clock=later, monotonic=mono)
     with pytest.raises(ConnectionError):
         await partial.snapshot_equity()
-    assert partial.last_snapshot_at == mono()  # equity/HWM still committed
+    assert partial.last_snapshot_at == 5.0  # equity/HWM still committed
 ```
 
-Check that `Mono`, `Account`, `Position`, `SimBroker`, `five`, `FEES`, `RULES` and `D` already exist or are imported in `test_engine.py` (`rg -n "class Mono|^from|^import" tests/unit/risk/test_engine.py`). Add any missing import from the module it's used from elsewhere in the file. If `Mono()` needs arguments or isn't callable, look at its definition and use it the way the existing tests do.
+Check that `Mono`, `Clock`, `NOW`, `timedelta`, `Account`, `Position`, `SimBroker`, `five`, `FEES`, `RULES` and `D` already exist or are imported in `test_engine.py` (`rg -n "class Mono|^from|^import" tests/unit/risk/test_engine.py`). Add any missing import from the module it's used from elsewhere in the file. If `Mono()` needs arguments or isn't callable, look at its definition and use it the way the existing tests do.
 
 - [ ] **Step 2: Run it to verify it fails**
 
@@ -1257,7 +1270,7 @@ Then update the existing tests as follows:
   - Create `control, _ = make_control()`.
   - Replace the `asyncio.create_task(run_core(...))` call with `task = start_core(cfg, lock, control, source=source, snapshot_s=0.01)`.
   - In `finally`, replace `stop.set()` with `control.begin("stop")`, and assert `await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN`.
-  - Remove the now-unused `stop` and `profile` variables. `profile` is still needed for the `scanner` asserts, so keep `profile = load_profile(cfg.strategy)`.
+  - Remove the now-unused `stop` variable. Keep `profile = load_profile(cfg.strategy)`: the `scanner` asserts use it.
 - **`test_dead_stream_stops_the_core_with_an_error`:**
 
 ```python
@@ -1313,7 +1326,7 @@ async def test_shutdown_requested_before_start_skips_startup(
         connected.append(1)
         return FakeBroker()
 
-    control, dog = make_control()
+    control, _ = make_control()
     control.begin("signal")  # e.g. a signal during the CLI's migration
     source = StreamingSource()
 
@@ -1353,6 +1366,7 @@ async def test_cancellation_resistant_cleanup_is_left_behind_at_the_deadline(
         await asyncio.sleep(0.01)
     forced = next(ln for ln in _log_lines(buf) if ln["event"] == "core.shutdown_forced")
     assert "source.stop" in forced["steps"]
+    assert "engine.dispose" not in forced["steps"]  # the dispose floor still closes the journal
     assert stubborn.cancels == 1
     assert lock.held  # run_core never releases the journal lock
 
@@ -1612,13 +1626,15 @@ async def _teardown(
 ) -> list[str]:
     """Ordered, bounded teardown (spec section 4). Each step gets what is left of the
     deadline; a step still running then is cancelled once and left behind."""
-    assert control.deadline is not None  # begin() ran before teardown
+    deadline = control.deadline
+    if deadline is None:
+        raise RuntimeError("teardown before ShutdownControl.begin()")
     log.info("core.stopping", cause=control.cause)
     forced: list[str] = []
 
-    async def bounded(name: str, work: Awaitable[object]) -> None:
+    async def bounded(name: str, work: Awaitable[object], floor_s: float = 0.0) -> None:
         task = asyncio.ensure_future(work)
-        done, _ = await asyncio.wait({task}, timeout=control.remaining())
+        done, _ = await asyncio.wait({task}, timeout=max(control.remaining(), floor_s))
         if not done:
             task.cancel()
             forced.append(name)
@@ -1628,12 +1644,14 @@ async def _teardown(
     # 1. Admission: nothing to close in 1.5a (WP 1.5d: close admission, runner.close()).
     await bounded("source.stop", source.stop())
     if supervisor is not None:
-        forced += [f"loop:{name}" for name in await supervisor.stop(control.deadline)]
+        forced += [f"loop:{name}" for name in await supervisor.stop(deadline)]
     if stream_task is not None and not stream_task.done():
         stream_task.cancel()
         await bounded("stream", stream_task)
     await bounded("bus.close", bus.close(budget_s=control.remaining()))
-    await bounded("engine.dispose", engine.dispose())
+    # A floor even after the deadline (inside the watchdog's 5 s grace): a forced teardown
+    # must still close the journal's connections (dry run, spec revision 2026-10-14).
+    await bounded("engine.dispose", engine.dispose(), floor_s=1.0)
     if forced:
         log.error("core.shutdown_forced", steps=forced, cause=control.cause)
         log.warning(
@@ -1661,23 +1679,17 @@ async def _check_broker(connect_broker: BrokerConnect, settings: Settings) -> An
     return broker
 ```
 
-Note: the `stream_task` annotation in `_teardown` is a string only so the signature stays on one line. If `ruff` prefers it unquoted, unquote it; `from __future__` isn't used in this repo.
+Note: the `stream_task` annotation in `_teardown` is quoted. If `ruff` prefers it unquoted, unquote it.
 
 - [ ] **Step 4: Run all tests** with `uv run pytest -q` (redirect the output, check the exit code). Expected: PASS. `tests/integration/test_scanner_feed.py` and other callers of `run_core` must also pass. Check with `rg -n "run_core\(" tests src`, and update any other caller the same way: a `lock` fixture, `make_control()`, `control.begin("stop")`.
 
-- [ ] **Step 5: Lint, type-check, commit**
+- [ ] **Step 5: Don't commit yet**
 
-```bash
-uv run ruff format && uv run ruff check && uv run mypy && git add src/autotrader/core/runtime.py tests/unit/core/test_runtime.py && git commit -m "WP 1.5a: run_core on lock, supervised loops and a bounded shutdown coordinator
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-```
-
-If another test file needed updating in Step 4, add it to the `git add`.
+`cli.py` still calls `run_core(..., stop=...)`, so mypy is red until Task 7 rewires the CLI. **Tasks 6 and 7 are one review unit with one commit**, made at the end of Task 7. Run `uv run pytest -q tests/unit/core/test_runtime.py` here to confirm the runtime tests pass, then continue with Task 7.
 
 ---
 
-### Task 7: CLI wiring: lock before migration, handlers, watchdog, exit codes
+### Task 7: CLI wiring: lock before migration, handlers, watchdog, exit codes (commits together with Task 6)
 
 **Files:**
 - Modify: `src/autotrader/cli.py`: the `run_core` command (around line 60-75) and `_run_core_until_signal` (around line 77-97)
@@ -1685,19 +1697,21 @@ If another test file needed updating in Step 4, add it to the `git add`.
 
 **Interfaces:**
 - Consumes: `journal_lock.acquire`, `JournalLockError` (Task 2); `ShutdownControl`, `Watchdog`, `make_signal_handler`, `install_signal_handlers`, `WATCHDOG_GRACE_S`, `EXIT_FAILED` (Task 3); `run_core(..., lock=, control=) -> int` (Task 6).
-- Produces: `_run_core_process(cfg, settings, profile, *, watchdog: Watchdog | None = None, install=install_signal_handlers, upgrade=db.upgrade, make_source=AlpacaBarSource.from_settings, run=asyncio.run) -> int`. `_run_core_until_signal` is removed.
+- Produces: `_run_core_process(cfg, settings, profile, *, watchdog: Watchdog | None = None, install=install_signal_handlers, upgrade=db.upgrade, make_source=AlpacaBarSource.from_settings, run=asyncio.run, acquire=journal_lock.acquire) -> int`. `_run_core_until_signal` is removed. Ctrl-C while waiting for the lock exits 130 without a traceback.
 
 - [ ] **Step 1: Write the failing tests** (append to `tests/unit/test_cli.py`)
 
 ```python
-import os
+import io
 import subprocess
 import sys
 from collections.abc import Callable, Coroutine
 from typing import Any
 
 from autotrader.cli import _run_core_process
+from autotrader.core import lock as journal_lock
 from autotrader.core.config import Settings, load_config, load_profile
+from autotrader.core.logging import configure_logging
 from autotrader.core.shutdown import Watchdog
 
 HOLD = """
@@ -1732,6 +1746,21 @@ class FakeTimer:
         self.cancelled = True
 
 
+class Locks:
+    """Real acquire, released when the test ends (production never releases early)."""
+
+    def __init__(self) -> None:
+        self.held: list[journal_lock.JournalLock] = []
+
+    def __call__(self, url: str, **kwargs: Any) -> journal_lock.JournalLock:
+        self.held.append(journal_lock.acquire(url, **kwargs))
+        return self.held[-1]
+
+    def release(self) -> None:
+        for held in self.held:
+            held.release()
+
+
 def _fast_config(tmp_path: Path) -> Path:
     path = _tmp_config(tmp_path)
     path.write_text(path.read_text().replace("timeout_s: 30", "timeout_s: 0.1"))
@@ -1743,7 +1772,7 @@ def test_losing_core_never_migrates_or_opens_the_journal(
 ) -> None:
     monkeypatch.setattr("autotrader.core.shutdown.WATCHDOG_GRACE_S", 0.0)
     cfg = load_config(_fast_config(tmp_path), Settings(_env_file=None))
-    proc = subprocess.Popen(
+    proc = subprocess.Popen(  # noqa: S603  (fixed argv: this interpreter + a constant script)
         [sys.executable, "-c", HOLD, cfg.database.url],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -1765,12 +1794,15 @@ def test_losing_core_never_migrates_or_opens_the_journal(
     finally:
         proc.stdin.close()
         proc.wait(timeout=10)
+        proc.stdout.close()
     assert code == 1
     assert upgrade.calls == [] and make_source.calls == [] and run.calls == []
 
 
 def test_signal_during_migration_arms_the_watchdog_and_skips_startup(tmp_path: Path) -> None:
+    configure_logging(stream=io.StringIO())  # an earlier CliRunner test left a closed stdout
     cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
+    locks = Locks()
     timers: list[FakeTimer] = []
     handlers: list[Any] = []
 
@@ -1798,7 +1830,9 @@ def test_signal_during_migration_arms_the_watchdog_and_skips_startup(tmp_path: P
         install=handlers.append,
         upgrade=upgrade,
         make_source=lambda settings, symbols: Source(),
+        acquire=locks,
     )
+    locks.release()
 
     assert code == 0
     assert timers and timers[0].started and timers[0].seconds == 35.0
@@ -1808,6 +1842,7 @@ def test_signal_during_migration_arms_the_watchdog_and_skips_startup(tmp_path: P
 
 def test_failure_inside_run_exits_1_and_cancels_the_watchdog_after_run(tmp_path: Path) -> None:
     cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
+    locks = Locks()
     timers: list[FakeTimer] = []
     order: list[str] = []
 
@@ -1829,10 +1864,31 @@ def test_failure_inside_run_exits_1_and_cancels_the_watchdog_after_run(tmp_path:
         upgrade=Spy(),
         make_source=Spy(),
         run=run,
+        acquire=locks,
     )
+    locks.release()
 
     assert code == 1
     assert order == ["run"] and timers[0].cancelled
+
+
+def test_ctrl_c_while_waiting_for_the_lock_exits_130(tmp_path: Path) -> None:
+    cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
+    upgrade = Spy()
+
+    def interrupted(url: str, **kwargs: Any) -> Any:
+        raise KeyboardInterrupt
+
+    code = _run_core_process(
+        cfg,
+        Settings(_env_file=None),
+        load_profile(cfg.strategy),
+        install=Spy(),
+        upgrade=upgrade,
+        acquire=interrupted,
+    )
+
+    assert code == 130 and upgrade.calls == []
 ```
 
 Check the imports at the top of `test_cli.py`. `Path`, `pytest` and `REPO` already exist; add the imports above that are missing, at the top of the file, not mid-file.
@@ -1854,6 +1910,7 @@ from autotrader.core import lock as journal_lock
 from autotrader.core import shutdown
 from autotrader.core.shutdown import (
     EXIT_FAILED,
+    EXIT_HARD,
     ShutdownControl,
     SignalHandler,
     Watchdog,
@@ -1890,6 +1947,7 @@ def _run_core_process(
     upgrade: Callable[[str], None] = db.upgrade,
     make_source: Callable[[Settings, list[str]], Any] = AlpacaBarSource.from_settings,
     run: Callable[[Coroutine[Any, Any, int]], int] = asyncio.run,
+    acquire: Callable[..., journal_lock.JournalLock] = journal_lock.acquire,
 ) -> int:
     """WP 1.5a ownership and shutdown boundary (spec 2026-10-14 sections 2 and 4).
 
@@ -1898,12 +1956,13 @@ def _run_core_process(
     only after `run` (asyncio.run) has fully returned."""
     timeout_s = cfg.shutdown.timeout_s
     try:
-        lock = journal_lock.acquire(
-            cfg.database.url, wait_s=timeout_s + shutdown.WATCHDOG_GRACE_S
-        )
+        lock = acquire(cfg.database.url, wait_s=timeout_s + shutdown.WATCHDOG_GRACE_S)
     except journal_lock.JournalLockError as e:
         typer.echo(f"cannot start: {e}", err=True)
         return EXIT_FAILED
+    except KeyboardInterrupt:  # Ctrl-C while waiting: nothing is owned yet, exit quietly
+        typer.echo("interrupted while waiting for the journal lock", err=True)
+        return EXIT_HARD
     dog = watchdog if watchdog is not None else Watchdog()
     control = ShutdownControl(timeout_s, arm_watchdog=dog.arm)
     install(make_signal_handler(control))
@@ -1934,10 +1993,10 @@ def _run_core_process(
 
 - [ ] **Step 4: Run all tests** with `uv run pytest -q` (redirect the output, check the exit code). Expected: PASS, including the existing `test_run_core_with_invalid_config_exits_1`.
 
-- [ ] **Step 5: Lint, type-check, commit**
+- [ ] **Step 5: Lint, type-check, commit (Tasks 6 and 7 together)**
 
 ```bash
-uv run ruff format && uv run ruff check && uv run mypy && git add src/autotrader/cli.py tests/unit/test_cli.py && git commit -m "WP 1.5a: run core takes the journal lock before the migration; signals and watchdog
+uv run ruff check --fix && uv run ruff format && uv run ruff check && uv run mypy && git add src/autotrader/core/runtime.py tests/unit/core/test_runtime.py src/autotrader/cli.py tests/unit/test_cli.py && git commit -m "WP 1.5a: run_core on lock/supervisor/shutdown coordinator; CLI lock before migration
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1986,3 +2045,24 @@ uv run ruff check && uv run ruff format --check && uv run mypy && git add SPEC.m
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 Expected: both pytest runs print `0`, and the risk coverage report shows 100 %.
+
+---
+
+## Plan verification (2026-10-14)
+
+Tasks 1-7 were dry-run verbatim in a throwaway worktree before review. Nine snippet problems were found and are fixed above:
+- unclosed subprocess pipes and the `S603` noqa;
+- mypy `var-annotated` in test lists;
+- a freshness test that ignored loop liveness;
+- `assert` in `src/` (`S101`);
+- a duplicate `equity_snapshots.ts` and an un-advanced `Mono`;
+- a forced teardown that never disposed the engine, now `engine.dispose` with a 1 s floor (a design fix, also recorded in the spec);
+- the Task 6/7 commit order, now one review unit;
+- import sorting via `ruff check --fix`;
+- a structlog stream left closed by an earlier CLI test, and leaked locks in the CLI tests.
+
+Design notes from the dry run:
+- The `signal.signal` handlers coexist with `asyncio.run`, which installs its own SIGINT handler only when the default is still in place.
+- Ctrl-C while waiting for the lock now exits 130 without a traceback.
+
+With all fixes, `uv run pytest -q` passed (791), ruff and mypy were clean, `risk/` had 100 % branch coverage, and five repeated runs of the new test files showed no flakiness.
