@@ -974,6 +974,24 @@ async def test_close_of_dust_is_rejected_and_the_position_stays() -> None:
     assert pos.qty == D("0.00009975")
 
 
+async def test_tiny_partial_ioc_entry_fill_still_leaves_dust() -> None:
+    # Pins a known limit (PR #21 review): risk check 7 rejects an entry that would be dust
+    # when FULLY filled, but an IOC that fills only a sliver can still leave dust. WP 1.5
+    # must reconcile and report it rather than assume check 7 rules it out.
+    sim = make_sim(fees=BASE)
+    sim.process_bar(bar(0, 100.0))
+    sim.script(BTC, "buy", FillPlan((D("0.00005"),)))  # slice floors to 0.0001
+    ack = await sim.submit_order(ioc_buy("2.997", "100"))
+    sim.process_bar(bar(1, 100.0))
+
+    status = await sim.get_order(ack.order_id)
+    assert (status.status, status.filled_qty) == ("canceled", D("0.0001"))
+    (pos,) = await sim.get_positions()
+    assert pos.qty == D("0.00009975")  # below min_qty 0.0001
+    with pytest.raises(OrderRejected, match="dust below minimum"):
+        await sim.close_position(BTC)
+
+
 # --- properties (WP 1.R2) ---------------------------------------------------------------
 
 _scripted_actions = st.lists(
