@@ -1,0 +1,140 @@
+{
+ "_note": "Alpaca paper re-query 2026-10-14 (read-only) after fee check step 2; raw_data=True payloads, order ids replaced. CFEE posted for both legs with date 2026-10-12. Cash moved -19.84 USD between the post-sell snapshot (99999.88, which the gross fills plus the -0.03 sell CFEE reconcile) and this read; no activity or order explains it. See docs/alpaca-notes.md.",
+ "recorded_at": "2026-10-14T16:37:48.043386+00:00",
+ "positions": [],
+ "account": {
+  "cash": "99980.04",
+  "equity": "99980.04",
+  "last_equity": "99980.04",
+  "long_market_value": "0",
+  "non_marginable_buying_power": "99980.04",
+  "accrued_fees": "0",
+  "pending_transfer_in": null,
+  "pending_transfer_out": null
+ },
+ "activities_all": [
+  {
+   "id": "20261012140303109::2e275646-7310-4b24-8be5-b0152efd7a96",
+   "activity_type": "FILL",
+   "transaction_time": "2026-10-12T18:03:03.109818Z",
+   "type": "fill",
+   "price": "82420.56",
+   "qty": "0.000117817",
+   "side": "sell",
+   "symbol": "BTC/USD",
+   "leaves_qty": "0",
+   "order_id": "00000000-0000-4000-8000-00000000c001",
+   "cum_qty": "0.000117817",
+   "order_status": "filled",
+   "swap_rate": "1"
+  },
+  {
+   "id": "20261012000000000::7d7e508b-be36-4738-ac6e-ae81d8e5cc37",
+   "activity_type": "CFEE",
+   "date": "2026-10-12",
+   "created_at": "2026-10-11T10:07:01.815652Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "symbol": "BTCUSD",
+   "cusip": "BTC123456",
+   "qty": "-0.000000296",
+   "price": "82994.2",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20261012000000000::55e95016-8c6b-4ab1-a602-266bf9fbda88",
+   "activity_type": "CFEE",
+   "date": "2026-10-12",
+   "created_at": "2026-10-12T18:03:03.479243Z",
+   "net_amount": "-0.03",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20261011060656916::a3b9674e-13e5-4d51-912a-d7ab66fc49f0",
+   "activity_type": "FILL",
+   "transaction_time": "2026-10-11T10:06:56.916636Z",
+   "type": "fill",
+   "price": "82994.2",
+   "qty": "0.000118113",
+   "side": "buy",
+   "symbol": "BTC/USD",
+   "leaves_qty": "0",
+   "order_id": "00000000-0000-4000-8000-00000000b001",
+   "cum_qty": "0.000118113",
+   "order_status": "filled",
+   "swap_rate": "1"
+  },
+  {
+   "id": "20261009000000000::3f5ae311-6192-49af-bf1e-4e13612c1a0a",
+   "activity_type": "JNLC",
+   "date": "2026-10-09",
+   "created_at": "2026-10-09T18:09:37.388842Z",
+   "net_amount": "100000",
+   "description": "",
+   "status": "executed",
+   "currency": "USD"
+  }
+ ],
+ "activities_CFEE": [
+  {
+   "id": "20261012000000000::7d7e508b-be36-4738-ac6e-ae81d8e5cc37",
+   "activity_type": "CFEE",
+   "date": "2026-10-12",
+   "created_at": "2026-10-11T10:07:01.815652Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "symbol": "BTCUSD",
+   "cusip": "BTC123456",
+   "qty": "-0.000000296",
+   "price": "82994.2",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20261012000000000::55e95016-8c6b-4ab1-a602-266bf9fbda88",
+   "activity_type": "CFEE",
+   "date": "2026-10-12",
+   "created_at": "2026-10-12T18:03:03.479243Z",
+   "net_amount": "-0.03",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  }
+ ],
+ "activities_FEE": [],
+ "orders": [
+  {
+   "id": "00000000-0000-4000-8000-00000000c001",
+   "client_order_id": "fee-check-sell",
+   "symbol": "BTC/USD",
+   "side": "sell",
+   "qty": "0.000117817",
+   "notional": null,
+   "filled_qty": "0.000117817",
+   "filled_avg_price": "82420.56",
+   "status": "filled",
+   "submitted_at": "2026-10-12T18:03:03.108146Z",
+   "filled_at": "2026-10-12T18:03:03.109818Z",
+   "type": "market",
+   "time_in_force": "gtc"
+  },
+  {
+   "id": "00000000-0000-4000-8000-00000000b001",
+   "client_order_id": "fee-check-buy",
+   "symbol": "BTC/USD",
+   "side": "buy",
+   "qty": null,
+   "notional": "10",
+   "filled_qty": "0.000118113",
+   "filled_avg_price": "82994.2",
+   "status": "filled",
+   "submitted_at": "2026-10-11T10:06:56.914979Z",
+   "filled_at": "2026-10-11T10:06:56.916636Z",
+   "type": "market",
+   "time_in_force": "gtc"
+  }
+ ]
+}
