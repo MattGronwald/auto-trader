@@ -6,6 +6,7 @@ Revised 2026-10-14 after the PR #23 spec review:
 - the journal path is canonicalised;
 - the second signal is a direct process exit;
 - one shutdown coordinator serves every exit cause;
+- (round 2) the watchdog and deadline are armed synchronously in the signal handler, before any event-loop work;
 - snapshot freshness is tracked separately from loop liveness.
 Sources: PLAN §3.2 items 7 and 8, PLAN 1.5 row, D7, D15; SPEC §0, §4.11;
 `core/runtime.py`, `core/cycle.py` (`CLOSE_BUDGET_S`), `cli.py`.
@@ -92,9 +93,19 @@ Loops registered in 1.5a:
 
 **Config:** `shutdown.timeout_s` is required in the schema: a finite number with `0 < v <= 300`. `config.yaml` sets **30**, which is above the Cycle Runner's 20 s close budget (`CLOSE_BUDGET_S`) wired in 1.5d. It is infrastructure config; the profile hash is unchanged.
 
-**Shutdown coordinator.** One `Shutdown` object in `runtime.py` handles every exit cause:
-- Causes: the first signal, a programmatic stop (`stop` event), a startup failure after the lock, and stream death.
-- On entry (once; re-entry is a no-op) it records the cause and sets a **monotonic deadline**, entry time + T. It also arms the watchdog through a callback provided by the CLI.
+**Shutdown trigger.** `begin_shutdown(cause)` is plain synchronous code, so it can't depend on the event loop running. It is shared by every exit cause: the first signal, a programmatic stop (`stop` event), a startup failure after the lock, and stream death.
+- The **first** call does three things, in this order:
+  1. records the cause and a **monotonic deadline**, `time.monotonic()` + T, measured from the trigger itself (for a signal, the signal);
+  2. **starts the watchdog thread**;
+  3. only then requests the async teardown: it sets the stop flag and wakes the loop with `call_soon_threadsafe` when a loop exists.
+- Later calls are no-ops. The deadline and timer are never reset or re-armed. The second-signal path is separate (below).
+- **It runs inside the Python-level signal handler.** If the event loop is stuck in synchronous Python code when the first signal arrives, the watchdog is already running and T is already counting, even though the queued teardown can't start yet.
+- **Installed early.** The CLI installs the `signal.signal` handlers right after acquiring the lock, *before* `db.upgrade()` or any other owned startup work that may block.
+  - A signal during the migration, before any event loop exists, records the deadline, arms the watchdog and sets the flag.
+  - When `run_core` starts, it sees the flag and goes straight to teardown without starting loops or the stream.
+
+**Shutdown coordinator.** The async `Shutdown.run()` in `runtime.py` performs the teardown.
+- It reads the deadline and cause recorded by `begin_shutdown`, and never sets its own. When it is reached by a programmatic stop or stream death, it calls `begin_shutdown` first, which is a no-op if a signal already did.
 - It then runs the ordered teardown:
   1. Admission: nothing to close in 1.5a. 1.5d inserts "close admission, then `runner.close()`" here.
   2. `source.stop()`, then `supervisor.stop(deadline)`.
@@ -107,12 +118,12 @@ Loops registered in 1.5a:
 - **After `run_core` returns:** `asyncio.run` teardown can itself block on tasks or executor work that were left behind. The watchdog stays armed through it (see below), so the process still ends by T + 5.
 
 **Second signal (hard):** the CLI installs the second-signal path with `signal.signal`, the Python-level handler, not the event loop's `add_signal_handler`.
-- The first signal schedules the coordinator on the loop with `call_soon_threadsafe`. The second calls `os._exit(130)` directly in the handler.
+- The first signal calls `begin_shutdown("signal")` synchronously in the handler (watchdog armed, deadline recorded, then the async teardown is queued). The second calls `os._exit(130)` directly in the handler.
 - There is no async cleanup, no engine dispose and no explicit lock release. Process death releases the lock, so no other core can start while a queued write of this one is still running.
 - Python-level handlers run in the main thread between bytecodes, so this works while the event loop is stuck in Python code. A stall inside a C call is the watchdog's job.
 
 **Watchdog (last resort):**
-- The coordinator arms it on entry, for **every** exit cause, through the CLI's callback. It is a daemon `threading.Timer` for T + 5 s, armed once. The thread is needed because a timer on the event loop can't fire while the loop is blocked.
+- `begin_shutdown` arms it on its first call, for **every** exit cause, through the CLI's callback, before any event-loop work. It is a daemon `threading.Timer` for T + 5 s from the trigger time, armed once. The thread is needed because a timer on the event loop can't fire while the loop is blocked.
 - If the timer fires, it writes `core.watchdog_exit` to stderr directly (not through the event loop) and calls `os._exit(70)`.
 - It is cancelled only after `asyncio.run(...)` has fully returned, immediately before the CLI's normal exit, so it covers asyncio and executor teardown too.
 
@@ -148,6 +159,9 @@ Loops registered in 1.5a:
   - A **pending aiosqlite worker write** at a forced shutdown: the lock is not released by the process (a fresh acquirer in a subprocess fails until the process exits).
   - The second-signal handler calls the injected exit function with 130, without awaiting anything, and also while the loop is blocked.
   - Re-entering the coordinator (a signal during stream-death teardown) is a no-op apart from the second-signal path.
+  - **First signal while the loop is blocked:** the handler is invoked directly while the test holds the loop in synchronous code. The injected timer must already be armed and the deadline recorded **before any loop callback has run**. When the loop is released, the coordinator uses that same deadline, and its remaining time is measured from the signal, not from coordinator entry.
+  - **Signal during `db.upgrade`:** the injected `db.upgrade` delivers the signal. The watchdog is armed at once, `run_core` goes straight to teardown, and no loops or stream are started.
+  - A later `begin_shutdown` call (a stream death after a signal) doesn't reset the deadline or start a second timer.
 - **Watchdog:** with the timer factory and exit function injected:
   - It is armed on every exit cause.
   - It fires once at T + 5.
