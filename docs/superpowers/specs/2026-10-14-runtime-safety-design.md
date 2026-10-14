@@ -1,6 +1,12 @@
 # Runtime safety design (WP 1.5a)
 
 Date: 2026-10-14. Status: approved in conversation (sections 1-3), pending written-spec review.
+Revised 2026-10-14 after the PR #23 spec review:
+- the lock is taken in the CLI before the migration;
+- the journal path is canonicalised;
+- the second signal is a direct process exit;
+- one shutdown coordinator serves every exit cause;
+- snapshot freshness is tracked separately from loop liveness.
 Sources: PLAN §3.2 items 7 and 8, PLAN 1.5 row, D7, D15; SPEC §0, §4.11;
 `core/runtime.py`, `core/cycle.py` (`CLOSE_BUDGET_S`), `cli.py`.
 
@@ -18,9 +24,12 @@ WP 1.5 is split into four sub-PRs (owner, 2026-10-14):
 - Shutdown is unbounded, and nothing handles a wedged event loop.
 
 Done means:
-- Only one `run core` process can hold a given journal. A second one waits a bounded time, then fails startup with the holder's PID.
-- Kill/control polling, feed ticks and equity snapshots run as independent supervised loops. A hung step in one never delays the others. Stalls are logged, including `risk.snapshot_overdue` when the last snapshot is older than 2 x its interval.
-- A first SIGINT/SIGTERM shuts down within `shutdown.timeout_s`. A second signal stops at once. A watchdog thread ends the process if even that hangs.
+- **One writer per journal.** Only one `run core` process can hold a given journal, identified by its canonical file path. A second one waits a bounded time, then fails startup with the holder's PID. It never migrates or opens the journal before it holds the lock.
+- **Independent loops.** Kill/control polling, feed ticks and equity snapshots run as independent supervised loops, and a hung step in one never delays the others. Stalls are logged. `risk.snapshot_overdue` is logged when the last *committed* snapshot is older than 2 x its interval.
+- **Bounded shutdown.** Every way the core stops (first SIGINT/SIGTERM, programmatic stop, startup failure, stream death) runs one coordinated teardown with two bounds:
+  - **graceful:** teardown is abandoned at `shutdown.timeout_s` (T) and the process exits 1;
+  - **last resort:** a watchdog thread ends the process at T + 5 s if even that hangs.
+  - A second signal ends the process at once.
 - No behaviour change for entries, exits or the feed's data handling.
 
 Owner decisions taken while designing (2026-10-14, recorded in PLAN 1.5):
@@ -29,15 +38,22 @@ Owner decisions taken while designing (2026-10-14, recorded in PLAN 1.5):
 
 ## 2. Single-writer lock (`core/lock.py`)
 
-- **Path:** derived from `database.url`. SQLite `sqlite+aiosqlite:///data/autotrader.db` gives `data/autotrader.db.lock`, beside the journal file. It is derived from the URL as `config.py` has already resolved it: `_resolve_sqlite_url` makes a relative SQLite path absolute against `config.yaml`'s directory. Two configs pointing at the same journal therefore always contend for the same lock.
+- **Path:** derived from the journal's **canonical** file path, with the lock file next to it: SQLite `.../data/autotrader.db` gives `.../data/autotrader.db.lock`.
+  - `config.py`'s `_resolve_sqlite_url` already makes a relative path absolute against `config.yaml`'s directory. The lock code then applies `os.path.realpath`, which resolves symlinks in every path component, including a symlinked database file.
+  - The same canonical path is used for the URL that opens the journal (migration and engine). Two configs that reach one journal through symlinks therefore contend for the same lock.
+  - **Hard links are unsupported:** two hard-linked names are separate paths to the same inode. The spec states this limit rather than detecting it.
+  - The lock lives in a separate file, not on the database itself, because SQLite's own POSIX locks on the database file may interact with `flock` on macOS.
 - **Non-file databases:** any URL that is not a file-backed SQLite database fails startup with `single-writer lock needs a file journal; cross-host ownership is WP 3.5`. That includes Postgres and in-memory SQLite.
 - **Mechanism:** an exclusive, non-blocking `fcntl.flock` on the lock file, which is opened or created.
-  - The file descriptor stays open for the process's lifetime. The OS releases the lock when the process exits, including a crash, `kill -9` or `os._exit`. Releasing it explicitly at the end of shutdown means closing the descriptor.
+  - The file descriptor stays open until the process exits, and process death is what releases the lock: a clean exit, a crash, `kill -9` or `os._exit`.
+  - There is **no explicit early release** on any production path. A cancelled aiosqlite caller can leave its queued write running in the worker thread, so closing the descriptor before the process ends could let another core in while this one still writes. Only tests release explicitly, after their writers have finished.
   - After acquiring the lock, the file is truncated and the PID and the start time (UTC ISO) are written. These are diagnostic only; the lock is what excludes other processes.
-- **When:** first in `run_core`, before anything opens or writes the journal (`register_strategy`, backfill, the bus).
+- **When:** in the CLI's `run core` command, after config validation and **before `db.upgrade()`**, i.e. before anything migrates, opens or writes the journal.
+  - The held lock is passed to `core.runtime.run_core(..., lock=...)`. The runtime never acquires a second lock; it checks that it was given a held one.
+  - Failures after acquisition (migration, bar source, startup) exit the process, and that releases the lock.
 - **Contention:**
-  - A second core retries the non-blocking lock once per second for `shutdown.timeout_s + 5` seconds. That way a restart can begin while the previous process is still shutting down: the lock is released only once the old process has exited, so its SQLite work has been committed or rolled back.
-  - On timeout, startup fails with `journal locked by PID <pid> since <ts>` and exit code 1.
+  - A second core retries the non-blocking lock once per second for `shutdown.timeout_s + 5` seconds, the old process's last-resort bound. That way a restart can begin while the previous process is still shutting down. The lock is released only when the old process has exited, so its SQLite work has been committed or rolled back.
+  - On timeout, startup fails with `journal locked by PID <pid> since <ts>` and exit code 1. The losing core never calls `db.upgrade()` and never opens the journal.
 - **Scope:** only `run core` takes the lock. `autotrader kill`, `check-config` and `db upgrade` don't, so the kill switch keeps working while a core runs.
 - **Platform:** macOS and Linux (`fcntl`). Windows is not supported.
 
@@ -60,8 +76,13 @@ Loops registered in 1.5a:
 |---|---|---|---|---|
 | `feed.tick` | `feed.tick()` | 1 s | 30 s | warning |
 | `control.poll` | `gate.status()`; log kill/pause changes (`core.kill_detected` / `core.kill_cleared`, as today) | 1 s | 10 s | **error** |
-| `risk.snapshot` | `risk.snapshot_equity()` | 60 s | 120 s, logged as `risk.snapshot_overdue` | warning |
+| `risk.snapshot` | `risk.snapshot_equity()` | 60 s | 120 s (`risk.snapshot.stalled`) | warning |
 
+- **Snapshot freshness is separate from loop liveness.** PLAN item 8 asks for the age of the last *persisted* snapshot, not the last finished loop step. The two differ:
+  - A loop that keeps failing can be alive without ever writing a snapshot.
+  - `RiskEngine.snapshot_equity()` commits a snapshot (equity and peak, exposure `NULL`) and *then* raises when the position read fails.
+- So `RiskEngine` keeps `last_snapshot_at`, set right after each successful `_write_snapshot` commit, on both the full and the partial path. It is an attribute of the engine, so it survives loop restarts.
+- The supervisor's stall check logs `risk.snapshot_overdue` once when `now - last_snapshot_at > 120 s` and `risk.snapshot_fresh` when it recovers. Before the first write, the age is measured from core start, so "no snapshot within 120 s of start" also warns.
 - The `control.poll` loop keeps the latest `ControlStatus` so that 1.5c can act on kill changes without a second poller. In 1.5a, a kill is only logged, as today.
 - The intervals and thresholds are constants in `runtime.py`, with no new config keys apart from `shutdown.timeout_s`.
 - The entry fail-closed behaviour is unchanged: `ControlGate` already fails closed, and no entries run until 1.5d.
@@ -71,52 +92,67 @@ Loops registered in 1.5a:
 
 **Config:** `shutdown.timeout_s` is required in the schema: a finite number with `0 < v <= 300`. `config.yaml` sets **30**, which is above the Cycle Runner's 20 s close budget (`CLOSE_BUDGET_S`) wired in 1.5d. It is infrastructure config; the profile hash is unchanged.
 
-**First SIGINT/SIGTERM (graceful):**
-1. Set the stop event. The CLI starts the watchdog.
-2. Admission: nothing to close in 1.5a. 1.5d inserts "close admission, then `runner.close()`" here.
-3. `source.stop()`, then `supervisor.stop(deadline)`.
-4. `bus.close()`, bounded by the remaining time.
-5. `engine.dispose()`, then release the lock.
+**Shutdown coordinator.** One `Shutdown` object in `runtime.py` handles every exit cause:
+- Causes: the first signal, a programmatic stop (`stop` event), a startup failure after the lock, and stream death.
+- On entry (once; re-entry is a no-op) it records the cause and sets a **monotonic deadline**, entry time + T. It also arms the watchdog through a callback provided by the CLI.
+- It then runs the ordered teardown:
+  1. Admission: nothing to close in 1.5a. 1.5d inserts "close admission, then `runner.close()`" here.
+  2. `source.stop()`, then `supervisor.stop(deadline)`.
+  3. `bus.close()`, bounded by the remaining time.
+  4. `engine.dispose()`, bounded by the remaining time.
+- **The deadline is enforced by not waiting.** Cancellation alone can't enforce it: a task that catches `CancelledError` keeps `wait_for` pending. So each step is waited on with `asyncio.wait(..., timeout=remaining)`. When time runs out, the step's task is cancelled once and then *left behind*, without awaiting it again.
+  - `core.shutdown_forced` is logged with the step and the loops still running, and teardown moves on.
+  - The process exits 1 for a forced deadline, startup failure or stream death, and 0 for a clean stop.
+- **Abandoned work** stays in the journal for 1.5d's startup recovery: open cycles, `pending`/`unknown` orders, and any queued aiosqlite write that may still finish. It is logged as `core.shutdown_abandoned`. Forced cancellation does not prove that broker work stopped.
+- **After `run_core` returns:** `asyncio.run` teardown can itself block on tasks or executor work that were left behind. The watchdog stays armed through it (see below), so the process still ends by T + 5.
 
-- **Deadline:** the whole sequence runs under one deadline, set to the time the signal was received plus `shutdown.timeout_s`.
-  - Whatever is unfinished at the deadline is cancelled and logged as `core.shutdown_forced`, naming the step and the loops that were cancelled.
-  - Abandoned work (open cycles, `pending`/`unknown` orders) stays in the journal for 1.5d's startup recovery and is logged as `core.shutdown_abandoned`. Forced cancellation does not prove that broker work stopped.
-- **Exit code:** 0 when clean, 1 when the deadline forced cancellation.
+**Second signal (hard):** the CLI installs the second-signal path with `signal.signal`, the Python-level handler, not the event loop's `add_signal_handler`.
+- The first signal schedules the coordinator on the loop with `call_soon_threadsafe`. The second calls `os._exit(130)` directly in the handler.
+- There is no async cleanup, no engine dispose and no explicit lock release. Process death releases the lock, so no other core can start while a queued write of this one is still running.
+- Python-level handlers run in the main thread between bytecodes, so this works while the event loop is stuck in Python code. A stall inside a C call is the watchdog's job.
 
-**Second signal (hard):** skip the rest of the drain, cancel all tasks at once, dispose the engine and release the lock without waiting. Exit code **130**. This applies at any point after the first signal.
-
-**Watchdog:**
-- On the first signal, the CLI starts a daemon `threading.Timer` for `shutdown.timeout_s + 5` s. The thread is needed because a timer on the event loop can't fire while the loop is blocked in synchronous code.
-- If the timer fires, it writes `core.watchdog_exit` to stderr directly (not through the event loop) and calls `os._exit(70)`. Skipping cleanup is acceptable: SQLite rolls back uncommitted transactions, and the OS releases the `flock`.
-- A process that exits cleanly first cancels the timer.
+**Watchdog (last resort):**
+- The coordinator arms it on entry, for **every** exit cause, through the CLI's callback. It is a daemon `threading.Timer` for T + 5 s, armed once. The thread is needed because a timer on the event loop can't fire while the loop is blocked.
+- If the timer fires, it writes `core.watchdog_exit` to stderr directly (not through the event loop) and calls `os._exit(70)`.
+- It is cancelled only after `asyncio.run(...)` has fully returned, immediately before the CLI's normal exit, so it covers asyncio and executor teardown too.
 
 | Exit code | Meaning |
 |---|---|
 | 0 | clean stop |
-| 1 | startup failure (including lock timeout), stream death, or a forced shutdown deadline |
+| 1 | startup failure (including lock timeout), stream death, or a graceful deadline (T) that forced teardown |
 | 130 | second signal |
-| 70 | watchdog |
+| 70 | watchdog (last resort, T + 5 s) |
 
 ## 5. Testing
 
 - **Lock:**
   - A second acquisition from a **subprocess** times out with the holder's PID in the error. A short wait is injected; no long real sleeps.
   - Acquisition succeeds after the holder exits.
-  - The derived path for a SQLite URL is correct.
+  - The derived path for a SQLite URL is correct and canonical: a **symlinked database file and a symlinked directory** contend with the real path (subprocess).
   - Postgres, `:memory:` and other non-file URLs fail with the documented error.
-  - The lock is released on every shutdown path: clean, forced and second signal.
+  - **CLI level:** while a subprocess holds the lock, a second `run core` exits 1, and `db.upgrade` and the engine are never called. Both are injected and asserted not called.
+  - Ownership is released only by process exit: after a forced shutdown and after a second signal, a fresh process can acquire the lock only once the old one has exited.
 - **Supervisor**, driven by an injected clock and events, never by wall-clock assertions (lesson from PR #13):
   - Stall and recovery logging happens once per transition.
-  - `risk.snapshot_overdue` is logged at 2 x the interval.
+  - `risk.snapshot_overdue` is driven by `last_snapshot_at`, not by the loop heartbeat:
+    - Repeated account-read failures (no write) log it once age > 120 s, even though the loop keeps running.
+    - A position-read failure that still commits equity/HWM refreshes `last_snapshot_at`, so no overdue warning.
+    - Before the first write, the age is measured from start.
   - A raising `step()` keeps its loop running.
   - A dead task is restarted.
   - `stop(deadline)` cancels the steps that are still hanging and returns their names.
 - **Independence:** a fake bar source whose REST `latest()` hangs forever. A kill-file change is still logged by `control.poll`, and `feed.tick.stalled` is logged.
 - **Shutdown:**
-  - A hanging `bus.close()` or loop step is cut off at the deadline: exit 1, and `core.shutdown_forced` is logged.
-  - A second signal skips the drain and exits with 130.
-  - Stream death still fails `run_core`.
-- **Watchdog:** with the timer factory and exit function injected, it fires once after the deadline and not after a clean exit. Tests never call the real `os._exit`.
+  - A **cancellation-resistant** step (catches `CancelledError` and keeps waiting) and a hanging `bus.close()` are left behind at the deadline: teardown completes, exit 1, and `core.shutdown_forced` is logged.
+  - **Stream death followed by cancellation-resistant cleanup** goes through the same coordinator: the deadline holds, the watchdog is armed, exit 1.
+  - A **pending aiosqlite worker write** at a forced shutdown: the lock is not released by the process (a fresh acquirer in a subprocess fails until the process exits).
+  - The second-signal handler calls the injected exit function with 130, without awaiting anything, and also while the loop is blocked.
+  - Re-entering the coordinator (a signal during stream-death teardown) is a no-op apart from the second-signal path.
+- **Watchdog:** with the timer factory and exit function injected:
+  - It is armed on every exit cause.
+  - It fires once at T + 5.
+  - It is cancelled only after `asyncio.run` returns cleanly.
+  - Tests never call the real `os._exit`.
 - **Config:** a missing `shutdown.timeout_s`, 0, a negative value, NaN, infinity and 301 are all rejected; 30 loads.
 
 ## 6. Out of scope
