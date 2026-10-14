@@ -9,6 +9,10 @@ Revised 2026-10-14 after a self-review against the code, before implementation:
 - `core.failed` logs startup failures and stream death with the traceback;
 - item 8's "fail entry checks closed" is explicitly deferred to 1.5d (section 6);
 - the limits of Python-level signal handlers are stated, and the section 5 tests match the plan.
+
+Revised 2026-10-14 after the Codex review of that revision (PR #23):
+- an unavailable journal read no longer clears a known kill (`ControlStatus.available`);
+- the watchdog's limit is qualified: it can't run while a native call holds the GIL.
 Revised 2026-10-14 after the second Codex plan review: the watchdog fires `log_wait_s` early so the exit, including the diagnostic wait, stays within T + 5 s.
 
 Revised 2026-10-14 after the Codex plan review:
@@ -108,7 +112,8 @@ Loops registered in 1.5a:
 - The supervisor's stall check logs `risk.snapshot_overdue` once when `now - last_snapshot_at > 120 s` and `risk.snapshot_fresh` when it recovers. Before the first write, the age is measured from core start, so "no snapshot within 120 s of start" also warns.
 - **The kill file has its own loop.** The kill file is the fallback for a broken journal, but `gate.status()` reads the journal after checking the file, so a hung journal read would hide a kill file created meanwhile. `control.kill_file` checks only the file. Both loops update one `ControlPoller` state:
   - a kill file seen by either loop keeps the status killed;
-  - only `control.poll` clears a kill, and only when the file is absent at that moment, so a journal read that started before the file appeared can't flap the status back.
+  - only `control.poll` clears a kill, and only when the file is absent at that moment, so a journal read that started before the file appeared can't flap the status back;
+  - only a **successful** journal read clears a kill. `ControlGate.status()` returns `killed=False` with a "control state unavailable" reason when the journal read fails. That blocks entries but proves no clearance. `ControlStatus` gets a typed `available` flag (default `True`, `False` on that path), and the poller keeps a known kill on an unavailable read, adding the unavailable reason so it stays visible, without logging a transition. Entry checks are unchanged.
 - The poller keeps the latest `ControlStatus` so that 1.5c can act on kill changes without another poller. In 1.5a, a kill is only logged, as today. A status raised by the file loop carries only the file reason; 1.5c should act on `killed`, not on the reasons list.
 - The intervals and thresholds are constants in `runtime.py`, with no new config keys apart from `shutdown.timeout_s`.
 - The entry fail-closed behaviour is unchanged: `ControlGate` already fails closed, and no entries run until 1.5d.
@@ -152,11 +157,13 @@ Loops registered in 1.5a:
 - The first signal calls `begin_shutdown("signal")` synchronously in the handler (watchdog armed, deadline recorded, then the async teardown is queued). The second calls `os._exit(130)` directly in the handler.
 - There is no async cleanup, no engine dispose and no explicit lock release. Process death releases the lock, so no other core can start while a queued write of this one is still running.
 - Python-level handlers run in the main thread between bytecodes, so this works while the event loop is stuck in Python code. A blocking call that is interrupted by the signal (for example `select`, `sleep` or a lock wait) runs the handler too.
-- **Limit:** if the main thread is stuck in a C call that neither returns nor is interrupted, no Python-level handler runs: the first signal arms nothing and the second can't exit. Only SIGKILL ends that process. Once the first handler has run, the watchdog covers any later stall, C calls included.
+- **Limit:** if the main thread is stuck in a C call that neither returns nor is interrupted, no Python-level handler runs: the first signal arms nothing and the second can't exit.
+- **The watchdog has a limit too.** It is a Python thread, so once armed it covers stalls in Python code and in native waits that release the GIL (I/O, `select`, `sleep`, SQLite calls). It can't run while a native call holds the GIL and never returns.
+- The T + 5 bound therefore holds only for stalls that leave the GIL free. A process stuck in a GIL-holding native call is ended only by SIGKILL or a supervisor outside the interpreter. That is out of scope here (section 6).
 - A signal that arrives after another cause (stream death, startup failure, programmatic stop) began shutdown counts as the *first* signal: it is a no-op, because shutdown is already running. The next one exits 130. So when shutdown is already under way, it takes two Ctrl-C to force an exit.
 
 **Watchdog (last resort):**
-- `begin_shutdown` arms it on its first call, for **every** exit cause, through the CLI's callback, before any event-loop work. It is a daemon `threading.Timer`, armed once, that guarantees exit by T + 5 s from the trigger time. It fires 0.5 s early (the diagnostic wait below), so the wait is inside the bound. The thread is needed because a timer on the event loop can't fire while the loop is blocked.
+- `begin_shutdown` arms it on its first call, for **every** exit cause, through the CLI's callback, before any event-loop work. It is a daemon `threading.Timer`, armed once, that ends the process by T + 5 s from the trigger time, unless a native call holds the GIL (see the limit under "Second signal"). It fires 0.5 s early (the diagnostic wait below), so the wait is inside the bound. The thread is needed because a timer on the event loop can't fire while the loop is blocked.
 - If the timer fires, it calls `os._exit(70)` in all cases. Before that it tries to write `core.watchdog_exit` to stderr (directly, not through the event loop). The write runs in a separate daemon thread that gets at most 0.5 s and whose errors are ignored, so a closed, broken or blocking stderr can't keep the process alive.
 - **It is never cancelled.** It is a daemon thread, so it never delays a normal exit. It must outlive `asyncio.run(...)`, because interpreter exit joins non-daemon threads: a scratch run showed that an unclosed, still-referenced aiosqlite connection keeps the process alive after `asyncio.run` returns, and that the armed watchdog then ends it with 70. A clean exit that hangs there is therefore ended too.
 
@@ -190,6 +197,7 @@ Loops registered in 1.5a:
   - A fake bar source whose REST `latest()` hangs forever: `feed.tick.stalled` is logged, and a kill file created afterwards is still logged as `core.kill_detected`.
   - A hung journal read in `gate.status()`: `control.poll.stalled` is logged, and a kill file created afterwards is still detected by `control.kill_file`.
   - The poller never clears a kill while the kill file is present, even when a journal read returns "not killed".
+  - A known kill followed by an unavailable journal read stays killed, with the unavailable reason, no log and no growth of the reasons on repeated outages. A later successful read with no file clears it, logging `core.kill_cleared` once.
 - **Startup:**
   - A stop request during a hung backfill is forced at the deadline (`startup`, exit 1), and `core.started` is never logged.
   - A backfill that finishes after the stop request starts no stream or loop, and the exit is clean.
@@ -213,6 +221,7 @@ Loops registered in 1.5a:
 
 - Cross-host or Postgres ownership and persistent account binding (WP 3.5).
 - Acting on a kill: cancelling entries and flatten (1.5c).
+- An unconditional bound on a native call that holds the GIL: it needs enforcement outside this interpreter (e.g. a service manager's stop timeout plus SIGKILL).
 - **Item 8's "fail entry checks closed when required state is unavailable"** (deferred to 1.5d, before admission opens). Entries can't run until 1.5d, but `check()` doesn't yet fail closed on stale risk state:
   - It takes the daily-loss baseline from the last snapshot at or before the day start. If the snapshot loop was dead for days, that baseline is days old.
   - With no snapshot at all, it uses current equity, which makes the daily-loss check a no-op.

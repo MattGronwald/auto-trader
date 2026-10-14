@@ -62,6 +62,7 @@ Conditions the spec implies that no task would otherwise exercise. Each one has 
 5. **A watchdog armed twice** (`begin` after a startup failure following a signal). Expected: one timer, the original deadline. Owner: Task 3 (`test_begin_is_idempotent_and_never_rearms`).
 6. **A stop request during startup** (a hung or slow backfill). Expected: hung, it is forced at the deadline (`startup`, exit 1); finishing within the budget, it starts no stream or loop (exit 0). Owner: Task 6 (`test_stop_during_startup_is_bounded_by_the_deadline`, `test_startup_finishing_after_the_stop_request_starts_nothing`).
 7. **A kill file created while the journal read hangs.** Expected: `core.kill_detected` from `control.kill_file`; no `kill_cleared` flapping when a stale journal read returns "not killed" while the file exists. Owner: Task 6 (`test_kill_file_is_seen_while_the_journal_read_hangs`, `test_poller_never_clears_a_kill_while_the_file_is_present`).
+9. **A known kill, then an unavailable journal read** (PR #23 Codex review). Expected: still killed, the unavailable reason visible, no log, reasons not growing on repeated outages; a later successful read with no file clears it (`core.kill_cleared` once). Owner: Task 6 (`test_poller_keeps_a_known_kill_while_the_journal_is_unavailable`).
 8. **The lock across a stuck shutdown.** Expected: a second acquirer fails while the old process is shutting down, and succeeds once the second signal ended it (exit 130). Real handlers, in a subprocess. Owner: Task 3 (`test_lock_is_held_through_a_stuck_shutdown_until_the_second_signal`).
 
 ---
@@ -673,9 +674,11 @@ interpreter's own exit hangs (aiosqlite worker threads are non-daemon and are jo
 
 Limits: a Python-level handler runs only when the main thread executes bytecode, so a first
 signal that arrives while the main thread is stuck in a C call that never returns arms
-nothing; only SIGKILL ends that process. A signal that arrives after another cause (stream
-death, startup failure, programmatic stop) began shutdown counts as the first one: it is a
-no-op, and the next signal exits 130.
+nothing. The armed watchdog is a Python thread too: it covers native waits that release the
+GIL (I/O, select, sleep, SQLite), but not a native call that holds the GIL and never returns.
+Only SIGKILL or an outside supervisor ends such a process. A signal that arrives after
+another cause (stream death, startup failure, programmatic stop) began shutdown counts as the
+first one: it is a no-op, and the next signal exits 130.
 """
 
 import asyncio
@@ -1322,7 +1325,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `src/autotrader/core/runtime.py` (whole file)
-- Test: `tests/unit/core/test_runtime.py` (update the existing tests, add new ones)
+- Modify: `src/autotrader/core/kill.py` (`ControlStatus.available`, PR #23 Codex review)
+- Test: `tests/unit/core/test_runtime.py` (update the existing tests, add new ones), `tests/unit/core/test_kill.py`
 
 **Interfaces:**
 - Consumes:
@@ -1335,7 +1339,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - It raises the original error after teardown on startup failure or stream death.
   - The `stop` parameter is removed: programmatic stop is `control.begin("stop")`.
   - Module constants: `TICK_S = 1.0`, `SNAPSHOT_S = 60.0`, `SUPERVISE_S = 1.0`, `FEED_STALL_S = 30.0`, `CONTROL_STALL_S = 10.0`.
-  - `ControlPoller(gate, kill_file)` with `step()` (the gate, journal included), `file_step()` (the kill file only, sync and DB-free) and `latest: ControlStatus | None`. A kill file seen by either step keeps the status killed; only `step()` with no file present clears it.
+  - `ControlPoller(gate, kill_file)` with `step()` (the gate, journal included), `file_step()` (the kill file only, sync and DB-free) and `latest: ControlStatus | None`. A kill file seen by either step keeps the status killed. Only a successful journal read (`available`) with no file present clears it: an unavailable read keeps a known kill, with the unavailable reason added (PR #23 Codex review).
+  - `ControlStatus.available: bool = True` in `core/kill.py`, `False` on `ControlGate.status()`'s failed-read path. The default keeps every existing caller unchanged; entry checks are unaffected.
   - Four loops: `feed.tick`, `control.poll`, `control.kill_file` (both error-level stalls) and `risk.snapshot`.
   - Startup (strategy registration, broker connect, backfill, wiring) runs as a task raced against the stop request. If shutdown is requested first, the unfinished startup is teardown step 0 (`startup`), bounded by the deadline like every other step. Startup checks the request again right before starting the stream and the loops, so a startup that finishes after the request starts neither.
   - A startup failure or stream death is logged as `core.failed` (cause, traceback) before teardown, because the watchdog may cut teardown short.
@@ -1608,6 +1613,29 @@ class FixedGate:
         return self.status_
 
 
+async def test_poller_keeps_a_known_kill_while_the_journal_is_unavailable(tmp_path: Path) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    gate = FixedGate(ControlStatus(True, ("kill set in control_state: x",)))
+    poller = ControlPoller(gate, tmp_path / "KILL")  # type: ignore[arg-type]
+    await poller.step()
+
+    gate.status_ = ControlStatus(False, ("control state unavailable: OSError",), available=False)
+    await poller.step()
+    await poller.step()  # repeated outages don't grow the reasons
+    assert poller.latest == ControlStatus(
+        True,
+        ("kill set in control_state: x", "control state unavailable: OSError"),
+        available=False,
+    )
+
+    gate.status_ = ControlStatus(False, ())  # a successful read confirms the clear
+    await poller.step()
+    assert poller.latest == ControlStatus(False, ())
+    events = [ln["event"] for ln in _log_lines(buf)]
+    assert events == ["core.kill_detected", "core.kill_cleared"]
+
+
 async def test_poller_never_clears_a_kill_while_the_file_is_present(tmp_path: Path) -> None:
     buf = io.StringIO()
     configure_logging(stream=buf)
@@ -1722,7 +1750,19 @@ async def test_unsuccessful_cleanup_step_exits_1_and_cleanup_continues(
 Run: `uv run pytest tests/unit/core/test_runtime.py -q`
 Expected: collection error (`cannot import name '_snapshot_step'`) or `TypeError: run_core() got an unexpected keyword argument 'lock'`.
 
-- [ ] **Step 3: Implement**: replace `src/autotrader/core/runtime.py` with:
+- [ ] **Step 3: Implement**
+
+In `src/autotrader/core/kill.py`, add the field to `ControlStatus`, after `reasons`:
+
+```python
+    # False when the journal's control state could not be read: `killed` then reflects the
+    # kill file only and proves no clearance of a journal kill (entries stay blocked).
+    available: bool = True
+```
+
+and in `ControlGate.status()`'s `except` branch return `ControlStatus(killed, tuple(reasons), available=False)`. In `tests/unit/core/test_kill.py`, `test_unreadable_control_state_fails_closed`, change `assert not status.entries_allowed` to `assert not status.entries_allowed and not status.available`.
+
+Then replace `src/autotrader/core/runtime.py` with:
 
 ```python
 """`autotrader run core` (SPEC §12 Phase 0 DoD; WP 1.5a runtime safety).
@@ -1791,22 +1831,30 @@ class ControlPoller:
 
     `file_step` checks the kill file on its own (sync, DB-free) in a separate loop, so a hung
     journal read in `step` never hides a kill file: the file latch is the fallback for a broken
-    journal. A file seen there only ever raises the kill; clearing it is `step`'s job."""
+    journal. A file seen there only ever raises the kill; clearing it is `step`'s job, and only
+    a successful journal read with no kill file present clears it: an unavailable read proves
+    no clearance, so a known kill is kept, with the unavailable reason added."""
 
     def __init__(self, gate: ControlGate, kill_file: Path) -> None:
         self._gate = gate
         self._kill_file = kill_file
         self.latest: ControlStatus | None = None
+        self._kill_reasons: tuple[str, ...] = ()  # of the last confirmed kill
 
     async def step(self) -> None:
         status = await self._gate.status()
         if not status.killed and self._file_present():  # created during the journal read
             status = self._file_status()
+        elif not status.killed and not status.available and self._known_kill():
+            status = ControlStatus(True, (*self._kill_reasons, *status.reasons), available=False)
         self._report(status)
 
     async def file_step(self) -> None:
         if self._file_present() and not (self.latest is not None and self.latest.killed):
             self._report(self._file_status())
+
+    def _known_kill(self) -> bool:
+        return self.latest is not None and self.latest.killed
 
     def _file_present(self) -> bool:
         return ControlGate.kill_file_present(self._kill_file)
@@ -1815,6 +1863,8 @@ class ControlPoller:
         return ControlStatus(True, (f"kill file present: {self._kill_file}",))
 
     def _report(self, status: ControlStatus) -> None:
+        if status.killed and status.available:
+            self._kill_reasons = status.reasons
         previous, self.latest = self.latest, status
         if previous is not None and status.killed == previous.killed:
             return
@@ -2444,3 +2494,9 @@ A self-review of spec and plan against the code (2026-10-14, before implementati
 - tests for these, the independence test now hangs the REST refresh (`latest()`) instead of stubbing `MarketFeed.tick`, and a subprocess test proves the lock is held through a stuck shutdown until the second signal.
 
 The plan's code blocks were re-synced from the dry-run worktree and re-run there: 804 passed, ruff and mypy clean, `risk/` at 100 %, five repeated runs of the lock/shutdown/supervise/runtime/CLI tests green.
+
+A Codex review of that revision (PR #23, 2026-10-14) added two fixes:
+- `ControlStatus.available`: an unavailable journal read no longer clears a known kill (it was logged as `core.kill_cleared`, and 1.5c would have acted on `killed=False`); only a successful read with no kill file clears it;
+- the watchdog's limit is qualified: as a Python thread it covers native waits that release the GIL, not a native call that holds it.
+
+Re-run in the dry-run worktree: 805 passed, ruff and mypy clean, `risk/` at 100 %, three repeated runs of the runtime and kill tests green.
