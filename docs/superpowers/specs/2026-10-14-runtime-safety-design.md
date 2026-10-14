@@ -1,6 +1,8 @@
 # Runtime safety design (WP 1.5a)
 
 Date: 2026-10-14. Status: approved in conversation (sections 1-3), pending written-spec review.
+Revised 2026-10-14 after the second Codex plan review: the watchdog fires `log_wait_s` early so the exit, including the diagnostic wait, stays within T + 5 s.
+
 Revised 2026-10-14 after the Codex plan review:
 - the watchdog's stderr line is best-effort and bounded, and the exit never waits for it;
 - a teardown step that raises or is cancelled makes the exit 1 (`core.shutdown_failed`), and the remaining steps still run;
@@ -135,7 +137,7 @@ Loops registered in 1.5a:
 - Python-level handlers run in the main thread between bytecodes, so this works while the event loop is stuck in Python code. A stall inside a C call is the watchdog's job.
 
 **Watchdog (last resort):**
-- `begin_shutdown` arms it on its first call, for **every** exit cause, through the CLI's callback, before any event-loop work. It is a daemon `threading.Timer` for T + 5 s from the trigger time, armed once. The thread is needed because a timer on the event loop can't fire while the loop is blocked.
+- `begin_shutdown` arms it on its first call, for **every** exit cause, through the CLI's callback, before any event-loop work. It is a daemon `threading.Timer`, armed once, that guarantees exit by T + 5 s from the trigger time. It fires 0.5 s early (the diagnostic wait below), so the wait is inside the bound. The thread is needed because a timer on the event loop can't fire while the loop is blocked.
 - If the timer fires, it calls `os._exit(70)` in all cases. Before that it tries to write `core.watchdog_exit` to stderr (directly, not through the event loop). The write runs in a separate daemon thread that gets at most 0.5 s and whose errors are ignored, so a closed, broken or blocking stderr can't keep the process alive.
 - It is cancelled only after `asyncio.run(...)` has fully returned, immediately before the CLI's normal exit, so it covers asyncio and executor teardown too.
 

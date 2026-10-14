@@ -29,7 +29,7 @@
 - **Constants:** `WATCHDOG_GRACE_S = 5.0` (last resort at T + 5 s), and lock poll 1.0 s.
 - **Teardown outcome (Codex plan review):** a teardown step that times out is *forced*; one that raises or is cancelled is *failed* (`core.shutdown_failed`). Either makes the exit 1, the remaining steps still run, and `core.stopped` is logged only when nothing was forced or failed.
 - **Loop cadence:** start to start. Pause `max(0, interval - step duration)`; an overrun starts the next step immediately, with no catch-up.
-- **Watchdog line:** best-effort, written by a daemon thread with a bounded wait (`log_wait_s=0.5`); `exit(70)` runs in a `finally`, whatever happens to stderr.
+- **Watchdog line:** best-effort, written by a daemon thread with a bounded wait (`log_wait_s=0.5`); `exit(70)` runs in a `finally`, whatever happens to stderr. The timer fires `log_wait_s` before the bound, so the process ends by T + 5 s including that wait.
 - **Teardown floor (dry-run finding, spec revision 2026-10-14):** `engine.dispose` gets at least 1.0 s even after the deadline, still inside the 5 s watchdog grace, so a forced teardown still closes the journal's connections. No other step gets a floor.
 - **Exit codes:** 0 clean; 1 for startup failure (including lock timeout), stream death or a forced graceful deadline; 130 for the second signal; 70 for the watchdog.
 - **Lock error text** contains `journal locked by PID <pid> since <ts>`. The non-file DB error is `single-writer lock needs a file journal; cross-host ownership is WP 3.5`.
@@ -474,7 +474,7 @@ def test_watchdog_arms_once_as_a_daemon_and_exits_70_with_a_stderr_line() -> Non
     dog.arm(99)  # a second arm is a no-op
 
     (timer,) = timers.made
-    assert (timer.seconds, timer.daemon, timer.started) == (35, True, True)
+    assert (timer.seconds, timer.daemon, timer.started) == (34.5, True, True)  # 35 - log wait
     timer.fn()
     assert exits == [EXIT_WATCHDOG]
     assert json.loads(err.getvalue())["event"] == "core.watchdog_exit"
@@ -495,6 +495,14 @@ class BlockingStream(io.StringIO):
     def write(self, s: str) -> int:
         self.release.wait(5)  # stands in for a full pipe
         return len(s)
+
+
+def test_watchdog_exit_including_the_log_wait_stays_within_the_armed_bound() -> None:
+    timers = Timers()
+    Watchdog(timer_factory=timers, exit=lambda code: None, log_wait_s=2.0).arm(35)
+
+    (timer,) = timers.made
+    assert timer.seconds + 2.0 == 35  # fires at 33, the log wait ends by 35
 
 
 def test_watchdog_exits_70_even_if_stderr_raises() -> None:
@@ -671,9 +679,11 @@ class Watchdog:
         return self._timer is not None
 
     def arm(self, seconds: float) -> None:
+        """Guarantee exit within `seconds`: fire `log_wait_s` early, so the bounded
+        diagnostic wait in `_fire` still ends by the deadline."""
         if self._timer is not None:
             return
-        timer = self._factory(seconds, self._fire)
+        timer = self._factory(max(0.0, seconds - self._log_wait_s), self._fire)
         timer.daemon = True
         timer.start()
         self._timer = timer
@@ -1981,7 +1991,7 @@ def test_signal_during_migration_arms_the_watchdog_and_skips_startup(tmp_path: P
     locks.release()
 
     assert code == 0
-    assert timers and timers[0].started and timers[0].seconds == 35.0
+    assert timers and timers[0].started and timers[0].seconds == 34.5  # exit by T + 5 = 35
     assert Source.stopped
     assert timers[0].cancelled  # only after asyncio.run returned
 
