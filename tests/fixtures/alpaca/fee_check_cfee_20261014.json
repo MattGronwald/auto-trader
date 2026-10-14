@@ -1,5 +1,5 @@
 {
- "_note": "Alpaca paper re-query 2026-10-14 (read-only) after fee check step 2; raw_data=True payloads, order ids replaced. CFEE posted for both legs with date 2026-10-12. Cash shows an unexplained -19.81 USD vs the activities. See docs/alpaca-notes.md.",
+ "_note": "Alpaca paper re-query 2026-10-14 (read-only) after fee check step 2; raw_data=True payloads, order ids replaced. CFEE posted for both legs with date 2026-10-12. Cash moved -19.84 USD between the post-sell snapshot (99999.88, which the gross fills plus the -0.03 sell CFEE reconcile) and this read; no activity or order explains it. See docs/alpaca-notes.md.",
  "recorded_at": "2026-10-14T16:37:48.043386+00:00",
  "positions": [],
  "account": {
