@@ -342,6 +342,7 @@ async def insert_order(
     tp_price: Decimal | None,
     status: str,
     now: datetime,
+    exit_reason: str | None = None,
 ) -> Order:
     row = Order(
         cycle_id=cycle_id,
@@ -357,6 +358,7 @@ async def insert_order(
         status=status,
         submitted_at=now,
         updated_at=now,
+        exit_reason=exit_reason,
     )
     session.add(row)
     await session.commit()
@@ -382,6 +384,18 @@ async def open_entry_orders(session: AsyncSession) -> list[Order]:
     rows = await session.scalars(
         select(Order)
         .where(Order.side == "buy", Order.status.in_(OPEN_ENTRY_STATUSES))
+        .order_by(Order.id)
+        .execution_options(populate_existing=True)
+    )
+    return list(rows)
+
+
+async def unsettled_orders(session: AsyncSession) -> list[Order]:
+    """Every order whose effects are not fully applied yet (WP 1.5b), in id order: the
+    ledger books a symbol's orders oldest first."""
+    rows = await session.scalars(
+        select(Order)
+        .where(Order.settled_at.is_(None))
         .order_by(Order.id)
         .execution_options(populate_existing=True)
     )

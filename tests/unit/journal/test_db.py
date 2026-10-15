@@ -14,7 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.schema import CreateTable
 
 from autotrader.journal import models as m
-from autotrader.journal.db import downgrade, make_engine, make_sessionmaker, upgrade
+from autotrader.journal.db import (
+    current_revision,
+    downgrade,
+    make_engine,
+    make_sessionmaker,
+    upgrade,
+)
 
 T0 = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 
@@ -139,7 +145,18 @@ def test_spec_indexes_exist() -> None:
 
 
 async def test_sqlite_enforces_foreign_keys(session: AsyncSession) -> None:
-    session.add(m.Fill(order_id=999, qty=Decimal(1), price=Decimal(1), fee=Decimal(0), ts=T0))
+    session.add(
+        m.Fill(
+            order_id=999,
+            broker_fill_id="f-1",
+            side="buy",
+            fee_asset="quote",
+            qty=Decimal(1),
+            price=Decimal(1),
+            fee=Decimal(0),
+            ts=T0,
+        )
+    )
 
     with pytest.raises(IntegrityError):
         await session.flush()
@@ -237,3 +254,93 @@ def test_decimal_is_numeric_on_postgres() -> None:
 
     assert "price NUMERIC(28, 12)" in ddl
     assert "ts TIMESTAMP WITH TIME ZONE" in ddl
+
+
+def _run_sql(url: str, *statements: str) -> None:
+    async def run() -> None:
+        engine = make_engine(url)
+        try:
+            async with engine.begin() as conn:
+                for statement in statements:
+                    await conn.execute(text(statement))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+_ORDER_0003 = (
+    "INSERT INTO orders (id, broker_order_id, mode, type, side, qty, status, submitted_at,"
+    " updated_at) VALUES ({id}, {broker}, 'paper', 'limit', 'buy', '1', '{status}',"
+    " '2026-10-09 12:00:00', '2026-10-09 12:00:00')"
+)
+
+
+def test_0004_refuses_to_invent_broker_fill_ids(db_url: str) -> None:
+    downgrade(db_url, "0003")
+    _run_sql(
+        db_url,
+        _ORDER_0003.format(id=1, broker="'b-1'", status="filled"),
+        "INSERT INTO fills (order_id, qty, price, fee, ts) VALUES (1, '1', '100', '0',"
+        " '2026-10-09 12:00:00')",
+    )
+    with pytest.raises(RuntimeError, match="fills has rows"):
+        upgrade(db_url)
+    assert current_revision(db_url) == "0003"
+
+
+def test_0004_settles_final_rows_that_never_reached_the_broker(db_url: str) -> None:
+    downgrade(db_url, "0003")
+    _run_sql(
+        db_url,
+        _ORDER_0003.format(id=1, broker="NULL", status="not_submitted"),
+        _ORDER_0003.format(id=2, broker="NULL", status="rejected"),
+        _ORDER_0003.format(id=3, broker="'b-3'", status="filled"),
+        _ORDER_0003.format(id=4, broker="NULL", status="unknown"),
+    )
+    upgrade(db_url)
+
+    async def rows() -> list[tuple[int, bool, Decimal]]:
+        engine = make_engine(db_url)
+        try:
+            async with make_sessionmaker(engine)() as s:
+                found = await s.scalars(select(m.Order).order_by(m.Order.id))
+                return [(o.id, o.settled_at is not None, o.filled_qty) for o in found]
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(rows()) == [
+        (1, True, Decimal(0)),
+        (2, True, Decimal(0)),
+        (3, False, Decimal(0)),
+        (4, False, Decimal(0)),
+    ]
+
+
+async def test_broker_fill_id_is_unique(session: AsyncSession) -> None:
+    order = m.Order(
+        mode="paper",
+        type="market",
+        side="buy",
+        qty=Decimal("1"),
+        status="new",
+        submitted_at=T0,
+        updated_at=T0,
+    )
+    session.add(order)
+    await session.flush()
+    for _ in range(2):
+        session.add(
+            m.Fill(
+                order_id=order.id,
+                broker_fill_id="f-1",
+                side="buy",
+                fee_asset="quote",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                fee=Decimal("0.25"),
+                ts=T0,
+            )
+        )
+    with pytest.raises(IntegrityError):
+        await session.commit()
