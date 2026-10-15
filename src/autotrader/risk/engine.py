@@ -113,6 +113,9 @@ class RiskEngine:
         self._clock = clock
         self._io_timeout = io_timeout_s
         self._monotonic = monotonic  # the budget clock (injectable for tests)
+        # Monotonic time of the last committed equity snapshot (None = none yet): drives
+        # run core's `risk.snapshot_overdue`, separately from the snapshot loop's liveness.
+        self.last_snapshot_at: float | None = None
         self._entry_lock = asyncio.Lock()  # check(): two entries never pass check 5 together
         self._exit_lock = asyncio.Lock()  # exit(): never waits for an entry
 
@@ -451,3 +454,4 @@ class RiskEngine:
                 hwm=hwm,
                 daily_pnl=equity - (baseline if baseline is not None else equity),
             )
+            self.last_snapshot_at = self._monotonic()
