@@ -20,13 +20,15 @@
 - Tests never assert wall-clock timing; use fixed clocks (`T0`/`NOW`). `filterwarnings = error` is on: close engines, buses and subprocess pipes you open.
 - Only `risk/engine.py` holds a `Broker`. `core/ledger.py` never imports or receives a broker.
 - Every commit ends with the trailer line `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` (subagents: use exactly this line, not your own model name).
-- Each task's commit must leave `uv run ruff check`, `uv run ruff format --check`, `uv run mypy` and `uv run pytest` green. Run `uv run ruff check --fix` (import sorting, I001) and `uv run ruff format` before committing.
+- Each task's commit must leave `uv run ruff check`, `uv run ruff format --check`, `uv run mypy` and `uv run pytest` green. Run `uv run ruff format` first (plan snippets may exceed the line length), then `uv run ruff check --fix` (import sorting, I001). `ruff format` does not wrap docstrings or comments: wrap those by hand at 100 columns.
 
 Full check, used at the end of every task:
 
 ```bash
-uv run ruff check --fix && uv run ruff format && uv run mypy && uv run pytest -q --cov && uv run coverage report --include='src/autotrader/risk/*' --fail-under=100 --show-missing
+uv run ruff format && uv run ruff check --fix && uv run ruff format && uv run mypy && uv run pytest -q --cov && uv run coverage report --include='src/autotrader/risk/*' --fail-under=100 --show-missing
 ```
+
+**Plan dry run (2026-10-15):** all eight tasks were applied verbatim in a throwaway worktree with every check after each task: all green, 868 tests, property test ~2 s for 25 examples (400 examples also passed). The nine snippet bugs and three design points it found are fixed in this revision (clarifications 5-7 below).
 
 ## Spec clarifications made while planning (flag in the PR description)
 
@@ -34,7 +36,10 @@ uv run ruff check --fix && uv run ruff format && uv run mypy && uv run pytest -q
 2. **`overfilled` against the order qty applies to buy orders only.** An exit is a `close_position`: the broker sells what it holds, which can exceed the qty recorded when `exit()` read the position (a late entry fill in between). A sell's bound is the open qty plus carried dust (`oversell`).
 3. **Runner/ledger race (not in the spec):** another cycle's `check()` can sync and complete a cycle (`RISK_CHECK -> FILLED/EXPIRED`) before that cycle's runner writes `SUBMITTED`. The runner's write then fails with `StaleTransition`. `CycleRunner._after_check` logs `cycle.completed_elsewhere` (info) instead of `cycle.stuck` for that cause. A not-submitted entry completed this way ends `EXPIRED` (D15's reconciliation edge) rather than the runner's `REJECTED`.
 4. **`positions.qty` is the remaining (open) qty**, reduced by sells; the acquired qty is derivable from the position's buy fills.
-5. **Known limitation kept:** until 1.5d adds a periodic sync loop, `check()` is the only caller of the sync, so an unsettled order blocks its symbol's admission until some other entry check runs. This is the same as today's `_refresh_open_entries`.
+5. **Deterministic outcome for orders that never reached the broker** (dry-run finding): the runner writes `SUBMITTED` even for a `not_submitted` result, then `REJECTED`; another check's sync could settle that row in between. The ledger therefore completes a zero-fill order **without a broker id** as `REJECTED` with reason `order <status>` (the runner's own edge and wording; D15's reconciliation may use runner edges), and only a broker-final zero fill as `EXPIRED`. Whoever writes first, the outcome is the same.
+6. **The bus no longer logs `StaleTransition` as `bus.unit_failed`** (error level): the runner always logs it itself (`cycle.completed_elsewhere`), so an expected race emits no error line.
+7. **Accepted, documented:** after the sync budget is spent, every remaining row is still attempted and fails at once (one `risk.order_sync_failed` line each; same result as stopping). Ledger booking inside `check()` consumes the entry's monotonic budget, so heavy contention can reject an entry `state unavailable` (fail closed). "At most one open position per symbol" can be broken by a position kept open only by a lagging exit while its remainder is broker dust (check 5 ignores dust); the readiness rule then defers the later sell instead of mis-booking it.
+8. **Known limitation kept:** until 1.5d adds a periodic sync loop, `check()` is the only caller of the sync, so an unsettled order blocks its symbol's admission until some other entry check runs. This is the same as today's `_refresh_open_entries`.
 
 ## Review Focus
 
@@ -115,19 +120,18 @@ async def test_dust_close_raises_the_typed_dust_signal() -> None:
     assert isinstance(caught.value, OrderRejected)  # existing handlers stay correct
 ```
 
-Append to `tests/unit/broker/test_alpaca.py` (it already has a fixture/helper that builds an `AlpacaBroker` for the other `not implemented until WP 1.6` tests; reuse that exact helper and its name, and follow the pattern of the existing `get_order` not-yet test):
+Append to `tests/unit/broker/test_alpaca.py` (same construction as the existing not-yet tests there):
 
 ```python
-async def test_order_fills_is_not_implemented_until_wp_1_6(broker: AlpacaBroker) -> None:
-    with pytest.raises(BrokerError, match="order_fills is not implemented until WP 1.6"):
+async def test_order_fills_is_not_implemented_until_wp_1_6() -> None:
+    broker = await connect(FakeClient())
+    with pytest.raises(BrokerError, match=r"order_fills is not implemented until WP 1\.6"):
         await broker.order_fills("any")
 ```
 
-If the existing not-yet tests use a different fixture name than `broker`, use that name.
-
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/broker/test_sim.py -k "order_fills or typed_dust" tests/unit/broker/test_alpaca.py -k "order_fills" -q`
+Run: `uv run pytest tests/unit/broker/test_sim.py tests/unit/broker/test_alpaca.py -k "order_fills or typed_dust" -q`
 Expected: FAIL (`AttributeError: 'SimBroker' object has no attribute 'order_fills'`, `ImportError: cannot import name 'DustRemainder'`).
 
 - [ ] **Step 3: Implement**
@@ -154,7 +158,16 @@ In the `Broker` protocol, after `get_order`:
     async def order_fills(self, order_id: str) -> list[Fill]: ...
 ```
 
-Change the `Fill` docstring sentence "so a consumer applies each fill once (WP 1.5)" to "so the ledger books each fill once (WP 1.5b, `fills.broker_fill_id`)".
+Replace the `Fill` docstring with (wrapped at 100 columns):
+
+```python
+    """One broker execution. `fill_id` is unique and stable per execution, so the ledger
+    books each fill once (WP 1.5b, `fills.broker_fill_id`). `qty` is the gross qty traded
+    at `price`; `fee` is denominated in `fee_asset`: a buy with
+    `FeeSchedule.buy_fee_asset == "base"` pays it in the coin (net coins received =
+    qty - fee), every sell and every "quote" buy pays it in USD (G10, D10,
+    docs/alpaca-notes.md)."""
+```
 
 In `src/autotrader/broker/sim.py`: add `DustRemainder` to the `autotrader.broker.base` import; in `close_position` replace
 
@@ -178,7 +191,12 @@ and add after `get_order`:
         return [f for f in self._fill_log.values() if f.order_id == order_id]
 ```
 
-In the module docstring, change "a remainder below `min_qty` is dust and is rejected (spec section 4)" to "a remainder below `min_qty` is dust and is rejected with `DustRemainder` (spec section 4)".
+In the module docstring, replace the two lines ending the `close_position` bullet with:
+
+```
+  remainder below `min_qty` is dust and is rejected with `DustRemainder` (spec section 4).
+  Whether Alpaca rejects a sell below `min_order_size` is unverified (WP 1.6).
+```
 
 In `src/autotrader/broker/alpaca.py`, after `get_order`:
 
@@ -686,7 +704,26 @@ Replace `_unit` with:
         return event
 ```
 
-Update the module docstring paragraph on `publish_tx`: "`build(session)` writes without committing and returns the event, a tuple of events (all committed in the same transaction, verified by the first; WP 1.5b), or `None`/`()`: roll back, nothing to do". Update the `publish_tx` method docstring to "Commit `build`'s writes and the event(s) it returns together, then deliver them in order; returns the first."
+Replace the module docstring paragraph on `publish_tx` from "committing and returns the event" to the paragraph's end with:
+
+```
+committing and returns the event, a tuple of events (all committed in the same
+transaction, verified by the first; WP 1.5b), or `None`/`()`: roll back, nothing to do;
+the bus appends the event(s), commits once and enqueues. The unit runs in a bus-owned
+task the caller awaits through `asyncio.shield`, so cancelling the caller never
+interrupts a commit or loses a committed event's delivery. A commit that raises is not
+proof of rollback: the bus asks `verify` once in a fresh session; only a positive answer
+confirms (deliver), anything else raises `CommitUncertain` after calling `on_uncertain`
+from the unit itself. Delivery is exactly once for confirmed commits; an uncertain or
+abandoned unit may be persisted without delivery (the `events` table stays the record).
+```
+
+and the `publish_tx` method docstring with:
+
+```python
+        """Commit `build`'s writes and the event(s) it returns together, then deliver them in
+        order; returns the first."""
+```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1052,7 +1089,7 @@ async def test_a_final_zero_fill_expires_the_cycle(
     assert order.settled_at is not None
 
 
-async def test_a_never_submitted_entry_settles_without_a_fill(
+async def test_a_never_submitted_entry_settles_and_is_rejected_like_the_runner_does(
     sessions: async_sessionmaker[AsyncSession], ledger: Ledger
 ) -> None:
     cycle = await new_cycle(sessions, state="RISK_CHECK")
@@ -1076,7 +1113,10 @@ async def test_a_never_submitted_entry_settles_without_a_fill(
     assert await ledger.apply(update_) == "applied"
     (order,) = await orders(sessions)
     assert order.settled_at is not None
-    assert await cycle_state(sessions, cycle) == "EXPIRED"
+    assert await cycle_state(sessions, cycle) == "REJECTED"  # as the runner would write it
+    async with sessions() as s:
+        (cycle_row,) = list(await s.scalars(select(m.Cycle).where(m.Cycle.id == cycle)))
+    assert cycle_row.reject_reason == "order not_submitted"
 
 
 async def test_terminal_cycles_are_never_reopened_but_their_fills_are_booked(
@@ -1096,6 +1136,12 @@ async def test_terminal_cycles_are_never_reopened_but_their_fills_are_booked(
     assert await cycle_state(sessions, filled) == "FILLED"
     assert await event_types(sessions) == ["OrderSettled", "OrderSettled"]
     assert len(await fills(sessions)) == 2
+
+
+def test_a_sync_is_complete_only_without_failed_orders() -> None:
+    # Keeps risk/ at 100 % branch coverage from this task on (the engine uses it in Task 7).
+    assert SyncResult().complete
+    assert not SyncResult(failed=(1,)).complete
 
 
 # --- idempotency and status/fill skew ---------------------------------------------------
@@ -1662,6 +1708,11 @@ class Ledger:
                 "ordered_qty": str(_norm(order.qty)),
                 "partial": applied < order.qty,
             }
+        elif order.broker_order_id is None:
+            # Never reached the broker: the runner's own edge and wording, so the outcome
+            # does not depend on who writes first (plan clarification 5).
+            to, reason = CycleState.REJECTED, f"order {order.status}"
+            details = {"reason": reason}
         else:
             to, reason = CycleState.EXPIRED, f"order {order.status} with no fill"
             details = {"reason": reason}
@@ -2390,7 +2441,7 @@ Add to `Ledger`:
                 ControlState(
                     key=CASH_CHECK_KEY,
                     value={
-                        "cash": str(account.cash),
+                        "cash": str(_norm(account.cash)),
                         "fill_watermark": again.generation[1],
                         "ts": now.isoformat(),
                     },
@@ -2435,7 +2486,7 @@ Add to `Ledger`:
         return unit.result
 ```
 
-Note: `str(account.cash)` for `SimBroker`'s `D("1000")` is `"1000"`; after the buy it is `"899.75"` (exact Decimal arithmetic), matching the tests.
+Note: SimBroker's exact arithmetic gives `Decimal("899.75000")` after the buy (the fee keeps the bps division's exponent); the baseline stores cash by value (`_norm`), so it reads `"899.75"`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -2463,6 +2514,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Modify: `src/autotrader/risk/engine.py`
 - Modify: `src/autotrader/journal/repo.py` (`open_entry_orders` = unsettled buys; drop `OPEN_ENTRY_STATUSES`)
 - Modify: `src/autotrader/core/cycle.py` (`_after_check`)
+- Modify: `src/autotrader/core/bus.py` (`_unit_done`)
 - Modify: `src/autotrader/core/runtime.py` (construct `Ledger`; `_Snapshotter` returns `object`)
 - Test: `tests/unit/risk/test_engine.py`, `tests/unit/journal/test_repo.py`, `tests/unit/core/test_cycle.py`, `tests/integration/test_cycle_runner.py`
 
@@ -2473,7 +2525,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - [ ] **Step 1: Write the failing tests**
 
 In `tests/unit/risk/test_engine.py`:
-- add imports: `from typing import Any`; `from autotrader.broker.base import DustRemainder, Fill` (into the existing import list); `from autotrader.broker.sim import FillPlan`; `from autotrader.core.bus import EventBus`; `from autotrader.core.ledger import Ledger`; `import autotrader.risk.engine as engine_module`; `from autotrader.risk.engine import Accounting` (next to `Gate, RiskEngine`); `from autotrader.risk.types import EntryIntent, ExitRequest, MarketSnapshot, OpenEntry, PortfolioState, RiskDecision, SyncResult`.
+- add imports: `from typing import Any`; `from autotrader.broker.base import DustRemainder, Fill` (into the existing import list); `from autotrader.broker.sim import FillPlan`; `from autotrader.core.bus import EventBus`; `from autotrader.core.ledger import Ledger`; `import autotrader.risk.engine as engine_module`; `from autotrader.risk.checks import check_entry`; `from autotrader.risk.engine import Accounting` (next to `Gate, RiskEngine`); `from autotrader.risk.types import EntryIntent, ExitRequest, MarketSnapshot, OpenEntry, PortfolioState, RiskDecision, SyncResult`.
 - change `make_engine_` to take `ledger: Accounting | None = None` and pass
   `ledger=ledger or Ledger(EventBus(sessions), sessions, clock=clock or Clock(NOW)),` to `cls(...)`.
 
@@ -2482,7 +2534,7 @@ Append:
 ```python
 def spy_portfolios(monkeypatch: pytest.MonkeyPatch) -> list[PortfolioState]:
     seen: list[PortfolioState] = []
-    real = engine_module.check_entry
+    real = check_entry  # mypy: risk.engine does not re-export it
 
     def spy(
         intent: EntryIntent, portfolio: PortfolioState, market: MarketSnapshot, **kw: Any
@@ -2701,7 +2753,8 @@ async def test_a_cycle_the_ledger_completed_first_is_not_stuck(
         await runner._run(cid, candidate())
     assert (await cycle_row(sessions, cid)).state == "FILLED"
     names = [e["event"] for e in logs]
-    assert "cycle.completed_elsewhere" in names and "cycle.stuck" not in names
+    assert "cycle.completed_elsewhere" in names
+    assert "cycle.stuck" not in names and "bus.unit_failed" not in names
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -2878,6 +2931,16 @@ async def open_entry_orders(session: AsyncSession) -> list[Order]:
             return False
 ```
 
+`src/autotrader/core/bus.py` `_unit_done`: do not log the expected race at error level (plan clarification 6):
+
+```python
+        if exc is not None and not isinstance(exc, CommitUncertain | repo.StaleTransition):
+            # The caller may be gone (cancelled): without this the failure would vanish.
+            # CommitUncertain is logged by the unit; StaleTransition by its caller (the
+            # runner logs cycle.completed_elsewhere or cycle.stuck).
+            log.error("bus.unit_failed", error=repr(exc))
+```
+
 `src/autotrader/core/runtime.py`: `from autotrader.core.ledger import Ledger`; pass `ledger=Ledger(bus, sessions),` to `RiskEngine(...)`; change `_Snapshotter.snapshot_equity` to `async def snapshot_equity(self) -> object: ...`.
 
 `tests/integration/test_cycle_runner.py` `wire()`: create `bus = EventBus(sessions)` before the engine and pass `ledger=Ledger(bus, sessions, clock=lambda: NOW)` to `RiskEngine(...)`; import `Ledger`.
@@ -2895,7 +2958,7 @@ Record every such change in the commit message body.
 Run the full check. Expected: green, `risk/` at 100 % branch coverage. If a branch in `_sync`/`_read_order` is reported missing, add a focused test for it rather than a `pragma: no cover`.
 
 ```bash
-git add src/autotrader/risk/engine.py src/autotrader/journal/repo.py src/autotrader/core/cycle.py src/autotrader/core/runtime.py tests/unit/risk/test_engine.py tests/unit/journal/test_repo.py tests/unit/core/test_cycle.py tests/integration/test_cycle_runner.py
+git add src/autotrader/risk/engine.py src/autotrader/journal/repo.py src/autotrader/core/cycle.py src/autotrader/core/bus.py src/autotrader/core/runtime.py tests/unit/risk/test_engine.py tests/unit/journal/test_repo.py tests/unit/core/test_cycle.py tests/integration/test_cycle_runner.py
 git commit -m "WP 1.5b: check() books every order through the ledger and reserves remainders
 
 Entries now sync and book all unsettled orders before reading positions, fail
@@ -3002,7 +3065,8 @@ rg -n "WP 1\.5 reconcil|until WP 1\.5|WP 1\.6 adds the fill stream|_refresh_open
 ```
 
 Known hits and their replacements:
-- `src/autotrader/core/cycle.py` module docstring: "`new` / `unknown` / `canceled` stay SUBMITTED until WP 1.5 reconciles the order" -> "`new` / `unknown` / `canceled` stay SUBMITTED until the ledger (WP 1.5b) settles the order from the broker's filled qty".
+- `src/autotrader/core/cycle.py` module docstring: replace "proven outcomes are mapped; `new` / `unknown` / `canceled` stay SUBMITTED until WP 1.5 reconciles the order." with (wrapped at 100 columns) "proven outcomes are mapped; `new` / `canceled` stay SUBMITTED until the ledger (WP 1.5b) settles the order from the broker's filled qty; an `unknown` row without a broker id waits for the 1.5d resolver."
+- `src/autotrader/risk/checks.py` (the check 7 comment): "A small partial IOC fill can still leave dust (WP 1.5 reconciles)" -> "A small partial IOC fill can still leave dust (the ledger writes it off at close, WP 1.5b)".
 - `core/cycle.py` comment above `RECONCILIATION_ONLY_EDGES`: "Taken only by WP 1.5 reconciliation" -> "Taken only by the ledger (WP 1.5b) when an entry order settles".
 - `core/cycle.py` `_risk_check` comment "WP 1.5 reconciles from the broker's fill qty" -> "the ledger settles them from the broker's fill qty (WP 1.5b)".
 - `core/cycle.py` `recover()` docstring "leave the rest to WP 1.5" -> "leave the rest to the ledger (WP 1.5b; startup reconciliation is 1.5d)".
@@ -3011,7 +3075,7 @@ Leave dated history in `PLAN.md` and specs untouched.
 
 - [ ] **Step 4: PLAN.md**
 
-- 1.5 row: append "**2026-10-DD, 1.5b done:** ledger (`core/ledger.py`), order sync in `RiskEngine.sync_orders()`, migration 0004, cash check (not yet run by `run core`: 1.5d); follow-ups (a) remainder notional, (b) `DustRemainder`, (c) fills by value are done. Plan clarifications: a position closes only when all its orders are settled; `overfilled` against the order qty applies to buys only; the runner logs `cycle.completed_elsewhere` when the ledger completed its cycle first. Spec `docs/superpowers/specs/2026-10-15-fill-position-accounting-design.md`, plan `docs/superpowers/plans/2026-10-15-fill-position-accounting.md`." Replace `DD` with the actual date the PR is opened.
+- 1.5 row: append "**2026-10-DD, 1.5b done:** ledger (`core/ledger.py`), order sync in `RiskEngine.sync_orders()`, migration 0004, cash check (not yet run by `run core`: 1.5d); follow-ups (a) remainder notional, (b) `DustRemainder`, (c) fills by value are done. Plan clarifications: a position closes only when all its orders are settled; `overfilled` against the order qty applies to buys only; the runner logs `cycle.completed_elsewhere` when the ledger completed its cycle first; an order that never reached the broker completes its cycle `REJECTED` (runner wording) whoever writes first. Spec `docs/superpowers/specs/2026-10-15-fill-position-accounting-design.md`, plan `docs/superpowers/plans/2026-10-15-fill-position-accounting.md`." Replace `DD` with the actual date the PR is opened.
 - 1.6 row: append "**2026-10-15 (1.5b):** implement `Broker.order_fills` for Alpaca (activities API, paginated) populating `fills.broker_fill_id`; establish Alpaca's coin fee and rounding exactly (or a bounded allowance) before the ledger's `oversell` check applies to Alpaca fills (spec 2026-10-15 section 4.4)."
 - The "Current repo state" paragraph: "WP 1.5a (runtime safety) done. Next: WP 1.5b (fill/position accounting) and WP 1.6 (Alpaca execution)." -> "WP 1.5a (runtime safety) and WP 1.5b (fill/position accounting: `core/ledger.py`) done. Next: WP 1.5c (exit management), then 1.5d and 1.6."
 
