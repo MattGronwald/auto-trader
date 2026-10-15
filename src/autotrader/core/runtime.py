@@ -40,6 +40,7 @@ from autotrader.core.bus import EventBus
 from autotrader.core.config import AppConfig, Settings, StrategyProfile
 from autotrader.core.feed import BarClosed, BarSource, MarketFeed
 from autotrader.core.kill import ControlGate, ControlStatus
+from autotrader.core.ledger import Ledger
 from autotrader.core.lock import JournalLock, canonical_journal
 from autotrader.core.scanner import Scanner
 from autotrader.core.shutdown import EXIT_CLEAN, EXIT_FAILED, ShutdownControl
@@ -60,7 +61,7 @@ CONTROL_STALL_S = 10.0
 
 
 class _Snapshotter(Protocol):
-    async def snapshot_equity(self) -> None: ...
+    async def snapshot_equity(self) -> object: ...
 
 
 class ControlPoller:
@@ -185,6 +186,7 @@ async def run_core(
             gate=gate,
             market=feed,
             sessions=sessions,
+            ledger=Ledger(bus, sessions),
             trading_day_tz=cfg.trading_day_tz,
         )
         log.info("risk.engine_ready", mode=cfg.mode)

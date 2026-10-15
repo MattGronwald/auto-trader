@@ -147,8 +147,10 @@ class EventBus:
         if unit.cancelled():
             return
         exc = unit.exception()  # retrieved here; a caller that is still waiting re-raises it
-        if exc is not None and not isinstance(exc, CommitUncertain):  # that one is logged
+        if exc is not None and not isinstance(exc, CommitUncertain | repo.StaleTransition):
             # The caller may be gone (cancelled): without this the failure would vanish.
+            # CommitUncertain is logged by the unit; StaleTransition by its caller (the
+            # runner logs cycle.completed_elsewhere or cycle.stuck).
             log.error("bus.unit_failed", error=repr(exc))
 
     async def _unit(

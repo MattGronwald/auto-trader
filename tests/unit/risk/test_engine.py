@@ -6,24 +6,28 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from pathlib import Path
-from typing import NoReturn, TypeVar
+from typing import Any, NoReturn, TypeVar
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+import autotrader.risk.engine as engine_module
 from autotrader.broker.base import (
     Account,
     AssetRules,
     Broker,
     BrokerOrder,
+    DustRemainder,
     FeeSchedule,
+    Fill,
     OrderAck,
     OrderRejected,
     OrderStatus,
     Position,
 )
-from autotrader.broker.sim import SimBroker
+from autotrader.broker.sim import FillPlan, SimBroker
+from autotrader.core.bus import EventBus
 from autotrader.core.config import StrategyProfile, load_profile
 from autotrader.core.kill import (
     PAUSED_KEY,
@@ -32,12 +36,22 @@ from autotrader.core.kill import (
     ControlStatus,
     write_kill_file,
 )
+from autotrader.core.ledger import Ledger
 from autotrader.core.types import Bar, Quote
 from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
-from autotrader.risk.engine import Gate, RiskEngine
-from autotrader.risk.types import EntryIntent, ExitRequest
+from autotrader.risk.checks import check_entry
+from autotrader.risk.engine import Accounting, Gate, RiskEngine
+from autotrader.risk.types import (
+    EntryIntent,
+    ExitRequest,
+    MarketSnapshot,
+    OpenEntry,
+    PortfolioState,
+    RiskDecision,
+    SyncResult,
+)
 
 REPO = Path(__file__).resolve().parents[3]
 T = TypeVar("T")
@@ -160,6 +174,7 @@ def make_engine_(
     io_timeout_s: float = 10.0,
     monotonic: "Mono | None" = None,
     cls: type[RiskEngine] = RiskEngine,
+    ledger: Accounting | None = None,
 ) -> RiskEngine:
     return cls(
         broker,
@@ -169,6 +184,7 @@ def make_engine_(
         gate=gate,
         market=view or FakeView(),
         sessions=sessions,
+        ledger=ledger or Ledger(EventBus(sessions), sessions, clock=clock or Clock(NOW)),
         trading_day_tz=tz,
         clock=clock or Clock(NOW),
         io_timeout_s=io_timeout_s,
@@ -1284,3 +1300,200 @@ async def test_last_snapshot_at_tracks_committed_writes(
     with pytest.raises(ConnectionError):
         await partial.snapshot_equity()
     assert partial.last_snapshot_at == 5.0  # equity/HWM still committed
+
+
+def spy_portfolios(monkeypatch: pytest.MonkeyPatch) -> list[PortfolioState]:
+    seen: list[PortfolioState] = []
+    real = check_entry  # mypy: risk.engine does not re-export it
+
+    def spy(
+        intent: EntryIntent, portfolio: PortfolioState, market: MarketSnapshot, **kw: Any
+    ) -> RiskDecision:
+        seen.append(portfolio)
+        return real(intent, portfolio, market, **kw)
+
+    monkeypatch.setattr(engine_module, "check_entry", spy)
+    return seen
+
+
+async def test_a_partially_filled_entry_reserves_only_its_remainder(
+    sessions: async_sessionmaker[AsyncSession],
+    gate: ControlGate,
+    cycle_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = _sim(PartialFillBroker)  # reports the canceled IOC as still partially filled
+    broker.script(BTC, "buy", FillPlan((D("0.5"),)))
+    engine = make_engine_(broker, sessions, gate)
+    await engine.check(intent(cycle_id))  # 2.997 at limit 100.10
+    broker.process_bar(five(30))  # fills 1.4985
+    seen = spy_portfolios(monkeypatch)
+
+    await engine.check(intent(await new_cycle(sessions)))
+    assert seen[-1].open_entries == (
+        OpenEntry(symbol=BTC, notional=(D("2.997") - D("1.4985")) * D("100.10")),
+        OpenEntry(symbol=BTC, notional=D(0)),  # the open journal trade (booked fill)
+    )
+
+
+class HiddenFillsBroker(SimBroker):
+    """Reports the order final but none of its executions yet (visibility lag)."""
+
+    async def order_fills(self, order_id: str) -> list[Fill]:
+        return []
+
+
+async def test_a_final_unsettled_entry_reserves_nothing_but_blocks_its_symbol(
+    sessions: async_sessionmaker[AsyncSession],
+    gate: ControlGate,
+    cycle_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = _sim(HiddenFillsBroker)
+    engine = make_engine_(broker, sessions, gate)
+    await engine.check(intent(cycle_id))
+    broker.process_bar(five(30))  # filled at the broker, fills not visible
+    seen = spy_portfolios(monkeypatch)
+
+    result = await engine.check(intent(await new_cycle(sessions)))
+    assert seen[-1].open_entries == (OpenEntry(symbol=BTC, notional=D(0)),)
+    assert "already has a position or open entry" in result.decision.reasons[0]
+    first = (await orders(sessions))[0]
+    assert (first.status, first.settled_at) == ("filled", None)
+
+
+async def test_an_unreadable_order_fails_entries_closed_but_the_rest_is_booked(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    engine = make_engine_(sim, sessions, gate)
+    await engine.check(intent(cycle_id))
+    sim.process_bar(five(30))  # the BTC entry fills
+    async with sessions() as s:  # an order the broker no longer knows, on another symbol
+        ghost = await repo.insert_order(
+            s,
+            cycle_id=None,
+            client_order_id=None,
+            symbol="ETH/USD",
+            mode="paper",
+            type_="limit",
+            side="buy",
+            qty=D("1"),
+            limit_price=D("10"),
+            stop_price=None,
+            tp_price=None,
+            status="pending",
+            now=NOW,
+        )
+        await repo.update_order(s, ghost.id, status="new", now=NOW, broker_order_id="sim-404")
+
+    result = await engine.check(intent(await new_cycle(sessions)))
+    assert result.decision.reasons == ("state unavailable: SyncIncomplete",)
+    async with sessions() as s:
+        (pos,) = list(await s.scalars(select(m.Position)))
+    assert pos.qty == D("2.997")  # the readable order was still booked
+    exited = await engine.exit(ExitRequest(symbol=BTC, reason="stop"))  # exits never sync
+    assert exited.decision.approved and exited.status == "new"
+
+
+class FailingLedger:
+    async def apply_all(self, result: SyncResult) -> None:
+        raise RuntimeError("journal down")
+
+
+async def test_a_failing_ledger_fails_entries_closed(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    result = await make_engine_(sim, sessions, gate, ledger=FailingLedger()).check(intent(cycle_id))
+    assert result.decision.reasons == ("state unavailable: RuntimeError",)
+
+
+async def test_sync_orders_reads_every_unsettled_row_once(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    engine = make_engine_(sim, sessions, gate)
+    await engine.check(intent(cycle_id))  # row 1: acked "new", nothing filled yet
+    direct = await sim.submit_order(
+        BrokerOrder(symbol=BTC, side="buy", qty=D("0.01"), type="market")
+    )
+    async with sessions() as s:
+
+        async def row(status: str, broker_id: str | None) -> int:
+            r = await repo.insert_order(
+                s,
+                cycle_id=None,
+                client_order_id=None,
+                symbol=BTC,
+                mode="paper",
+                type_="market",
+                side="buy",
+                qty=D("0.01"),
+                limit_price=None,
+                stop_price=None,
+                tp_price=None,
+                status=status,
+                now=NOW,
+            )
+            if broker_id is not None:
+                await repo.update_order(s, r.id, status=status, now=NOW, broker_order_id=broker_id)
+            return r.id
+
+        unknown = await row("unknown", None)  # 1.5d's resolver: not read
+        never = await row("not_submitted", None)  # local final: no broker call
+        ghost = await row("new", "sim-404")  # the broker does not know it
+        same_symbol = await row("new", direct.order_id)  # second BTC row: rules cached
+
+    first = await engine.sync_orders()
+    assert first.failed == (ghost,)
+    by_row = {u.order_row_id: u for u in first.updates}
+    assert unknown not in by_row
+    assert (by_row[never].status, by_row[never].min_qty) == ("not_submitted", None)
+    assert by_row[1].fills == () and by_row[1].min_qty == RULES.min_qty
+    sim.process_bar(five(30))
+    second = await engine.sync_orders()
+    filled = {u.order_row_id: u for u in second.updates}
+    assert len(filled[1].fills) == 1 and len(filled[same_symbol].fills) == 1
+
+
+class DustBroker(SimBroker):
+    async def close_position(self, symbol: str) -> OrderAck:
+        raise DustRemainder(symbol, D("0.00005"), RULES.min_qty)
+
+
+async def test_a_dust_close_is_reported_as_dust(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    broker = _sim(DustBroker)
+    await _held_btc(broker)
+    result = await make_engine_(broker, sessions, gate).exit(ExitRequest(symbol=BTC, reason="kill"))
+    assert (result.status, result.dust) == ("rejected", True)
+    (row,) = await orders(sessions)
+    assert (row.status, row.exit_reason) == ("rejected", "kill")
+
+
+async def test_an_open_journal_trade_blocks_its_symbol_even_on_broker_dust(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    # PR #25 review: a trade kept open by a lagging exit while the broker holds only dust
+    # (which check 5 ignores) must still block a second trade on the symbol.
+    async with sessions() as s:
+        s.add(
+            m.Position(
+                symbol=BTC,
+                side="long",
+                qty=D("0.00005"),
+                entry_price=D("100"),
+                opened_at=NOW,
+                fees=D(0),
+                dust_consumed=D(0),
+            )
+        )
+        await s.commit()
+    result = await make_engine_(sim, sessions, gate).check(intent(cycle_id))
+    assert "already has a position or open entry" in result.decision.reasons[0]
+
+
+async def test_snapshot_equity_returns_the_account_it_read(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    account = await make_engine_(sim, sessions, gate).snapshot_equity()
+    assert account.cash == D("1000")

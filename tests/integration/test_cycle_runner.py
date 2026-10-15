@@ -24,6 +24,7 @@ from autotrader.core.bus import EventBus
 from autotrader.core.config import StrategyProfile, parse_profile
 from autotrader.core.cycle import CycleRunner
 from autotrader.core.kill import ControlGate
+from autotrader.core.ledger import Ledger
 from autotrader.core.scanner import CandidateSignal
 from autotrader.core.types import Bar, Quote
 from autotrader.journal import models as m
@@ -141,6 +142,7 @@ async def wire(
     broker.process_bar(five(29))
     gate = ControlGate(tmp_path / "KILL", sessions)
     view = View()
+    bus = EventBus(sessions)
     engine = RiskEngine(
         broker,
         profile=prof,
@@ -149,9 +151,9 @@ async def wire(
         gate=gate,
         market=view,
         sessions=sessions,
+        ledger=Ledger(bus, sessions, clock=lambda: NOW),
         clock=lambda: NOW,
     )
-    bus = EventBus(sessions)
     runner = CycleRunner(
         profile=prof,
         strategy_id=strategy_id,

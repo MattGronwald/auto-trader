@@ -604,6 +604,14 @@ class CycleRunner:
             return True
         except asyncio.CancelledError:
             raise
+        except _WriteFailed as e:
+            if isinstance(e.__cause__, repo.StaleTransition):
+                # Another check()'s sync booked this cycle's order first and the ledger
+                # completed the cycle (WP 1.5b): its state is final, nothing is stuck.
+                log.info("cycle.completed_elsewhere", state=cur.state, to_state=to)
+            else:
+                log.exception("cycle.stuck", state=cur.state, to_state=to)
+            return False
         except Exception:  # incl. CommitUncertain: the order row decides what happens
             log.exception("cycle.stuck", state=cur.state, to_state=to)
             return False

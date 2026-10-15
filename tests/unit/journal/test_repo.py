@@ -282,20 +282,16 @@ async def test_client_order_id_is_unique(session: AsyncSession) -> None:
         await repo.insert_order(session, **kw)
 
 
-async def test_open_entry_orders_and_update(session: AsyncSession) -> None:
+async def test_open_entry_orders_are_the_unsettled_buys(session: AsyncSession) -> None:
     keep = [
-        await _order(session, status=s) for s in ("pending", "new", "partially_filled", "unknown")
-    ]
-    for s in ("filled", "canceled", "rejected", "not_submitted"):
         await _order(session, status=s)
+        for s in ("pending", "new", "partially_filled", "unknown", "filled", "canceled")
+    ]
+    done = await _order(session, status="filled")
+    await session.execute(update(m.Order).where(m.Order.id == done.id).values(settled_at=T0))
+    await session.commit()
     await _order(session, status="new", side="sell")
     assert {o.id for o in await repo.open_entry_orders(session)} == {o.id for o in keep}
-    await repo.update_order(session, keep[1].id, status="filled", now=T0, broker_order_id="b1")
-    assert {o.id for o in await repo.open_entry_orders(session)} == {
-        keep[0].id,
-        keep[2].id,
-        keep[3].id,
-    }
 
 
 async def test_count_entry_orders_window(session: AsyncSession) -> None:

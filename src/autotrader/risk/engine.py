@@ -9,13 +9,17 @@ Two locks: entries serialise on one, exits on another, and an exit never waits f
 entry (a stalled journal call inside `check()` cannot block a stop-out). That is safe
 because an entry that runs beside an exit still sees the position being exited and
 rejects or over-counts it (conservative), and a late IOC fill after a kill-flatten can
-happen with or without a shared lock (fills are broker-side); the Position Manager handles
-it (WP 1.5).
+happen with or without a shared lock (fills are broker-side); the ledger books it (WP 1.5b)
+and the Position Manager manages it (WP 1.5c).
+
+`check()` first syncs every unsettled order (`sync_orders`) and books it through the ledger
+(`core/ledger.py`, WP 1.5b); an unreadable order rejects the entry (`state unavailable:
+SyncIncomplete`). Exits never sync.
 
 Each locked section has ONE budget of `io_timeout_s`, measured from taking its lock and
 shared by its network/gate awaits only (gate.status, get_account, get_positions, each
-asset_rules and get_order, submit/close); each is wrapped in `_within`. Journal reads and
-writes (every `self._sessions()` block, `_write_snapshot`) run outside any `wait_for`, so
+asset_rules, get_order and order_fills, submit/close); each is wrapped in `_within`. Journal
+reads and writes (every `self._sessions()` block, `_write_snapshot`) run outside any `wait_for`, so
 a timeout never cancels a DB session mid-statement or mid-commit; SQLite errors on a
 locked DB after `busy_timeout` (5 s) instead of hanging. A step whose budget is already
 spent is not called: its timeout outcome applies, and a submit that was never attempted
@@ -35,7 +39,15 @@ from typing import Protocol, TypeVar
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from autotrader.broker.base import Broker, Mode, OrderAck, OrderRejected
+from autotrader.broker.base import (
+    Account,
+    Broker,
+    DustRemainder,
+    Fill,
+    Mode,
+    OrderAck,
+    OrderRejected,
+)
 from autotrader.core.config import StrategyProfile
 from autotrader.core.indicators import compute_features
 from autotrader.core.kill import PAUSED_KEY, PAUSED_UNTIL_KEY, ControlStatus
@@ -50,17 +62,26 @@ from autotrader.risk.types import (
     HeldPosition,
     MarketSnapshot,
     OpenEntry,
+    OrderUpdate,
     Pause,
     PortfolioState,
     RiskDecision,
+    SyncIncomplete,
+    SyncResult,
 )
 
 log = structlog.get_logger(__name__)
 HOUR = timedelta(hours=1)
 T = TypeVar("T")
 
-# Broker order states that are not final: the order can still fill (some of) its qty.
-_BROKER_OPEN = ("new", "partially_filled")
+# Final rows that never reached the broker: nothing to read, the ledger settles them.
+_LOCAL_FINAL = ("not_submitted", "rejected")
+
+
+class Accounting(Protocol):
+    """The ledger (`core/ledger.py`, WP 1.5b): books a sync pass. Journal code only."""
+
+    async def apply_all(self, result: SyncResult) -> None: ...
 
 
 class RiskMarketView(Protocol):
@@ -80,6 +101,7 @@ class OrderResult:
     order_row_id: int | None = None
     status: str | None = None
     broker_order_id: str | None = None
+    dust: bool = False
 
 
 def _dec(value: float | None) -> Decimal | None:
@@ -97,6 +119,7 @@ class RiskEngine:
         gate: Gate,
         market: RiskMarketView,
         sessions: async_sessionmaker[AsyncSession],
+        ledger: Accounting,
         trading_day_tz: str = "UTC",
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         io_timeout_s: float = 10.0,
@@ -109,6 +132,7 @@ class RiskEngine:
         self._gate = gate
         self._market = market
         self._sessions = sessions
+        self._ledger = ledger
         self._tz = trading_day_tz
         self._clock = clock
         self._io_timeout = io_timeout_s
@@ -183,9 +207,19 @@ class RiskEngine:
         """Only the network/gate awaits are budgeted; a timeout raises out of here and
         `check()` turns it into the persisted `state unavailable` rejection."""
         control = await self._within(deadline, lambda: self._gate.status(now))
-        # Refresh our own entries BEFORE reading positions: a fill the refresh observes
-        # is then already in the positions read below (never neither-position-nor-entry).
-        open_rows = await self._refresh_open_entries(deadline)
+        # Book our own orders BEFORE reading positions: a fill the sync observed is then in
+        # the journal and in the positions read below (never neither position nor entry).
+        synced = await self._sync(deadline)
+        await self._ledger.apply_all(synced)
+        if not synced.complete:  # PLAN 3.2 item 4: an unreadable order fails entries closed
+            raise SyncIncomplete(f"order rows not synced: {list(synced.failed)}")
+        async with self._sessions() as session:
+            open_rows = await repo.open_entry_orders(session)
+            # One open journal trade per symbol (PR #25 review): a trade stays open (e.g.
+            # an exit whose status lags) even when the broker holds only dust, which
+            # check 5 ignores.
+            journal_open = await repo.open_position_symbols(session)
+        broker_filled = {u.order_row_id: u.filled_qty for u in synced.updates}
         account = await self._within(deadline, self._broker.get_account)
         # Persist a new peak (or the first-ever baseline) right after the account read,
         # before anything else here can fail: otherwise a spike seen by a check that then
@@ -217,10 +251,19 @@ class RiskEngine:
             positions=held,
             open_entries=tuple(
                 # symbol is always set by insert_order; "" only guards legacy NULL rows and
-                # still counts toward max_positions (conservative)
-                OpenEntry(symbol=o.symbol or "", notional=o.qty * (o.limit_price or Decimal(0)))
+                # still counts toward max_positions (conservative). The notional is the
+                # unfilled remainder: the filled part is already a priced position.
+                OpenEntry(
+                    symbol=o.symbol or "",
+                    notional=max(
+                        o.qty - max(broker_filled.get(o.id, o.filled_qty), o.filled_qty),
+                        Decimal(0),
+                    )
+                    * (o.limit_price or Decimal(0)),
+                )
                 for o in open_rows
-            ),
+            )
+            + tuple(OpenEntry(symbol=s, notional=Decimal(0)) for s in sorted(journal_open)),
             entries_last_hour=entries_hour,
             entries_today=entries_day,
             strategy_trades_n=trades_n,
@@ -243,29 +286,54 @@ class RiskEngine:
         )
         return control, portfolio, market
 
-    async def _refresh_open_entries(self, deadline: float) -> list[Order]:
-        """Order status sync for our own acked entries (WP 1.6 adds the fill stream): a
-        final broker status is written and the row leaves the open set; "partially_filled"
-        is written but stays open. Without it an IOC entry would stay `new` and block its
-        symbol forever. No DB session is held open across the broker calls."""
+    async def sync_orders(self) -> SyncResult:
+        """Read-only broker view of every unsettled order for the ledger (spec 4.2). Takes
+        no lock (never delays an exit) and has its own `io_timeout_s` budget."""
+        return await self._sync(self._monotonic() + self._io_timeout)
+
+    async def _sync(self, deadline: float) -> SyncResult:
+        """Per-order failures (incl. `OrderNotFound` and a spent budget) are collected,
+        never raised: the caller decides, and `check()` then fails closed."""
         async with self._sessions() as session:
-            rows = await repo.open_entry_orders(session)
-        still_open: list[Order] = []
-        changed: list[tuple[int, str]] = []
+            rows = await repo.unsettled_orders(session)
+        updates: list[OrderUpdate] = []
+        failed: list[int] = []
+        min_qty: dict[str, Decimal] = {}
         for row in rows:
-            if row.status in _BROKER_OPEN and row.broker_order_id is not None:
-                get_order = partial(self._broker.get_order, row.broker_order_id)
-                status = await self._within(deadline, get_order)
-                if status.status != row.status:
-                    changed.append((row.id, status.status))
-                if status.status not in _BROKER_OPEN:
-                    continue
-            still_open.append(row)
-        if changed:
-            async with self._sessions() as session:
-                for row_id, new_status in changed:
-                    await repo.update_order(session, row_id, status=new_status, now=self._clock())
-        return still_open
+            broker_id = row.broker_order_id
+            if broker_id is None:
+                if row.status in _LOCAL_FINAL:
+                    updates.append(
+                        OrderUpdate(order_row_id=row.id, status=row.status, filled_qty=Decimal(0))
+                    )
+                continue  # pending / unknown without an id: the 1.5d resolver's case
+            try:
+                updates.append(await self._read_order(row, broker_id, min_qty, deadline))
+            except Exception:
+                log.exception("risk.order_sync_failed", order_row=row.id)
+                failed.append(row.id)
+        return SyncResult(updates=tuple(updates), failed=tuple(failed))
+
+    async def _read_order(
+        self, row: Order, broker_id: str, min_qty: dict[str, Decimal], deadline: float
+    ) -> OrderUpdate:
+        """Status, then (only if more filled than booked) executions: two reads, so the
+        executions may be ahead of the status (the ledger handles that)."""
+        status = await self._within(deadline, partial(self._broker.get_order, broker_id))
+        fills: list[Fill] = []
+        if status.filled_qty > row.filled_qty:
+            fills = await self._within(deadline, partial(self._broker.order_fills, broker_id))
+        symbol = row.symbol or ""
+        if symbol not in min_qty:
+            rules = await self._within(deadline, partial(self._broker.asset_rules, symbol))
+            min_qty[symbol] = rules.min_qty
+        return OrderUpdate(
+            order_row_id=row.id,
+            status=status.status,
+            filled_qty=status.filled_qty,
+            fills=tuple(fills),
+            min_qty=min_qty[symbol],
+        )
 
     async def _broker_positions(
         self, deadline: float, symbol: str | None = None
@@ -323,6 +391,10 @@ class RiskEngine:
             return OrderResult(decision, row_id, "not_submitted")
         try:
             ack = await self._within(deadline, call)
+        except DustRemainder as e:  # close_position only: report dust as a type (1.5c)
+            log.warning("risk.exit_dust", order_row=row_id, qty=str(e.qty), min_qty=str(e.min_qty))
+            await self._set_status(row_id, "rejected")
+            return OrderResult(decision, row_id, "rejected", dust=True)
         except OrderRejected as e:
             log.warning("risk.order_rejected", order_row=row_id, reason=str(e))
             await self._set_status(row_id, "rejected")
@@ -406,6 +478,7 @@ class RiskEngine:
                     tp_price=None,
                     status="pending",
                     now=now,
+                    exit_reason=request.reason,
                 )
             return await self._submit(
                 row.id, decision, deadline, lambda: self._broker.close_position(request.symbol)
@@ -413,10 +486,11 @@ class RiskEngine:
 
     # --- equity snapshots ------------------------------------------------------------
 
-    async def snapshot_equity(self) -> None:
+    async def snapshot_equity(self) -> Account:
         """Called every 60 s by `run core`'s supervised `risk.snapshot` loop. Its broker calls
         have their own `io_timeout_s` budget; journal writes are never cancelled.
-        Lock-free on purpose: it must never delay an exit."""
+        Lock-free on purpose: it must never delay an exit. Returns the account it read, so a
+        caller can feed the ledger's cash check (1.5d) without a second broker call."""
         deadline = self._monotonic() + self._io_timeout  # its own budget; no lock shared
         now = self._clock()
         account = await self._within(deadline, self._broker.get_account)
@@ -426,6 +500,7 @@ class RiskEngine:
             await self._write_snapshot(now, account.equity, account.cash, None)
             raise
         await self._write_snapshot(now, account.equity, account.cash, held)
+        return account
 
     async def _write_snapshot(
         self, now: datetime, equity: Decimal, cash: Decimal, held: tuple[HeldPosition, ...] | None

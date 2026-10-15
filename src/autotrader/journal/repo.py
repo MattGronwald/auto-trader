@@ -296,11 +296,6 @@ async def set_control(session: AsyncSession, key: str, value: Any) -> None:
 
 # --- risk decisions / orders / equity (WP 1.3) ---------------------------------------
 
-# Entry orders that may still fill: not yet acked, acked and not final (including partly
-# filled with the rest still open), or unknown after an ambiguous submit failure (WP 1.5
-# reconciles those by client_order_id). "partially_filled" fits orders.status String(16).
-OPEN_ENTRY_STATUSES = ("pending", "new", "partially_filled", "unknown")
-
 
 async def record_risk_decision(
     session: AsyncSession,
@@ -381,9 +376,12 @@ async def update_order(
 
 
 async def open_entry_orders(session: AsyncSession) -> list[Order]:
+    """Entry orders that still reserve their symbol: every buy not yet settled by the
+    ledger (WP 1.5b), whatever its status. A final but unsettled row (fills not booked
+    yet) keeps reserving until the ledger settles it."""
     rows = await session.scalars(
         select(Order)
-        .where(Order.side == "buy", Order.status.in_(OPEN_ENTRY_STATUSES))
+        .where(Order.side == "buy", Order.settled_at.is_(None))
         .order_by(Order.id)
         .execution_options(populate_existing=True)
     )
