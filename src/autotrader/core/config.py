@@ -368,6 +368,10 @@ class Feed(_Frozen):
 
 class Shutdown(_Frozen):
     flatten: bool
+    # WP 1.5a: graceful teardown budget T; the watchdog ends the process at T + 5 s.
+    # Above the Cycle Runner's 20 s close budget (wired in WP 1.5d). allow_inf_nan=False
+    # rejects NaN/inf, which the bounds alone would not.
+    timeout_s: Annotated[float, Field(gt=0, le=300, allow_inf_nan=False)]
 
 
 class AppConfig(_Frozen):

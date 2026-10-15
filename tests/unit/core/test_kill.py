@@ -128,7 +128,7 @@ async def test_unreadable_control_state_fails_closed(tmp_path: Path, kill_file: 
     status = await gate.status(NOW)
     await engine.dispose()
 
-    assert not status.entries_allowed
+    assert not status.entries_allowed and not status.available
     assert any("control state unavailable" in r for r in status.reasons)
 
 

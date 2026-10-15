@@ -369,3 +369,18 @@ def test_settings_read_dotenv(tmp_path: Path) -> None:
 
     assert settings.anthropic_api_key is not None
     assert settings.anthropic_api_key.get_secret_value() == "from-dotenv"
+
+
+def test_shutdown_timeout_loads_from_the_repo_config() -> None:
+    assert load_config(CONFIG, paper_settings()).shutdown.timeout_s == 30
+
+
+@pytest.mark.parametrize("value", [0, -1, 301, "NaN", "Infinity", None])
+def test_shutdown_timeout_is_required_finite_and_bounded(tmp_path: Path, value: Any) -> None:
+    shutdown: dict[str, Any] = {"flatten": False}
+    if value is not None:
+        shutdown["timeout_s"] = value
+    path = _write_config(tmp_path, shutdown=shutdown)
+
+    with pytest.raises(ConfigError, match="timeout_s"):
+        load_config(path, paper_settings())

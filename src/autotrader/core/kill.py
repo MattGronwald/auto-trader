@@ -49,6 +49,9 @@ class KillCleared(DomainEvent):
 class ControlStatus:
     killed: bool
     reasons: tuple[str, ...]  # why entries are blocked; empty = allowed
+    # False when the journal's control state could not be read: `killed` then reflects the
+    # kill file only and proves no clearance of a journal kill (entries stay blocked).
+    available: bool = True
 
     @property
     def entries_allowed(self) -> bool:
@@ -80,7 +83,7 @@ class ControlGate:
         except Exception as e:  # fail closed: unknown state must not allow trading
             log.exception("control.state_unavailable")
             reasons.append(f"control state unavailable: {type(e).__name__}")
-            return ControlStatus(killed, tuple(reasons))
+            return ControlStatus(killed, tuple(reasons), available=False)
 
         if kill:
             killed = True

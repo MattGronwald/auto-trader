@@ -242,6 +242,7 @@ See §9.
 - **Event bus:** in-process asyncio pub/sub with append-only persistence before delivery. It is not a durable replay queue. WP 1.4 `publish_tx` commits cycle state and event together; uncertain commits suspend admission until restart/recovery. Database evidence can exist without in-process delivery. The future dashboard tails persisted events by durable id, independently of core subscriptions.
 - **Cost meter:** wraps the Anthropic client; per-call tokens and USD (price table in config, versioned); daily and per-cycle aggregates; hard daily budget → scanner stops emitting candidates when exceeded.
 - **Kill-switch:** configured `control.kill_file`, resolved relative to `config.yaml` (default `data/control/KILL`), plus DB kill state. Core and API share this path/volume in Compose. Check before **entry** submission; allow cancellations and protective exits while killed. On kill, WP 1.5 cancels outstanding entry orders and optionally flattens (`kill.flatten`, default true in live, false in paper); API/dashboard controls arrive in Phase 3.
+- **Single writer and bounded shutdown (WP 1.5a):** `run core` holds an exclusive lock on `<canonical journal path>.lock` for its lifetime, taken before the migration; a second core waits up to `shutdown.timeout_s` + 5 s and fails. Feed ticks, kill polling, a DB-free kill-file check and equity snapshots are independent supervised loops (stalls and `risk.snapshot_overdue` are logged). Every exit cause, startup included, runs one bounded teardown (`shutdown.timeout_s`, exit 1 if forced or failed); a second signal exits 130 immediately; a watchdog thread, never cancelled once armed, exits 70 at timeout + 5 s.
 - **Config:** `config.yaml` (infra, API keys via env) + `strategies/<name>.yaml` (strategy profile, §6). Secrets only via environment / `.env` (git-ignored).
 - **Logging:** structured JSON (structlog), one line per event, cycle_id in every line.
 
@@ -523,7 +524,7 @@ Preconditions, all required:
 - Dashboard not internet-exposed (localhost / Tailscale). Bearer token.
 - Prompt injection: the Context Analyst (when enabled) consumes third-party text. Its output schema is narrow (numbers + enums + short strings) and it has no tool access; the Decision Maker treats it as data. No agent output is ever executed or used to construct prompts for other agents without schema validation.
 - Dependency pinning, `pip-audit` in CI.
-- One core process per journal and one dedicated paper account/journal in Phase 1. WP 1.5 enforces a process-held local single-writer lock; restart resolves the previous writer's SQLite work before admitting entries. WP 3.5 / the Phase 5 gate adds persistent account/mode binding, cash-flow discontinuity detection and Postgres ownership/recovery. Postgres locking and query deadlines require real Postgres tests, not only SQLite tests or DDL compilation.
+- One core process per journal and one dedicated paper account/journal in Phase 1. WP 1.5a enforces a process-held local single-writer lock; WP 1.5d resolves the previous writer's SQLite work before admitting entries. WP 3.5 / the Phase 5 gate adds persistent account/mode binding, cash-flow discontinuity detection and Postgres ownership/recovery. Postgres locking and query deadlines require real Postgres tests, not only SQLite tests or DDL compilation.
 
 ---
 

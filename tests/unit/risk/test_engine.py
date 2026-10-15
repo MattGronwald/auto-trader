@@ -1245,3 +1245,42 @@ async def test_concurrent_exits_on_one_symbol_sell_once(
     results = await asyncio.gather(engine.exit(request), engine.exit(request))
     assert sorted(str(r.status) for r in results) == ["new", "rejected"]
     assert len(sells(sim)) == 1
+
+
+class AccountDown(SimBroker):
+    async def get_account(self) -> Account:
+        raise ConnectionError("account down")
+
+
+class PositionsDown(SimBroker):
+    async def get_positions(self) -> list[Position]:
+        raise ConnectionError("positions down")
+
+
+def _broker(cls: type[SimBroker]) -> SimBroker:
+    b = cls(cash=D("1000"), fees=FEES, slippage_bps=D(0), asset_rules={BTC: RULES}, timeframe="5m")
+    b.process_bar(five(29))
+    return b
+
+
+async def test_last_snapshot_at_tracks_committed_writes(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    mono = Mono()
+    mono.t = 2.0
+    ok = make_engine_(_broker(SimBroker), sessions, gate, monotonic=mono)
+    assert ok.last_snapshot_at is None
+    await ok.snapshot_equity()
+    assert ok.last_snapshot_at == 2.0
+
+    no_account = make_engine_(_broker(AccountDown), sessions, gate, monotonic=mono)
+    with pytest.raises(ConnectionError):
+        await no_account.snapshot_equity()
+    assert no_account.last_snapshot_at is None  # nothing was written
+
+    mono.t = 5.0  # advance, so the assertion shows the value was set by this write
+    later = Clock(NOW + timedelta(minutes=1))  # equity_snapshots.ts is unique
+    partial = make_engine_(_broker(PositionsDown), sessions, gate, clock=later, monotonic=mono)
+    with pytest.raises(ConnectionError):
+        await partial.snapshot_equity()
+    assert partial.last_snapshot_at == 5.0  # equity/HWM still committed

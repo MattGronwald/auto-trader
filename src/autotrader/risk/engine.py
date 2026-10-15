@@ -113,6 +113,9 @@ class RiskEngine:
         self._clock = clock
         self._io_timeout = io_timeout_s
         self._monotonic = monotonic  # the budget clock (injectable for tests)
+        # Monotonic time of the last committed equity snapshot (None = none yet): drives
+        # run core's `risk.snapshot_overdue`, separately from the snapshot loop's liveness.
+        self.last_snapshot_at: float | None = None
         self._entry_lock = asyncio.Lock()  # check(): two entries never pass check 5 together
         self._exit_lock = asyncio.Lock()  # exit(): never waits for an entry
 
@@ -201,7 +204,7 @@ class RiskEngine:
                 session, day_start(now, self._tz), inclusive=True
             )
             baseline = await repo.day_start_equity(session, day_start(now, self._tz))
-            # Re-read: the snapshot task may have committed a higher peak while this check
+            # Re-read: the snapshot loop may have committed a higher peak while this check
             # awaited positions/rules; the decision uses the max of both durable reads.
             late_hwm = await repo.max_hwm(session)
             trades_n, wins = await repo.strategy_trade_stats(session, self._strategy_id)
@@ -411,7 +414,7 @@ class RiskEngine:
     # --- equity snapshots ------------------------------------------------------------
 
     async def snapshot_equity(self) -> None:
-        """Called every 60 s by `run core`'s background snapshot task. Its broker calls
+        """Called every 60 s by `run core`'s supervised `risk.snapshot` loop. Its broker calls
         have their own `io_timeout_s` budget; journal writes are never cancelled.
         Lock-free on purpose: it must never delay an exit."""
         deadline = self._monotonic() + self._io_timeout  # its own budget; no lock shared
@@ -451,3 +454,4 @@ class RiskEngine:
                 hwm=hwm,
                 daily_pnl=equity - (baseline if baseline is not None else equity),
             )
+            self.last_snapshot_at = self._monotonic()
