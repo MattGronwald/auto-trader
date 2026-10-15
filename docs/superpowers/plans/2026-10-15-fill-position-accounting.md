@@ -28,7 +28,7 @@ Full check, used at the end of every task:
 uv run ruff format && uv run ruff check --fix && uv run ruff format && uv run mypy && uv run pytest -q --cov && uv run coverage report --include='src/autotrader/risk/*' --fail-under=100 --show-missing
 ```
 
-**Plan dry run (2026-10-15):** all eight tasks were applied verbatim in a throwaway worktree with every check after each task: all green, 868 tests, property test ~2 s for 25 examples (400 examples also passed). The nine snippet bugs and three design points it found are fixed in this revision (clarifications 5-7 below).
+**Plan dry run (2026-10-15):** all eight tasks were applied verbatim in a throwaway worktree with every check after each task: all green, 868 tests, property test ~2 s for 25 examples (400 examples also passed). The nine snippet bugs and three design points it found are fixed in this revision (clarifications 5-7 below). The PR #25 review fixes (clarifications 8-9) were applied to the same worktree and re-run: 873 tests green, `risk/` at 100 %.
 
 ## Spec clarifications made while planning (flag in the PR description)
 
@@ -38,8 +38,10 @@ uv run ruff format && uv run ruff check --fix && uv run ruff format && uv run my
 4. **`positions.qty` is the remaining (open) qty**, reduced by sells; the acquired qty is derivable from the position's buy fills.
 5. **Deterministic outcome for orders that never reached the broker** (dry-run finding): the runner writes `SUBMITTED` even for a `not_submitted` result, then `REJECTED`; another check's sync could settle that row in between. The ledger therefore completes a zero-fill order **without a broker id** as `REJECTED` with reason `order <status>` (the runner's own edge and wording; D15's reconciliation may use runner edges), and only a broker-final zero fill as `EXPIRED`. Whoever writes first, the outcome is the same.
 6. **The bus no longer logs `StaleTransition` as `bus.unit_failed`** (error level): the runner always logs it itself (`cycle.completed_elsewhere`), so an expected race emits no error line.
-7. **Accepted, documented:** after the sync budget is spent, every remaining row is still attempted and fails at once (one `risk.order_sync_failed` line each; same result as stopping). Ledger booking inside `check()` consumes the entry's monotonic budget, so heavy contention can reject an entry `state unavailable` (fail closed). "At most one open position per symbol" can be broken by a position kept open only by a lagging exit while its remainder is broker dust (check 5 ignores dust); the readiness rule then defers the later sell instead of mis-booking it.
-8. **Known limitation kept:** until 1.5d adds a periodic sync loop, `check()` is the only caller of the sync, so an unsettled order blocks its symbol's admission until some other entry check runs. This is the same as today's `_refresh_open_entries`.
+7. **Accepted, documented:** after the sync budget is spent, every remaining row is still attempted and fails at once (one `risk.order_sync_failed` line each; same result as stopping). Ledger booking inside `check()` consumes the entry's monotonic budget, so heavy contention can reject an entry `state unavailable` (fail closed).
+8. **One open journal trade per symbol, enforced by `check()`** (PR #25 review): a symbol with an open journal position counts as reserved (`OpenEntry` with notional 0), so a trade kept open by a lagging exit while the broker holds only dust (which check 5 ignores) still blocks a second trade. The ledger never picks "the oldest" of several open positions: more than one is the anomaly `ambiguous_position`.
+9. **Unit-exact commit verification** (PR #25 review): every ledger event carries a `unit_id` (uuid4 hex), and `_verify` confirms a unit only by finding its own head event in the `events` table. A shared flag (`paused`) or a timestamp proves nothing about a particular unit.
+10. **Known limitation kept:** until 1.5d adds a periodic sync loop, `check()` is the only caller of the sync, so an unsettled order blocks its symbol's admission until some other entry check runs. This is the same as today's `_refresh_open_entries`.
 
 ## Review Focus
 
@@ -754,7 +756,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `Broker.order_fills`/SimBroker (Task 1, tests only), models and `repo.unsettled_orders`/`insert_order(exit_reason=)` (Task 2), tuple builds (Task 3), `check_edge`, `CycleState`, `CycleTransitioned` from `core/cycle.py`, `repo.transition_cycle`, `repo.cycle_state`, `PAUSED_KEY` from `core/kill.py`.
 - Produces (`risk/types.py`): `OrderUpdate(order_row_id: int, status: str, filled_qty: Dec, fills: tuple[Fill, ...] = (), min_qty: Dec | None = None)`; `SyncResult(updates: tuple[OrderUpdate, ...] = (), failed: tuple[int, ...] = ())` with property `complete: bool`; `class SyncIncomplete(RuntimeError)`.
-- Produces (`core/ledger.py`): `Ledger(bus: EventBus, sessions: async_sessionmaker[AsyncSession], *, clock: Callable[[], datetime] = ...)` with `async apply(update: OrderUpdate) -> Outcome` and `async apply_all(result: SyncResult) -> None` (the sell side and the per-symbol ordering are completed in Task 5); events `FillsApplied`, `OrderSettled`, `DustLeft`, `LedgerAnomaly`; `Outcome = Literal["applied", "noop", "deferred", "anomaly"]`; `FINAL`; module helpers `_norm`, `_cash_effect`, `_verify`.
+- Produces (`core/ledger.py`): `Ledger(bus: EventBus, sessions: async_sessionmaker[AsyncSession], *, clock: Callable[[], datetime] = ...)` with `async apply(update: OrderUpdate) -> Outcome` and `async apply_all(result: SyncResult) -> None` (the sell side and the per-symbol ordering are completed in Task 5); events (all subclasses of `LedgerEvent`, which carries `unit_id: str`) `FillsApplied`, `OrderSettled`, `DustLeft`, `LedgerAnomaly`; `Outcome = Literal["applied", "noop", "deferred", "anomaly"]`; `FINAL`; module helpers `_norm`, `_cash_effect`, `_verify`.
 
 - [ ] **Step 1: Types** (no test of their own; exercised below)
 
@@ -809,7 +811,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from autotrader.broker.base import AssetRules, BrokerOrder, FeeSchedule
 from autotrader.broker.sim import FillPlan, SimBroker
-from autotrader.core.bus import EventBus
+from autotrader.core.bus import CommitUncertain, DomainEvent, EventBus
 from autotrader.core.config import load_profile
 from autotrader.core.kill import PAUSED_KEY
 from autotrader.core.ledger import Ledger
@@ -818,6 +820,7 @@ from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
 from autotrader.risk.types import OrderUpdate, SyncResult
+from tests.dbhooks import CommitHook, hooked_sessionmaker
 
 REPO = Path(__file__).resolve().parents[3]
 PROFILE = load_profile(REPO / "strategies" / "fast_momentum_v1.yaml")
@@ -1324,6 +1327,78 @@ async def test_a_new_fill_on_a_settled_order_is_an_anomaly_and_a_stale_update_a_
     late = once.fills[0].model_copy(update={"fill_id": "late"})
     assert await ledger.apply(once.model_copy(update={"fills": (*once.fills, late)})) == "anomaly"
     assert anomaly_kind(await event_rows(sessions)) == "fill_after_settle"
+
+
+# --- commit verification (PR #25 review) ---------------------------------------------------
+
+
+@pytest.fixture
+def hook() -> CommitHook:
+    return CommitHook()
+
+
+@pytest.fixture
+async def hooked(
+    db_url: str, hook: CommitHook
+) -> AsyncIterator[tuple[Ledger, list[DomainEvent], EventBus]]:
+    """A ledger whose commits go through `hook`, and every event its bus delivers."""
+    engine = make_engine(db_url)
+    hooked_sessions = hooked_sessionmaker(engine, hook)
+    hbus = EventBus(hooked_sessions)
+    delivered: list[DomainEvent] = []
+
+    async def collect(event: DomainEvent) -> None:
+        delivered.append(event)
+
+    hbus.subscribe(DomainEvent, collect)
+    yield Ledger(hbus, hooked_sessions, clock=lambda: T0), delivered, hbus
+    await hbus.close()
+    await engine.dispose()
+
+
+async def test_an_older_pause_never_confirms_an_anomaly_whose_commit_failed(
+    sessions: async_sessionmaker[AsyncSession],
+    hooked: tuple[Ledger, list[DomainEvent], EventBus],
+    hook: CommitHook,
+) -> None:
+    ledger, delivered, hbus = hooked
+    sim = make_sim()
+    sim.script(BTC, "buy", FillPlan((D("0.5"),)))
+    row, oid = await place(sessions, sim, "buy", "1")
+    sim.process_bar(bar(1))
+    first = await update(sim, row, oid)
+    assert await ledger.apply(first) == "applied"
+    async with sessions() as s:
+        await repo.set_control(s, PAUSED_KEY, True)  # an earlier incident
+    await hbus.drain()
+    delivered.clear()
+    changed = (first.fills[0].model_copy(update={"price": D("101")}),)
+    hook.fail_before = 1  # the anomaly unit's commit fails without committing
+
+    with pytest.raises(CommitUncertain):
+        await ledger.apply(first.model_copy(update={"fills": changed}))
+    await hbus.drain()
+    assert "LedgerAnomaly" not in await event_types(sessions)
+    assert delivered == []
+
+
+async def test_a_lost_ack_on_a_committed_unit_delivers_all_its_events_once(
+    sessions: async_sessionmaker[AsyncSession],
+    hooked: tuple[Ledger, list[DomainEvent], EventBus],
+    hook: CommitHook,
+) -> None:
+    ledger, delivered, hbus = hooked
+    sim = make_sim()
+    cycle = await new_cycle(sessions)
+    row, oid = await place(sessions, sim, "buy", "1", cycle_id=cycle)
+    sim.process_bar(bar(1))
+    hook.fail_after = 1  # the unit commits, then the acknowledgement is lost
+
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"
+    await hbus.drain()
+    assert [type(e).__name__ for e in delivered] == ["OrderSettled", "CycleTransitioned"]
+    assert await event_types(sessions) == ["OrderSettled", "CycleTransitioned"]
+    assert await cycle_state(sessions, cycle) == "FILLED"
 ```
 
 
@@ -1361,8 +1436,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Literal
+from uuid import uuid4
 
 import structlog
+from pydantic import Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -1372,6 +1449,7 @@ from autotrader.core.cycle import CycleState, CycleTransitioned, check_edge
 from autotrader.core.kill import PAUSED_KEY
 from autotrader.journal import repo
 from autotrader.journal.models import ControlState, Order, Position, RiskDecision, SymbolDust
+from autotrader.journal.models import Event as EventRow
 from autotrader.journal.models import Fill as FillRow
 from autotrader.risk.types import OrderUpdate, SyncResult
 
@@ -1382,12 +1460,25 @@ _RANK = {"new": 1, "partially_filled": 2}  # pending / unknown: 0, final: 3
 _D0 = Decimal(0)
 
 AnomalyKind = Literal[
-    "fill_mismatch", "overfilled", "fill_after_settle", "sell_without_position", "oversell"
+    "fill_mismatch",
+    "overfilled",
+    "fill_after_settle",
+    "sell_without_position",
+    "oversell",
+    "ambiguous_position",
 ]
 Outcome = Literal["applied", "noop", "deferred", "anomaly"]
 
 
-class FillsApplied(DomainEvent):
+class LedgerEvent(DomainEvent):
+    """Every ledger event carries the identity of the unit that wrote it: after a commit
+    error, `_verify` looks for this exact event in the journal (a shared flag such as
+    `paused`, or a timestamp, cannot prove that this unit committed)."""
+
+    unit_id: str = Field(default_factory=lambda: uuid4().hex)
+
+
+class FillsApplied(LedgerEvent):
     """Fills or a status change of one order were booked; the order is not settled yet."""
 
     order_row_id: int
@@ -1404,14 +1495,14 @@ class OrderSettled(FillsApplied):
     settled: bool = True
 
 
-class DustLeft(DomainEvent):
+class DustLeft(LedgerEvent):
     symbol: str
     position_id: int
     dust_qty: Decimal
     min_qty: Decimal
 
 
-class LedgerAnomaly(DomainEvent):
+class LedgerAnomaly(LedgerEvent):
     kind: AnomalyKind
     order_row_id: int
     detail: str
@@ -1473,18 +1564,16 @@ def _same(row: FillRow, fill: Fill) -> bool:
 
 
 async def _verify(session: AsyncSession, event: DomainEvent) -> bool:
-    """Read-back after a commit error (D15): did this unit's writes land?"""
-    if isinstance(event, FillsApplied):
-        order = await session.get(Order, event.order_row_id)
-        return (
-            order is not None
-            and order.filled_qty == event.filled_qty
-            and order.status == event.status
-            and (order.settled_at is not None) == event.settled
+    """Read-back after a commit error (D15): is this unit's own head event in the journal?
+    It commits atomically with the unit's rows, so finding it proves the whole unit."""
+    if not isinstance(event, LedgerEvent):
+        raise TypeError(f"cannot verify {type(event).__name__}")
+    payloads = await session.scalars(
+        select(EventRow.payload).where(
+            EventRow.type == type(event).__name__, EventRow.ts == event.ts
         )
-    if isinstance(event, LedgerAnomaly):
-        return bool(await repo.get_control(session, PAUSED_KEY) is True)
-    raise TypeError(f"cannot verify {type(event).__name__}")
+    )
+    return any(p.get("unit_id") == event.unit_id for p in payloads)
 
 
 async def _initial_risk(session: AsyncSession, cycle_id: int | None) -> Decimal | None:
@@ -2150,6 +2239,40 @@ async def test_a_sell_without_a_position_waits_for_an_earlier_unsettled_order(
     )
     assert await ledger.apply(lone) == "deferred"
     assert not await paused(sessions)
+
+
+async def test_a_sell_with_two_open_positions_is_ambiguous_and_books_nothing(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    async with sessions() as s:  # check() never admits this; the ledger must not guess
+        for qty in ("0.00005", "1"):
+            s.add(
+                m.Position(
+                    symbol=BTC,
+                    side="long",
+                    qty=D(qty),
+                    entry_price=D("100"),
+                    opened_at=T0,
+                    fees=D(0),
+                    dust_consumed=D(0),
+                )
+            )
+        await s.commit()
+    row = await _sell_row(sessions)
+    small = _sell_fill("x:1").model_copy(update={"qty": D("0.00001")})
+    update_ = OrderUpdate(
+        order_row_id=row,
+        status="partially_filled",
+        filled_qty=D("0.00001"),
+        fills=(small,),
+        min_qty=RULES.min_qty,
+    )
+
+    assert await ledger.apply(update_) == "anomaly"
+    assert anomaly_kind(await event_rows(sessions)) == "ambiguous_position"
+    assert [p.qty for p in await positions(sessions)] == [D("0.00005"), D("1")]
+    (order,) = await orders(sessions)
+    assert (order.position_id, order.filled_qty) == (None, D(0))
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -2172,12 +2295,20 @@ Expected: the new exit tests FAIL with `NotImplementedError: sell fills are book
         earlier trades, resolved only once every earlier order on the symbol is settled
         (spec 4.3): until then the whole update is deferred, never an anomaly."""
         if position is None:
-            position = await session.scalar(
-                select(Position)
-                .where(Position.symbol == order.symbol, Position.closed_at.is_(None))
-                .order_by(Position.id)
-                .limit(1)
+            # Never "the oldest open one": check() keeps one open journal trade per symbol,
+            # so more than one is a contradiction, not a choice (PR #25 review).
+            candidates = list(
+                await session.scalars(
+                    select(Position).where(
+                        Position.symbol == order.symbol, Position.closed_at.is_(None)
+                    )
+                )
             )
+            if len(candidates) > 1:
+                raise _Anomaly(
+                    "ambiguous_position", f"{len(candidates)} open {order.symbol} positions"
+                )
+            position = candidates[0] if candidates else None
             if position is None:
                 if await _earlier_unsettled(session, order):
                     raise _Deferred("no open position yet; an earlier order is unsettled")
@@ -2353,6 +2484,24 @@ async def test_the_tolerance_is_a_cent_per_fill(
     truncated = Account(equity=D("999.74"), cash=D("899.74"))  # one fill: 0.01 allowed
     assert await check(ledger, truncated) == "ok"
     assert await check(ledger, Account(equity=D("999.72"), cash=D("899.72"))) == "discrepancy"
+
+
+async def test_a_baseline_at_the_same_timestamp_never_confirms_a_failed_cash_check(
+    sessions: async_sessionmaker[AsyncSession],
+    hooked: tuple[Ledger, list[DomainEvent], EventBus],
+    hook: CommitHook,
+) -> None:
+    ledger, delivered, hbus = hooked
+    sim = make_sim()
+    guard = await ledger.cash_guard()
+    assert await ledger.check_cash(await sim.get_account(), guard) == "baseline"  # ts T0
+    hook.fail_before = 1
+
+    with pytest.raises(CommitUncertain):
+        await ledger.check_cash(await sim.get_account(), await ledger.cash_guard())
+    await hbus.drain()
+    assert await event_types(sessions) == ["CashChecked"]  # only the first one
+    assert [type(e).__name__ for e in delivered] == ["CashChecked"]
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -2373,14 +2522,14 @@ CashResult = Literal["baseline", "ok", "discrepancy", "skipped"]
 After `LedgerAnomaly`:
 
 ```python
-class CashChecked(DomainEvent):
+class CashChecked(LedgerEvent):
     result: Literal["baseline", "ok"]
     expected: Decimal | None
     actual: Decimal
     n_fills: int
 
 
-class CashDiscrepancy(DomainEvent):
+class CashDiscrepancy(LedgerEvent):
     expected: Decimal
     actual: Decimal
     diff: Decimal
@@ -2405,13 +2554,7 @@ async def _guard(session: AsyncSession) -> CashGuard:
     return CashGuard((last_order or 0, last_fill or 0), bool(open_orders))
 ```
 
-Extend `_Unit` with `result: CashResult = "skipped"` and `_verify` with (before the final `raise`):
-
-```python
-    if isinstance(event, CashChecked | CashDiscrepancy):
-        baseline = await repo.get_control(session, CASH_CHECK_KEY)
-        return isinstance(baseline, dict) and baseline.get("ts") == event.ts.isoformat()
-```
+Extend `_Unit` with `result: CashResult = "skipped"`. `_verify` needs no change: the cash events are `LedgerEvent`s, verified by their own `unit_id` (a baseline timestamp is not unique per unit).
 
 Add to `Ledger`:
 
@@ -2520,7 +2663,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `SyncResult`, `OrderUpdate`, `SyncIncomplete` (Task 4), `Ledger` (Tasks 4-6), `Broker.order_fills`, `DustRemainder` (Task 1), `repo.unsettled_orders`, `insert_order(exit_reason=)` (Task 2).
-- Produces: `RiskEngine(..., ledger: Accounting, ...)` (keyword, required); `class Accounting(Protocol): async def apply_all(self, result: SyncResult) -> None`; `RiskEngine.sync_orders() -> SyncResult`; `OrderResult.dust: bool = False`; `RiskEngine.snapshot_equity() -> Account`; `repo.open_entry_orders` returns unsettled buy rows.
+- Produces: `RiskEngine(..., ledger: Accounting, ...)` (keyword, required); `check()` reserves every symbol with an open journal position (`OpenEntry` notional 0); `class Accounting(Protocol): async def apply_all(self, result: SyncResult) -> None`; `RiskEngine.sync_orders() -> SyncResult`; `OrderResult.dust: bool = False`; `RiskEngine.snapshot_equity() -> Account`; `repo.open_entry_orders` returns unsettled buy rows.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2562,6 +2705,7 @@ async def test_a_partially_filled_entry_reserves_only_its_remainder(
     await engine.check(intent(await new_cycle(sessions)))
     assert seen[-1].open_entries == (
         OpenEntry(symbol=BTC, notional=(D("2.997") - D("1.4985")) * D("100.10")),
+        OpenEntry(symbol=BTC, notional=D(0)),  # the open journal trade (booked fill)
     )
 
 
@@ -2697,6 +2841,28 @@ async def test_a_dust_close_is_reported_as_dust(
     assert (row.status, row.exit_reason) == ("rejected", "kill")
 
 
+async def test_an_open_journal_trade_blocks_its_symbol_even_on_broker_dust(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    # PR #25 review: a trade kept open by a lagging exit while the broker holds only dust
+    # (which check 5 ignores) must still block a second trade on the symbol.
+    async with sessions() as s:
+        s.add(
+            m.Position(
+                symbol=BTC,
+                side="long",
+                qty=D("0.00005"),
+                entry_price=D("100"),
+                opened_at=NOW,
+                fees=D(0),
+                dust_consumed=D(0),
+            )
+        )
+        await s.commit()
+    result = await make_engine_(sim, sessions, gate).check(intent(cycle_id))
+    assert "already has a position or open entry" in result.decision.reasons[0]
+
+
 async def test_snapshot_equity_returns_the_account_it_read(
     sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
 ) -> None:
@@ -2802,6 +2968,10 @@ with
             raise SyncIncomplete(f"order rows not synced: {list(synced.failed)}")
         async with self._sessions() as session:
             open_rows = await repo.open_entry_orders(session)
+            # One open journal trade per symbol (PR #25 review): a trade stays open (e.g.
+            # an exit whose status lags) even when the broker holds only dust, which
+            # check 5 ignores.
+            journal_open = await repo.open_position_symbols(session)
         broker_filled = {u.order_row_id: u.filled_qty for u in synced.updates}
 ```
 
@@ -2821,7 +2991,8 @@ and the `open_entries=` argument with
                     * (o.limit_price or Decimal(0)),
                 )
                 for o in open_rows
-            ),
+            )
+            + tuple(OpenEntry(symbol=s, notional=Decimal(0)) for s in sorted(journal_open)),
 ```
 
 Replace `_refresh_open_entries` with:
