@@ -204,7 +204,7 @@ class RiskEngine:
                 session, day_start(now, self._tz), inclusive=True
             )
             baseline = await repo.day_start_equity(session, day_start(now, self._tz))
-            # Re-read: the snapshot task may have committed a higher peak while this check
+            # Re-read: the snapshot loop may have committed a higher peak while this check
             # awaited positions/rules; the decision uses the max of both durable reads.
             late_hwm = await repo.max_hwm(session)
             trades_n, wins = await repo.strategy_trade_stats(session, self._strategy_id)
@@ -414,7 +414,7 @@ class RiskEngine:
     # --- equity snapshots ------------------------------------------------------------
 
     async def snapshot_equity(self) -> None:
-        """Called every 60 s by `run core`'s background snapshot task. Its broker calls
+        """Called every 60 s by `run core`'s supervised `risk.snapshot` loop. Its broker calls
         have their own `io_timeout_s` budget; journal writes are never cancelled.
         Lock-free on purpose: it must never delay an exit."""
         deadline = self._monotonic() + self._io_timeout  # its own budget; no lock shared
