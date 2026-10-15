@@ -1,7 +1,8 @@
 """Cycle Runner on a real RiskEngine + SimBroker (WP 1.4; spec §10).
 
 SimBroker acks every accepted order `new` (fills happen on a later bar), so an approved
-cycle ends in SUBMITTED here; completing it is WP 1.5's reconciliation.
+cycle ends in SUBMITTED here unless a test syncs: the ledger (WP 1.5b) completes the cycle
+from the entry order's outcome when `check()` syncs orders.
 """
 
 import asyncio
