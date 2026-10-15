@@ -5,17 +5,19 @@ never mistakes an unimplemented `kill` or `flatten` for a successful one.
 """
 
 import asyncio
-import signal
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import Annotated, Any, NoReturn
 
 import typer
 
 from autotrader.broker.alpaca import AlpacaBroker
 from autotrader.broker.alpaca_data import AlpacaBarSource
+from autotrader.core import lock as journal_lock
 from autotrader.core import runtime as core_runtime
+from autotrader.core import shutdown
 from autotrader.core.bus import EventBus
 from autotrader.core.config import (
     AppConfig,
@@ -27,6 +29,15 @@ from autotrader.core.config import (
 )
 from autotrader.core.kill import ClearResult, clear_kill, record_kill, write_kill_file
 from autotrader.core.logging import configure_logging
+from autotrader.core.shutdown import (
+    EXIT_FAILED,
+    EXIT_HARD,
+    ShutdownControl,
+    SignalHandler,
+    Watchdog,
+    install_signal_handlers,
+    make_signal_handler,
+)
 from autotrader.journal import db
 
 app = typer.Typer(help="Automated, agent-based crypto trading PoC.", no_args_is_help=True)
@@ -69,31 +80,59 @@ def run_core(config: ConfigOption = Path("config.yaml")) -> None:
     except ConfigError as e:
         typer.echo(f"invalid config: {e}", err=True)
         raise typer.Exit(code=1) from None
-    db.upgrade(cfg.database.url)
-    source = AlpacaBarSource.from_settings(settings, list(profile.universe))
-    asyncio.run(_run_core_until_signal(cfg, settings, profile, cfg.strategy.read_text(), source))
+    raise typer.Exit(code=_run_core_process(cfg, settings, profile))
 
 
-async def _run_core_until_signal(
+def _run_core_process(
     cfg: AppConfig,
     settings: Settings,
     profile: StrategyProfile,
-    profile_yaml: str,
-    source: AlpacaBarSource,
-) -> None:
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
-    await core_runtime.run_core(
-        cfg,
-        settings,
-        profile,
-        profile_yaml,
-        source=source,
-        connect_broker=AlpacaBroker.connect,
-        stop=stop,
-    )
+    *,
+    watchdog: Watchdog | None = None,
+    install: Callable[[SignalHandler], None] = install_signal_handlers,
+    upgrade: Callable[[str], None] = db.upgrade,
+    make_source: Callable[[Settings, list[str]], Any] = AlpacaBarSource.from_settings,
+    run: Callable[[Coroutine[Any, Any, int]], int] = asyncio.run,
+    acquire: Callable[..., journal_lock.JournalLock] = journal_lock.acquire,
+) -> int:
+    """WP 1.5a ownership and shutdown boundary (spec 2026-10-14 sections 2 and 4).
+
+    The journal lock comes first, before the migration; the signal handlers right after it.
+    The lock is never released here: process exit releases it. The watchdog, once armed, is
+    never cancelled: a daemon thread doesn't delay a normal exit, and it still ends the
+    process if the interpreter's exit hangs on a left-behind non-daemon thread."""
+    timeout_s = cfg.shutdown.timeout_s
+    try:
+        lock = acquire(cfg.database.url, wait_s=timeout_s + shutdown.WATCHDOG_GRACE_S)
+    except journal_lock.JournalLockError as e:
+        typer.echo(f"cannot start: {e}", err=True)
+        return EXIT_FAILED
+    except KeyboardInterrupt:  # Ctrl-C while waiting: nothing is owned yet, exit quietly
+        typer.echo("interrupted while waiting for the journal lock", err=True)
+        return EXIT_HARD
+    dog = watchdog if watchdog is not None else Watchdog()
+    control = ShutdownControl(timeout_s, arm_watchdog=dog.arm)
+    install(make_signal_handler(control))
+    try:
+        upgrade(lock.url)
+        source = make_source(settings, list(profile.universe))
+        code = run(
+            core_runtime.run_core(
+                cfg,
+                settings,
+                profile,
+                cfg.strategy.read_text(),
+                source=source,
+                connect_broker=AlpacaBroker.connect,
+                lock=lock,
+                control=control,
+            )
+        )
+    except Exception as e:
+        control.begin("startup_failure")  # no-op if teardown already began
+        typer.echo(f"run core failed: {type(e).__name__}: {e}", err=True)
+        code = EXIT_FAILED
+    return code
 
 
 @run_app.command("api")

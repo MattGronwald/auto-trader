@@ -1,9 +1,18 @@
+import io
+import subprocess
+import sys
+from collections.abc import Callable, Coroutine
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
 
-from autotrader.cli import app
+from autotrader.cli import _run_core_process, app
+from autotrader.core import lock as journal_lock
+from autotrader.core.config import Settings, load_config, load_profile
+from autotrader.core.logging import configure_logging
+from autotrader.core.shutdown import Watchdog
 
 runner = CliRunner()
 REPO = Path(__file__).resolve().parents[2]
@@ -225,3 +234,177 @@ def test_run_core_with_invalid_config_exits_1(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "invalid config" in result.output
+
+
+HOLD = """
+import sys
+from autotrader.core.lock import acquire
+lock = acquire(sys.argv[1], wait_s=0)
+print("held", flush=True)
+sys.stdin.readline()
+"""
+
+
+class Spy:
+    def __init__(self, result: Any = None) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.result = result
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append(args)
+        return self.result
+
+
+class FakeTimer:
+    def __init__(self, seconds: float, fn: Callable[[], None]) -> None:
+        self.seconds = seconds
+        self.daemon = False
+        self.started = False
+
+    def start(self) -> None:
+        self.started = True
+
+
+class Locks:
+    """Real acquire, released when the test ends (production never releases early)."""
+
+    def __init__(self) -> None:
+        self.held: list[journal_lock.JournalLock] = []
+
+    def __call__(self, url: str, **kwargs: Any) -> journal_lock.JournalLock:
+        self.held.append(journal_lock.acquire(url, **kwargs))
+        return self.held[-1]
+
+    def release(self) -> None:
+        for held in self.held:
+            held.release()
+
+
+def _fast_config(tmp_path: Path) -> Path:
+    path = _tmp_config(tmp_path)
+    path.write_text(path.read_text().replace("timeout_s: 30", "timeout_s: 0.1"))
+    return path
+
+
+def test_losing_core_never_migrates_or_opens_the_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("autotrader.core.shutdown.WATCHDOG_GRACE_S", 0.0)
+    cfg = load_config(_fast_config(tmp_path), Settings(_env_file=None))
+    proc = subprocess.Popen(  # noqa: S603  (fixed argv: this interpreter + a constant script)
+        [sys.executable, "-c", HOLD, cfg.database.url],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None and proc.stdin is not None
+    assert proc.stdout.readline().strip() == "held"
+    upgrade, make_source, run = Spy(), Spy(), Spy(0)
+    try:
+        code = _run_core_process(
+            cfg,
+            Settings(_env_file=None),
+            load_profile(cfg.strategy),
+            install=Spy(),
+            upgrade=upgrade,
+            make_source=make_source,
+            run=run,
+        )
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=10)
+        proc.stdout.close()
+    assert code == 1
+    assert upgrade.calls == [] and make_source.calls == [] and run.calls == []
+
+
+def test_signal_during_migration_arms_the_watchdog_and_skips_startup(tmp_path: Path) -> None:
+    configure_logging(stream=io.StringIO())  # an earlier CliRunner test left a closed stdout
+    cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
+    locks = Locks()
+    timers: list[FakeTimer] = []
+    handlers: list[Any] = []
+
+    def factory(seconds: float, fn: Callable[[], None]) -> FakeTimer:
+        timers.append(FakeTimer(seconds, fn))
+        return timers[-1]
+
+    def upgrade(url: str) -> None:
+        from autotrader.journal import db
+
+        db.upgrade(url)
+        handlers[0](2, None)  # SIGINT arrives during the migration
+
+    class Source:
+        stopped = False
+
+        async def stop(self) -> None:
+            Source.stopped = True
+
+    code = _run_core_process(
+        cfg,
+        Settings(_env_file=None),
+        load_profile(cfg.strategy),
+        watchdog=Watchdog(timer_factory=factory, exit=Spy()),
+        install=handlers.append,
+        upgrade=upgrade,
+        make_source=lambda settings, symbols: Source(),
+        acquire=locks,
+    )
+    locks.release()
+
+    assert code == 0
+    assert timers and timers[0].started and timers[0].seconds == 34.5  # exit by T + 5 = 35
+    assert Source.stopped
+
+
+def test_failure_inside_run_exits_1_and_leaves_the_watchdog_armed(tmp_path: Path) -> None:
+    cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
+    locks = Locks()
+    timers: list[FakeTimer] = []
+    order: list[str] = []
+
+    def factory(seconds: float, fn: Callable[[], None]) -> FakeTimer:
+        timers.append(FakeTimer(seconds, fn))
+        return timers[-1]
+
+    def run(coro: Coroutine[Any, Any, int]) -> int:
+        coro.close()
+        order.append("run")
+        raise RuntimeError("stream died")
+
+    code = _run_core_process(
+        cfg,
+        Settings(_env_file=None),
+        load_profile(cfg.strategy),
+        watchdog=Watchdog(timer_factory=factory, exit=Spy()),
+        install=Spy(),
+        upgrade=Spy(),
+        make_source=Spy(),
+        run=run,
+        acquire=locks,
+    )
+    locks.release()
+
+    assert code == 1
+    assert order == ["run"]
+    assert len(timers) == 1 and timers[0].started  # armed for the exit; never cancelled
+
+
+def test_ctrl_c_while_waiting_for_the_lock_exits_130(tmp_path: Path) -> None:
+    cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
+    upgrade = Spy()
+
+    def interrupted(url: str, **kwargs: Any) -> Any:
+        raise KeyboardInterrupt
+
+    code = _run_core_process(
+        cfg,
+        Settings(_env_file=None),
+        load_profile(cfg.strategy),
+        install=Spy(),
+        upgrade=upgrade,
+        acquire=interrupted,
+    )
+
+    assert code == 130 and upgrade.calls == []
