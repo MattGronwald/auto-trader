@@ -12,12 +12,12 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from autotrader.broker.base import AssetRules, BrokerOrder, FeeSchedule, Fill
+from autotrader.broker.base import Account, AssetRules, BrokerOrder, FeeSchedule, Fill
 from autotrader.broker.sim import FillPlan, SimBroker
 from autotrader.core.bus import CommitUncertain, DomainEvent, EventBus
 from autotrader.core.config import load_profile
 from autotrader.core.kill import PAUSED_KEY
-from autotrader.core.ledger import Ledger
+from autotrader.core.ledger import CASH_CHECK_KEY, Ledger
 from autotrader.core.types import Bar
 from autotrader.journal import models as m
 from autotrader.journal import repo
@@ -977,3 +977,115 @@ async def test_a_sell_with_two_open_positions_is_ambiguous_and_books_nothing(
     assert [p.qty for p in await positions(sessions)] == [D("0.00005"), D("1")]
     (order,) = await orders(sessions)
     assert (order.position_id, order.filled_qty) == (None, D(0))
+
+
+# --- cash check (D17, spec 4.6) -----------------------------------------------------------
+
+
+async def baseline_of(sessions: async_sessionmaker[AsyncSession]) -> dict[str, object]:
+    async with sessions() as s:
+        value = await repo.get_control(s, CASH_CHECK_KEY)
+    assert isinstance(value, dict)
+    return value
+
+
+async def check(ledger: Ledger, account: Account) -> str:
+    return await ledger.check_cash(account, await ledger.cash_guard())
+
+
+async def test_the_first_check_only_records_a_baseline(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    assert await check(ledger, await sim.get_account()) == "baseline"
+    baseline = await baseline_of(sessions)
+    assert (baseline["cash"], baseline["fill_watermark"]) == ("1000", 0)
+    assert await event_types(sessions) == ["CashChecked"]
+
+
+async def test_cash_explained_by_booked_fills_is_ok(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    assert await check(ledger, await sim.get_account()) == "baseline"
+    row, oid = await place(sessions, sim, "buy", "1")
+    sim.process_bar(bar(1))
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"
+
+    assert await check(ledger, await sim.get_account()) == "ok"
+    assert not await paused(sessions)
+    assert (await baseline_of(sessions))["cash"] == "899.75"
+
+
+async def test_an_unexplained_change_pauses_once_and_rebaselines(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    assert await check(ledger, await sim.get_account()) == "baseline"
+    sim.cash -= D("19.84")  # the unexplained paper drop of 2026-10-14
+
+    assert await check(ledger, await sim.get_account()) == "discrepancy"
+    assert await paused(sessions)
+    (event,) = [e for e in await event_rows(sessions) if e.type == "CashDiscrepancy"]
+    assert (event.payload["diff"], event.payload["n_fills"]) == ("-19.84", 0)
+    assert await check(ledger, await sim.get_account()) == "ok"  # measured from the new cash
+
+
+async def test_the_check_skips_while_an_order_is_unsettled(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    assert await check(ledger, await sim.get_account()) == "baseline"
+    before = await baseline_of(sessions)
+    await place(sessions, sim, "buy", "1")  # unsettled until booked
+
+    assert await check(ledger, await sim.get_account()) == "skipped"
+    assert await baseline_of(sessions) == before
+
+
+async def test_an_order_settled_between_guard_and_check_skips_the_check(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    assert await check(ledger, await sim.get_account()) == "baseline"
+    guard = await ledger.cash_guard()
+    account = await sim.get_account()  # cash 1000
+    row, oid = await place(sessions, sim, "buy", "1")  # submitted, filled and settled
+    sim.process_bar(bar(1))
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"
+
+    assert await ledger.check_cash(account, guard) == "skipped"  # not a false incident
+    assert not await paused(sessions)
+    assert await check(ledger, await sim.get_account()) == "ok"
+
+
+async def test_the_tolerance_is_a_cent_per_fill(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    assert await check(ledger, await sim.get_account()) == "baseline"
+    row, oid = await place(sessions, sim, "buy", "1")
+    sim.process_bar(bar(1))
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"  # expected 899.75
+
+    truncated = Account(equity=D("999.74"), cash=D("899.74"))  # one fill: 0.01 allowed
+    assert await check(ledger, truncated) == "ok"
+    assert await check(ledger, Account(equity=D("999.72"), cash=D("899.72"))) == "discrepancy"
+
+
+async def test_a_baseline_at_the_same_timestamp_never_confirms_a_failed_cash_check(
+    sessions: async_sessionmaker[AsyncSession],
+    hooked: tuple[Ledger, list[DomainEvent], EventBus],
+    hook: CommitHook,
+) -> None:
+    ledger, delivered, hbus = hooked
+    sim = make_sim()
+    guard = await ledger.cash_guard()
+    assert await ledger.check_cash(await sim.get_account(), guard) == "baseline"  # ts T0
+    hook.fail_before = 1
+
+    with pytest.raises(CommitUncertain):
+        await ledger.check_cash(await sim.get_account(), await ledger.cash_guard())
+    await hbus.drain()
+    assert await event_types(sessions) == ["CashChecked"]  # only the first one
+    assert [type(e).__name__ for e in delivered] == ["CashChecked"]

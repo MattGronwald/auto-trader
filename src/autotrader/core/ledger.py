@@ -29,7 +29,7 @@ from pydantic import Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from autotrader.broker.base import Fill
+from autotrader.broker.base import Account, Fill
 from autotrader.core.bus import DomainEvent, EventBus
 from autotrader.core.cycle import CycleState, CycleTransitioned, check_edge
 from autotrader.core.kill import PAUSED_KEY
@@ -44,6 +44,9 @@ log = structlog.get_logger(__name__)
 FINAL = frozenset({"filled", "canceled", "rejected", "not_submitted"})
 _RANK = {"new": 1, "partially_filled": 2}  # pending / unknown: 0, final: 3
 _D0 = Decimal(0)
+CASH_CHECK_KEY = "cash_check"
+CENT = Decimal("0.01")
+CashResult = Literal["baseline", "ok", "discrepancy", "skipped"]
 
 AnomalyKind = Literal[
     "fill_mismatch",
@@ -94,6 +97,38 @@ class LedgerAnomaly(LedgerEvent):
     detail: str
 
 
+class CashChecked(LedgerEvent):
+    result: Literal["baseline", "ok"]
+    expected: Decimal | None
+    actual: Decimal
+    n_fills: int
+
+
+class CashDiscrepancy(LedgerEvent):
+    expected: Decimal
+    actual: Decimal
+    diff: Decimal
+    n_fills: int
+    baseline_ts: str
+
+
+@dataclass(frozen=True)
+class CashGuard:
+    """The order/fill generation and whether any order was unsettled at one read (4.6)."""
+
+    generation: tuple[int, int]
+    unsettled: bool
+
+
+async def _guard(session: AsyncSession) -> CashGuard:
+    last_order = await session.scalar(select(func.max(Order.id)))
+    last_fill = await session.scalar(select(func.max(FillRow.id)))
+    open_orders = await session.scalar(
+        select(func.count()).select_from(Order).where(Order.settled_at.is_(None))
+    )
+    return CashGuard((last_order or 0, last_fill or 0), bool(open_orders))
+
+
 class _Deferred(Exception):
     """Not an error: the update waits for earlier history on its symbol (spec 4.3)."""
 
@@ -111,6 +146,7 @@ class _Unit:
 
     error: _Deferred | _Anomaly | None = None
     cycle_id: int | None = None
+    result: CashResult = "skipped"
 
 
 def _rank(status: str) -> int:
@@ -523,3 +559,72 @@ class Ledger:
             return event
 
         await self._bus.publish_tx(build, _verify)
+
+    # --- cash (D17) ----------------------------------------------------------------------
+
+    async def cash_guard(self) -> CashGuard:
+        """Read BEFORE the account read and pass it to `check_cash`."""
+        async with self._sessions() as session:
+            return await _guard(session)
+
+    async def check_cash(self, account: Account, guard: CashGuard) -> CashResult:
+        """Compare broker cash with the cash effects of fills booked since the baseline
+        (spec 4.6). Compares only if the generation is unchanged from `guard` to the
+        re-read inside this unit and no order was unsettled at either read: an order that
+        came and went in between still changed `max(orders.id)`. Outside the tolerance:
+        manual pause, `CashDiscrepancy`, re-baseline (alert once, nothing absorbed)."""
+        now = self._clock()
+        unit = _Unit()
+
+        async def build(session: AsyncSession) -> DomainEvent | None:
+            again = await _guard(session)
+            if guard.unsettled or again.unsettled or again.generation != guard.generation:
+                return None
+            baseline = await repo.get_control(session, CASH_CHECK_KEY)
+            await session.merge(
+                ControlState(
+                    key=CASH_CHECK_KEY,
+                    value={
+                        "cash": str(_norm(account.cash)),
+                        "fill_watermark": again.generation[1],
+                        "ts": now.isoformat(),
+                    },
+                )
+            )
+            if baseline is None:
+                unit.result = "baseline"
+                return CashChecked(
+                    ts=now, result="baseline", expected=None, actual=account.cash, n_fills=0
+                )
+            rows = list(
+                await session.scalars(
+                    select(FillRow).where(FillRow.id > int(baseline["fill_watermark"]))
+                )
+            )
+            expected = Decimal(baseline["cash"]) + sum((_cash_effect(r) for r in rows), _D0)
+            diff = account.cash - expected
+            if abs(diff) <= max(CENT, CENT * len(rows)):
+                unit.result = "ok"
+                return CashChecked(
+                    ts=now, result="ok", expected=expected, actual=account.cash, n_fills=len(rows)
+                )
+            await session.merge(ControlState(key=PAUSED_KEY, value=True))
+            unit.result = "discrepancy"
+            log.error(
+                "ledger.cash_discrepancy",
+                expected=str(expected),
+                actual=str(account.cash),
+                diff=str(diff),
+                n_fills=len(rows),
+            )
+            return CashDiscrepancy(
+                ts=now,
+                expected=expected,
+                actual=account.cash,
+                diff=diff,
+                n_fills=len(rows),
+                baseline_ts=str(baseline["ts"]),
+            )
+
+        await self._bus.publish_tx(build, _verify)
+        return unit.result
