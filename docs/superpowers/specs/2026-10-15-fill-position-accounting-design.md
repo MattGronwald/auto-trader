@@ -9,6 +9,8 @@ Revised 2026-10-15 after the first Codex review (PR #24), owner go:
 - a position closes only once its entry order is settled; updates are applied per symbol in order-row id order, and a missing earlier update defers the later ones;
 - carried dust is a durable per-symbol balance that a later oversell consumes; an oversell beyond it is an anomaly.
 
+Revised 2026-10-15 after the second Codex review (PR #24), owner go: an earlier order can have an update and still miss fills, so a sell's excess over the open qty is resolved (dust or `oversell`) only once every earlier order on the symbol is settled; until then the exit's update is deferred, not an anomaly.
+
 Sources: PLAN §3.2 items 3 and 6, the PLAN 1.5 row follow-ups (2026-10-13 WP 1.R2 final review, 2026-10-14 PR #21 review, 2026-10-14 fee re-query), D10, D14, D15, G10; SPEC §4.5 checks 5 and 7, §4.7, §7; `risk/engine.py`, `broker/base.py`, `broker/sim.py`, `core/cycle.py`, `core/bus.py`, `journal/models.py`, `journal/repo.py`.
 
 WP 1.5 is split into four sub-PRs (owner, 2026-10-14): 1.5a runtime safety (done), **1.5b fill/position accounting (this spec)**, 1.5c exit management, 1.5d startup recovery/reconciliation and Cycle Runner wiring.
@@ -79,7 +81,7 @@ SPEC §7 gets a dated note listing these additions.
 
 ### 4.3 `core/ledger.py`: `Ledger.apply_all(sync_result)` and `Ledger.apply(update)`
 
-**Order of application.** `apply_all` groups the updates by symbol and applies each symbol's updates in order-row id order (an entry row always precedes the exits that sell its qty). If an earlier order row on the same symbol is unsettled and has no update in this pass (it failed in the sync, or it is a `pending`/`unknown` row without a broker id), every later update for that symbol is **deferred** to the next pass. A restart that sees an exit's history before its entry's history therefore never applies the exit first.
+**Order of application.** `apply_all` groups the updates by symbol and applies each symbol's updates in order-row id order (an entry row always precedes the exits that sell its qty). If an earlier order row on the same symbol is unsettled and has no update in this pass (it failed in the sync, or it is a `pending`/`unknown` row without a broker id), every later update for that symbol is **deferred** to the next pass. A restart that sees an exit's history before its entry's history therefore never applies the exit first. An earlier update can also be present but **incomplete** (its fills not all visible yet); the sell-fill readiness rule below covers that case.
 
 **One transaction per order update** through `EventBus.publish_tx`. `build` re-reads the order row, its applied fills, its position and the symbol's dust balance **inside the transaction** and computes the delta there, so the result does not depend on what the caller saw. The bus unit lock serialises all `publish_tx` units, so two concurrent `apply()` calls for the same order can't both apply a fill; the unique `broker_fill_id` constraint is the backstop (an `IntegrityError` rolls the unit back and the order is retried on the next pass).
 
@@ -92,7 +94,9 @@ SPEC §7 gets a dated note listing these additions.
 Per fill not yet in the journal:
 - insert the `fills` row (by value); `orders.filled_qty += fill qty`;
 - **buy fill of an entry order:** if the order has no position yet, open one: `cycle_id`, `symbol`, `side="long"`, `stop`/`tp` from the order, `initial_risk` from the approved entry decision of the order's cycle (latest approved `kind="entry"` decision for that cycle), `opened_at` = fill ts, and set `orders.position_id`. Then `qty += net` (net = `qty − fee` for `fee_asset="base"`, else `qty`), `entry_price` = gross VWAP of the order's buy fills (Alpaca's convention, informational), `fees += fee in USD` (a coin fee × its fill price). The entry's position stays open until the entry is settled (below), so a late entry fill always lands on an open position;
-- **sell fill:** attach to the symbol's open journal position (check 5 guarantees at most one), set `orders.position_id`, `fees += fee`. If the fill qty exceeds the position's remaining qty, the excess is carried dust from earlier trades (section 4.4): consume it from `symbol_dust`, add it to `positions.dust_consumed`, and set the remaining qty to 0. An excess beyond the available `symbol_dust.qty` is an anomaly (`oversell`).
+- **sell fill:** attach to the symbol's open journal position (check 5 guarantees at most one), set `orders.position_id`, `fees += fee`. A sell within the remaining qty applies at once (so a protective exit against a still-open partial entry is booked). If the fill qty **exceeds** the remaining qty, the excess is resolved only when every earlier order row on the symbol is **settled** (its full history applied):
+  - **readiness not met** (an earlier order is unsettled, e.g. its status is final but some of its fills are not visible yet): the whole update is rolled back as **deferred** (logged `ledger.exit_deferred`, no anomaly, no dust touched) and retried on the next pass. Only the booking waits; the broker exit already happened. While deferred the exit stays unsettled (so the cash check skips) and the unsettled earlier entry keeps blocking its symbol. If the missing fills never appear, the earlier order never settles: 1.5d resolver / operator, not a pause;
+  - **readiness met:** the excess is carried dust from earlier trades (section 4.4): consume it from `symbol_dust`, add it to `positions.dust_consumed`, and set the remaining qty to 0. An excess beyond the available `symbol_dust.qty` is an anomaly (`oversell`).
 
 **Closing.** A position closes when **both** hold: its entry order is settled, and its remaining qty is below `min_qty`. The check runs whenever an order of that position settles:
 - entry settles with no sells (the tiny partial IOC case, PLAN 1.5 row, PR #21 review): close as dust, `exit_reason="dust"`;
@@ -123,7 +127,7 @@ Each of these logs an error, rolls back the update, leaves the order unsettled, 
 - `overfilled`: the applied qty would exceed the order's qty, or a **final** status reports less `filled_qty` than is already applied (a final status is final);
 - `fill_after_settle`: a new fill id for an order that is already settled;
 - `sell_without_position`: a sell fill with no open journal position for its symbol, when no earlier unsettled order on that symbol exists (otherwise the update is deferred, section 4.3);
-- `oversell`: a sell beyond the open qty plus the available `symbol_dust`.
+- `oversell`: a sell beyond the open qty plus the available `symbol_dust`, established only once every earlier order on the symbol is settled (otherwise deferred, section 4.3).
 
 ### 4.6 Cash check: `Ledger.cash_guard()` and `Ledger.check_cash(account, guard)` (decision 1)
 
@@ -153,6 +157,7 @@ Each of these logs an error, rolls back the update, leaves the order unsettled, 
 | `get_order`/`order_fills` fails for one order | recorded as failed, other orders still synced; `check()` rejects `state unavailable`; exits unaffected |
 | sync budget spent | remaining orders failed; `check()` rejects `state unavailable` |
 | earlier order on a symbol has no update | later updates on that symbol deferred to the next pass |
+| sell exceeds the open qty while an earlier order on the symbol is unsettled | exit update deferred (no dust consumed, no anomaly), retried next pass |
 | fills ahead of the status / fills not yet visible | apply what is there, stay unsettled |
 | stale update after a newer one | no regression of `status`/`settled_at`; settled rows dropped |
 | ledger unit fails (DB error, `IntegrityError`) | `check()` rejects `state unavailable`; order retried next pass |
@@ -167,7 +172,7 @@ Ledger (SimBroker with `FillPlan`s): full entry → position + `FILLED`; partial
 
 Snapshot consistency (explicit interleavings): a fill lands between `get_order` and `order_fills` (fills ahead of status) → applied, not settled, no anomaly, settles next pass; a stale update applied after a newer one → no status/settlement regression.
 
-Position lifetime: partial entry → protective exit settles → late entry fill → position still open with the late qty, closes only after the entry settles; restart catch-up where the exit's update is available but the entry's lookup fails → exit deferred, no `sell_without_position`; with both available, applied in id order.
+Position lifetime: partial entry → protective exit settles → late entry fill → position still open with the late qty, closes only after the entry settles; restart catch-up where the exit's update is available but the entry's lookup fails → exit deferred, no `sell_without_position`; with both available, applied in id order. Separately: successful but incomplete entry history (status final with `filled_qty` 1, only 0.5 visible) followed by a fully visible exit selling 1, with an existing old-dust balance → first pass: exit deferred, no anomaly, dust balance unchanged; after the missing 0.5 is released → both settle, exact P&L, old-dust balance still unchanged.
 
 Carried dust: close/re-entry/resale repeated over several trades keeps the invariant and assigns resale proceeds to the selling trade; an excess sell beyond the dust balance → `oversell`.
 
