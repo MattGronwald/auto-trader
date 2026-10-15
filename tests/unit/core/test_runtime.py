@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import io
 import json
 from collections.abc import Awaitable, Callable, Iterator, Sequence
@@ -612,3 +613,46 @@ async def test_unsuccessful_cleanup_step_exits_1_and_cleanup_continues(
     events = [ln["event"] for ln in _log_lines(buf)]
     assert "core.stopped" not in events and "core.shutdown_forced" not in events
     assert source.stopped.is_set()
+
+
+class StopRaceSource(StreamingSource):
+    """The stream errors at the moment the stop is requested."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = asyncio.Event()
+
+    async def stream(
+        self, on_bar: Callable[[Bar], Awaitable[None]], on_quote: Callable[[Quote], Awaitable[None]]
+    ) -> None:
+        await self.fail.wait()
+        raise ConnectionError("stream died at stop")
+
+
+async def test_stream_error_at_the_stop_request_is_read_and_fails_the_exit(
+    cfg: AppConfig, lock: JournalLock
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    source = StopRaceSource()
+    control, _ = make_control()
+
+    task = start_core(cfg, lock, control, source=source)
+    await _wait_for(lambda: any(ln["event"] == "core.started" for ln in _log_lines(buf)))
+    source.fail.set()
+    control.begin("stop")
+    code = await asyncio.wait_for(task, timeout=5)
+    del task
+    gc.collect()
+    await asyncio.sleep(0)
+
+    assert code == EXIT_FAILED
+    failed = next(ln for ln in _log_lines(buf) if ln["event"] == "core.shutdown_failed")
+    assert failed["steps"] == ["stream"]
+    step = next(ln for ln in _log_lines(buf) if ln["event"] == "core.shutdown_step_failed")
+    assert step["step"] == "stream" and "stream died at stop" in step["error"]
+    assert "core.stopped" not in [ln["event"] for ln in _log_lines(buf)]
+    assert unhandled == []  # no "Task exception was never retrieved"

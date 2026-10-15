@@ -121,14 +121,18 @@ class ShutdownControl:
         return self.cause is not None
 
     def begin(self, cause: str) -> None:
-        """Deadline, then watchdog, then wake the loop. Safe in a signal handler."""
+        """Deadline, then watchdog, then wake the loop. Safe in a signal handler, and after the
+        attached loop has closed (run_core raised before teardown, or a late signal): then
+        there is no loop to wake, and the deadline and the armed watchdog still stand."""
         if self.cause is not None:
             return
         self.cause = cause
         self.deadline = self._monotonic() + self.timeout_s
         self._arm_watchdog(self.timeout_s + WATCHDOG_GRACE_S)
-        if self._loop is not None and self._wakeup is not None:
-            self._loop.call_soon_threadsafe(self._wakeup.set)
+        loop, wakeup = self._loop, self._wakeup
+        if loop is not None and wakeup is not None and not loop.is_closed():
+            with contextlib.suppress(RuntimeError):  # closed between the check and the call
+                loop.call_soon_threadsafe(wakeup.set)
 
     def attach(self) -> asyncio.Event:
         """Bind to the running loop; the returned event is set once shutdown begins."""

@@ -174,6 +174,22 @@ async def test_attach_after_begin_starts_set() -> None:
     assert control.attach().is_set()
 
 
+def test_begin_after_the_attached_loop_closed_still_records_and_arms() -> None:
+    clock = Clock()
+    armed: list[float] = []
+    control = ShutdownControl(30, arm_watchdog=armed.append, monotonic=clock)
+
+    async def attach() -> None:
+        control.attach()
+
+    asyncio.run(attach())  # e.g. run_core raised before its teardown; asyncio.run closed it
+
+    control.begin("startup_failure")  # the CLI's except handler, or a late signal
+
+    assert (control.cause, control.deadline) == ("startup_failure", 130.0)
+    assert armed == [30 + WATCHDOG_GRACE_S]
+
+
 def test_remaining_before_begin_is_the_whole_budget() -> None:
     assert ShutdownControl(30, arm_watchdog=lambda s: None).remaining() == 30
 

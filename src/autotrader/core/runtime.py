@@ -3,8 +3,8 @@
 Connects the broker, backfills and streams bars for the universe, persists 1m bars, runs the
 Signal Scanner on closed bars (WP 1.2) and snapshots equity for the daily-loss/drawdown
 checks. The broker is handed to the `RiskEngine`, its only holder from then on (SPEC §0.1).
-Nothing calls `check()`/`exit()` until WP 1.5d wires the Cycle Runner and the Position
-Manager.
+Nothing calls `check()`/`exit()` until WP 1.5c/1.5d wire the Position Manager and the Cycle
+Runner.
 
 WP 1.5a (spec 2026-10-14):
 - The caller (the CLI) holds the single-writer journal lock (`core/lock.py`) before the
@@ -20,7 +20,9 @@ WP 1.5a (spec 2026-10-14):
   backfill is bounded too. Teardown is ordered and bounded: a step still running at the
   deadline is cancelled once and left behind (`core.shutdown_forced`), and abandoned work
   stays in the journal for startup recovery (WP 1.5d). A startup failure or stream death is
-  logged as `core.failed` (with the traceback) before teardown.
+  logged as `core.failed` (with the traceback) before teardown: here once shutdown began, by
+  the CLI for one raised before it (preconditions, journal engine). A stream error that lands
+  as the stop is requested fails the `stream` step (`core.shutdown_failed`, exit 1).
 """
 
 import asyncio
@@ -136,12 +138,12 @@ async def run_core(
 ) -> int:
     """Run until shutdown is requested. Returns EXIT_CLEAN, or EXIT_FAILED when a teardown
     step was forced at the deadline or failed. Startup failures and stream death are logged
-    (`core.failed`) and re-raised after teardown."""
+    (`core.failed`) and re-raised after teardown. The precondition `ValueError`s and a failing
+    journal engine are raised before shutdown begins, unlogged: the CLI logs those."""
     if not lock.held:
         raise ValueError("run_core needs the held single-writer journal lock")
     if lock.url != canonical_journal(cfg.database.url)[0]:
         raise ValueError("the journal lock belongs to a different journal")
-    wakeup = control.attach()
     engine = make_engine(lock.url)
     sessions = make_sessionmaker(engine)
     bus = EventBus(sessions)
@@ -213,6 +215,8 @@ async def run_core(
     supervisor: Supervisor | None = None
     stream_task: asyncio.Task[None] | None = None
     failure: BaseException | None = None
+    stream_died = False  # the supervise loop read the stream's end (and its error) itself
+    wakeup = control.attach()  # right before the try: nothing that can raise sits between
     try:
         if not control.requested:
             # Startup races the stop request: a signal during the broker connect or the
@@ -230,6 +234,7 @@ async def run_core(
             while supervisor is not None and stream_task is not None and not control.requested:
                 if stream_task.done():
                     control.begin("stream_death")
+                    stream_died = True
                     error = None if stream_task.cancelled() else stream_task.exception()
                     failure = error or RuntimeError("market data stream ended unexpectedly")
                     break
@@ -241,7 +246,9 @@ async def run_core(
         failure = e
     if failure is not None:  # logged before teardown, which the watchdog may cut short
         log.error("core.failed", cause=control.cause, exc_info=failure)
-    forced = await _teardown(control, source, startup, supervisor, stream_task, bus, engine)
+    forced = await _teardown(
+        control, source, startup, supervisor, stream_task, bus, engine, stream_died=stream_died
+    )
     if failure is not None:
         raise failure
     return EXIT_FAILED if forced else EXIT_CLEAN
@@ -255,6 +262,8 @@ async def _teardown(
     stream_task: "asyncio.Task[None] | None",
     bus: EventBus,
     engine: Any,
+    *,
+    stream_died: bool = False,
 ) -> list[str]:
     """Ordered, bounded teardown (spec section 4). Each step gets what is left of the
     deadline; a step still running then is cancelled once and left behind (forced). A step
@@ -294,6 +303,13 @@ async def _teardown(
     if stream_task is not None and not stream_task.done():
         stream_task.cancel()
         await bounded("stream", stream_task, cancel_ok=True)  # we cancelled it ourselves
+    elif stream_task is not None and not stream_died and not stream_task.cancelled():
+        # It ended while the stop was being requested, before the supervise loop looked: read
+        # its error here (else it is never retrieved and the exit would read clean). A stream
+        # that returned normally after `source.stop()` stays clean.
+        if (error := stream_task.exception()) is not None:
+            failed.append("stream")
+            log.error("core.shutdown_step_failed", step="stream", error=repr(error))
     await bounded("bus.close", bus.close(budget_s=control.remaining()))
     # A floor even after the deadline (inside the watchdog's 5 s grace): a forced teardown
     # must still close the journal's connections (dry run, spec revision 2026-10-14).

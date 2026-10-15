@@ -524,7 +524,7 @@ Preconditions, all required:
 - Dashboard not internet-exposed (localhost / Tailscale). Bearer token.
 - Prompt injection: the Context Analyst (when enabled) consumes third-party text. Its output schema is narrow (numbers + enums + short strings) and it has no tool access; the Decision Maker treats it as data. No agent output is ever executed or used to construct prompts for other agents without schema validation.
 - Dependency pinning, `pip-audit` in CI.
-- One core process per journal and one dedicated paper account/journal in Phase 1. WP 1.5a enforces a process-held local single-writer lock; restart resolves the previous writer's SQLite work before admitting entries. WP 3.5 / the Phase 5 gate adds persistent account/mode binding, cash-flow discontinuity detection and Postgres ownership/recovery. Postgres locking and query deadlines require real Postgres tests, not only SQLite tests or DDL compilation.
+- One core process per journal and one dedicated paper account/journal in Phase 1. WP 1.5a enforces a process-held local single-writer lock; WP 1.5d resolves the previous writer's SQLite work before admitting entries. WP 3.5 / the Phase 5 gate adds persistent account/mode binding, cash-flow discontinuity detection and Postgres ownership/recovery. Postgres locking and query deadlines require real Postgres tests, not only SQLite tests or DDL compilation.
 
 ---
 

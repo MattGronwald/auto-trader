@@ -1,4 +1,5 @@
 import io
+import json
 import subprocess
 import sys
 from collections.abc import Callable, Coroutine
@@ -12,7 +13,7 @@ from autotrader.cli import _run_core_process, app
 from autotrader.core import lock as journal_lock
 from autotrader.core.config import Settings, load_config, load_profile
 from autotrader.core.logging import configure_logging
-from autotrader.core.shutdown import Watchdog
+from autotrader.core.shutdown import ShutdownControl, Watchdog
 
 runner = CliRunner()
 REPO = Path(__file__).resolve().parents[2]
@@ -408,3 +409,98 @@ def test_ctrl_c_while_waiting_for_the_lock_exits_130(tmp_path: Path) -> None:
     )
 
     assert code == 130 and upgrade.calls == []
+
+
+def _core_failed(buf: io.StringIO) -> list[dict[str, Any]]:
+    lines = [json.loads(ln) for ln in buf.getvalue().splitlines() if ln.startswith("{")]
+    return [ln for ln in lines if ln["event"] == "core.failed"]
+
+
+def test_startup_failure_before_run_core_is_logged_as_core_failed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
+    locks = Locks()
+
+    def upgrade(url: str) -> None:
+        raise RuntimeError("migration broke")
+
+    code = _run_core_process(
+        cfg,
+        Settings(_env_file=None),
+        load_profile(cfg.strategy),
+        watchdog=Watchdog(timer_factory=FakeTimer, exit=Spy()),
+        install=Spy(),
+        upgrade=upgrade,
+        make_source=Spy(),
+        run=Spy(0),
+        acquire=locks,
+    )
+    locks.release()
+
+    assert code == 1
+    (failed,) = _core_failed(buf)
+    assert failed["cause"] == "startup_failure"
+    assert "migration broke" in failed["exception"] and "Traceback" in failed["exception"]
+    assert capsys.readouterr().err == "run core failed: RuntimeError: migration broke\n"
+
+
+def test_failure_run_core_already_logged_is_not_logged_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
+    locks = Locks()
+
+    async def run_core(*args: Any, control: ShutdownControl, **kwargs: Any) -> int:
+        control.begin("stream_death")  # run_core logs core.failed itself, then re-raises
+        raise ConnectionError("stream died")
+
+    monkeypatch.setattr("autotrader.core.runtime.run_core", run_core)
+    code = _run_core_process(
+        cfg,
+        Settings(_env_file=None),
+        load_profile(cfg.strategy),
+        watchdog=Watchdog(timer_factory=FakeTimer, exit=Spy()),
+        install=Spy(),
+        upgrade=Spy(),
+        make_source=Spy(),
+        acquire=locks,
+    )
+    locks.release()
+
+    assert code == 1
+    assert _core_failed(buf) == []
+
+
+def test_engine_failure_inside_run_core_exits_1_with_a_one_line_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
+    locks = Locks()
+
+    def make_engine(url: str) -> Any:
+        raise RuntimeError("no engine")
+
+    monkeypatch.setattr("autotrader.core.runtime.make_engine", make_engine)
+    code = _run_core_process(
+        cfg,
+        Settings(_env_file=None),
+        load_profile(cfg.strategy),
+        watchdog=Watchdog(timer_factory=FakeTimer, exit=Spy()),
+        install=Spy(),
+        upgrade=Spy(),
+        make_source=Spy(),
+        acquire=locks,
+    )
+    locks.release()
+
+    assert code == 1
+    assert capsys.readouterr().err == "run core failed: RuntimeError: no engine\n"
+    (failed,) = _core_failed(buf)
+    assert failed["cause"] == "startup_failure" and "no engine" in failed["exception"]

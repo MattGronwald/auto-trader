@@ -11,6 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
+import structlog
 import typer
 
 from autotrader.broker.alpaca import AlpacaBroker
@@ -39,6 +40,8 @@ from autotrader.core.shutdown import (
     make_signal_handler,
 )
 from autotrader.journal import db
+
+log = structlog.get_logger(__name__)
 
 app = typer.Typer(help="Automated, agent-based crypto trading PoC.", no_args_is_help=True)
 run_app = typer.Typer(help="Run a long-lived process.", no_args_is_help=True)
@@ -129,7 +132,13 @@ def _run_core_process(
             )
         )
     except Exception as e:
+        # A failure before run_core's teardown (migration, source, preconditions, engine) is
+        # logged here, with the traceback; one that run_core re-raises was logged there
+        # (shutdown had begun), so it isn't logged twice.
+        first = not control.requested
         control.begin("startup_failure")  # no-op if teardown already began
+        if first:
+            log.error("core.failed", cause=control.cause, exc_info=e)
         typer.echo(f"run core failed: {type(e).__name__}: {e}", err=True)
         code = EXIT_FAILED
     return code
