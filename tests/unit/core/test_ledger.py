@@ -2,6 +2,7 @@
 migrated SQLite journal."""
 
 import asyncio
+import tempfile
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
@@ -9,15 +10,24 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from autotrader.broker.base import Account, AssetRules, BrokerOrder, FeeSchedule, Fill
+from autotrader.broker.base import (
+    Account,
+    AssetRules,
+    BrokerOrder,
+    FeeSchedule,
+    Fill,
+    OrderRejected,
+)
 from autotrader.broker.sim import FillPlan, SimBroker
 from autotrader.core.bus import CommitUncertain, DomainEvent, EventBus
 from autotrader.core.config import load_profile
 from autotrader.core.kill import PAUSED_KEY
-from autotrader.core.ledger import CASH_CHECK_KEY, Ledger
+from autotrader.core.ledger import CASH_CHECK_KEY, Ledger, _cash_effect
 from autotrader.core.types import Bar
 from autotrader.journal import models as m
 from autotrader.journal import repo
@@ -1089,3 +1099,76 @@ async def test_a_baseline_at_the_same_timestamp_never_confirms_a_failed_cash_che
     await hbus.drain()
     assert await event_types(sessions) == ["CashChecked"]  # only the first one
     assert [type(e).__name__ for e in delivered] == ["CashChecked"]
+
+
+_trades = st.lists(
+    st.tuples(
+        st.integers(min_value=2, max_value=40),  # qty in 0.01 BTC
+        st.sampled_from(["full", "half", "sliver"]),
+        st.floats(min_value=90, max_value=110, allow_nan=False),
+        st.floats(min_value=90, max_value=110, allow_nan=False),
+    ),
+    min_size=1,
+    max_size=6,
+)
+
+
+async def _replay(url: str, trades: list[tuple[int, str, float, float]], fee_asset: str) -> None:
+    engine = make_engine(url)
+    sessions = make_sessionmaker(engine)
+    bus = EventBus(sessions)
+    ledger = Ledger(bus, sessions, clock=lambda: T0)
+    sim = make_sim(QUOTE.model_copy(update={"buy_fee_asset": fee_asset}))
+    i = 0
+    try:
+        for n, plan, price_in, price_out in trades:
+            qty = D(n) / 100
+            if plan == "half":
+                sim.script(BTC, "buy", FillPlan((D("0.5"), "cancel")))
+            elif plan == "sliver":
+                sim.script(BTC, "buy", FillPlan((D("0.0001") / qty, "cancel")))
+            await place(sessions, sim, "buy", str(qty))
+            for _ in range(2):  # the fill bar, then the scripted cancel (if any)
+                i += 1
+                sim.process_bar(bar(i, price_in))
+            await ledger.apply_all(await sync(sessions, sim))
+            held = await sim.get_positions()
+            if not held or held[0].qty < RULES.min_qty:
+                continue  # all dust: nothing to close
+            try:
+                await place(sessions, sim, "close", str(held[0].qty), exit_reason="time")
+            except OrderRejected:
+                break  # below min notional: open but not closable; one trade per symbol
+            i += 1
+            sim.process_bar(bar(i, price_out))
+            await ledger.apply_all(await sync(sessions, sim))
+        async with sessions() as s:
+            booked = list(await s.scalars(select(m.Fill)))
+            open_qty = sum(
+                (
+                    p.qty
+                    for p in await s.scalars(
+                        select(m.Position).where(m.Position.closed_at.is_(None))
+                    )
+                ),
+                D(0),
+            )
+            dust = await s.get(m.SymbolDust, BTC)
+            assert await repo.get_control(s, PAUSED_KEY) is None
+        assert abs(D("1000") + sum((_cash_effect(f) for f in booked), D(0)) - sim.cash) < D("1e-18")
+        held_qty = sum((p.qty for p in await sim.get_positions()), D(0))
+        assert open_qty + (D(0) if dust is None else dust.qty) == held_qty
+    finally:
+        await bus.close()
+        await engine.dispose()
+
+
+@given(_trades, st.sampled_from(["base", "quote"]))
+@settings(max_examples=25, deadline=None)
+def test_the_ledger_reproduces_broker_cash_and_holdings(
+    trades: list[tuple[int, str, float, float]], fee_asset: str
+) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        url = f"sqlite+aiosqlite:///{tmp}/ledger.db"
+        upgrade(url)  # sync: Alembic runs its own event loop
+        asyncio.run(_replay(url, trades, fee_asset))

@@ -140,7 +140,8 @@ def _size_and_finish(
         return _reject(f"size {qty} below broker minimum")
     # A coin buy fee shrinks the held qty; below min_qty a FULLY filled position would be
     # dust (not exitable, frees its slot). Fee rounded up to the qty step: never
-    # under-estimated. A small partial IOC fill can still leave dust (WP 1.5 reconciles).
+    # under-estimated. A small partial IOC fill can still leave dust (the ledger writes it off at
+    # close, WP 1.5b).
     if market.fees.buy_fee_asset == "base":
         net = qty - _step(qty * taker, rules.qty_increment, ROUND_CEILING)
         if net < rules.min_qty:
