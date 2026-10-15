@@ -21,3 +21,4 @@ feed:                           # D6
 
 shutdown:
   flatten: false                # D7: flatten on graceful stop
+  timeout_s: 30                 # WP 1.5a: graceful teardown budget; watchdog at +5 s
