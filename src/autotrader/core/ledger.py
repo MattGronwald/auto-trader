@@ -204,14 +204,23 @@ class Ledger:
     # --- orders ------------------------------------------------------------------------
 
     async def apply_all(self, result: SyncResult) -> None:
-        """Book one sync pass (spec 4.3): every update, in order-row id order."""
+        """Book one sync pass (spec 4.3): per symbol in order-row id order. An unsettled row
+        without an update (failed lookup, or pending/unknown with no broker id), and an
+        update that was deferred or anomalous, hold back the later rows of its symbol, so a
+        catch-up never books an exit before its entry."""
         updates = {u.order_row_id: u for u in result.updates}
         async with self._sessions() as session:
             rows = await repo.unsettled_orders(session)
+        held: set[str] = set()
         for row in rows:
+            symbol = row.symbol or ""
             update = updates.get(row.id)
-            if update is not None:
-                await self.apply(update)
+            if symbol in held:
+                if update is not None:
+                    log.info("ledger.update_deferred", order_row=row.id, symbol=symbol)
+                continue
+            if update is None or await self.apply(update) in ("deferred", "anomaly"):
+                held.add(symbol)
 
     async def apply(self, update: OrderUpdate) -> Outcome:
         """Book one order's update in one transaction. Never raises for a deferral or an
@@ -360,7 +369,51 @@ class Ledger:
         fill: Fill,
         now: datetime,
     ) -> Position:
-        raise NotImplementedError("sell fills are booked from WP 1.5b Task 5 on")
+        """Reduce the symbol's open position. A sell beyond the open qty is carried dust of
+        earlier trades, resolved only once every earlier order on the symbol is settled
+        (spec 4.3): until then the whole update is deferred, never an anomaly."""
+        if position is None:
+            # Never "the oldest open one": check() keeps one open journal trade per symbol,
+            # so more than one is a contradiction, not a choice (PR #25 review).
+            candidates = list(
+                await session.scalars(
+                    select(Position).where(
+                        Position.symbol == order.symbol, Position.closed_at.is_(None)
+                    )
+                )
+            )
+            if len(candidates) > 1:
+                raise _Anomaly(
+                    "ambiguous_position", f"{len(candidates)} open {order.symbol} positions"
+                )
+            position = candidates[0] if candidates else None
+            if position is None:
+                if await _earlier_unsettled(session, order):
+                    raise _Deferred("no open position yet; an earlier order is unsettled")
+                raise _Anomaly(
+                    "sell_without_position", f"sell fill {fill.fill_id}: no open {order.symbol}"
+                )
+            order.position_id = position.id
+        position.fees = _norm(
+            (position.fees or _D0) + _fee_usd(fill.fee, fill.fee_asset, fill.price)
+        )
+        excess = fill.qty - position.qty
+        if excess <= 0:
+            position.qty = _norm(position.qty - fill.qty)
+            return position
+        if await _earlier_unsettled(session, order):
+            raise _Deferred(f"sells {excess} beyond the open qty; an earlier order is unsettled")
+        dust = await session.get(SymbolDust, position.symbol)
+        available = _D0 if dust is None else dust.qty
+        if dust is None or excess > available:
+            raise _Anomaly(
+                "oversell", f"sells {excess} beyond the open qty, carried dust {available}"
+            )
+        dust.qty = _norm(available - excess)
+        dust.updated_at = now
+        position.dust_consumed = _norm(position.dust_consumed + excess)
+        position.qty = _D0
+        return position
 
     async def _reprice(self, session: AsyncSession, order: Order, position: Position) -> None:
         """`entry_price` = gross VWAP of the entry's buy fills (Alpaca's convention)."""

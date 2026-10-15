@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from autotrader.broker.base import AssetRules, BrokerOrder, FeeSchedule
+from autotrader.broker.base import AssetRules, BrokerOrder, FeeSchedule, Fill
 from autotrader.broker.sim import FillPlan, SimBroker
 from autotrader.core.bus import CommitUncertain, DomainEvent, EventBus
 from autotrader.core.config import load_profile
@@ -606,3 +606,374 @@ async def test_a_lost_ack_on_a_committed_unit_delivers_all_its_events_once(
     assert [type(e).__name__ for e in delivered] == ["OrderSettled", "CycleTransitioned"]
     assert await event_types(sessions) == ["OrderSettled", "CycleTransitioned"]
     assert await cycle_state(sessions, cycle) == "FILLED"
+
+
+# --- exits -------------------------------------------------------------------------------
+
+
+async def settle_entry(
+    sessions: async_sessionmaker[AsyncSession],
+    ledger: Ledger,
+    sim: SimBroker,
+    n: int,
+    qty: str = "1",
+) -> int:
+    """Buy `qty` at market, fill it on bar `n` and book it settled."""
+    row, oid = await place(sessions, sim, "buy", qty)
+    sim.process_bar(bar(n))
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"
+    return row
+
+
+async def test_a_full_exit_closes_with_exact_pnl_on_quote_fees(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await settle_entry(sessions, ledger, sim, 1)
+    row, oid = await place(sessions, sim, "close", "1", exit_reason="take_profit")
+    sim.process_bar(bar(2, 110.0))
+
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"
+    (pos,) = await positions(sessions)
+    # in: 110 - 0.275 = 109.725; out: 100 + 0.25 = 100.25
+    assert (pos.exit_reason, pos.realized_pnl, pos.fees, pos.dust_qty) == (
+        "take_profit",
+        D("9.475"),
+        D("0.525"),
+        D("0"),
+    )
+    assert pos.closed_at == T0 + timedelta(minutes=2)
+    assert await dust_balance(sessions) is None
+
+
+async def test_a_full_exit_closes_with_exact_pnl_on_coin_fees(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim(BASE)
+    await settle_entry(sessions, ledger, sim, 1)  # net 0.9975 coins for 100 USD
+    row, oid = await place(sessions, sim, "close", "0.9975", exit_reason="time")
+    sim.process_bar(bar(2, 110.0))
+
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"
+    (pos,) = await positions(sessions)
+    # in: 0.9975 * 110 = 109.725 - fee 0.2743125; out: 100 (the coin fee is not cash)
+    assert (pos.realized_pnl, pos.fees) == (D("9.4506875"), D("0.5243125"))
+
+
+async def test_a_tiny_partial_ioc_entry_closes_at_once_as_dust(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim(BASE)
+    cycle = await new_cycle(sessions)
+    sim.script(BTC, "buy", FillPlan((D("0.00005"),)))  # slice floors to 0.0001
+    row, oid = await place(sessions, sim, "buy", "2.997", cycle_id=cycle, limit="100")
+    sim.process_bar(bar(1))
+
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"
+    (pos,) = await positions(sessions)
+    assert (pos.exit_reason, pos.dust_qty, pos.realized_pnl) == (
+        "dust",
+        D("0.00009975"),
+        D("-0.01"),
+    )
+    assert await dust_balance(sessions) == D("0.00009975")
+    assert await event_types(sessions) == ["OrderSettled", "CycleTransitioned", "DustLeft"]
+    assert await cycle_state(sessions, cycle) == "FILLED"
+
+
+async def test_a_partial_exit_keeps_the_position_open(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await settle_entry(sessions, ledger, sim, 1)
+    row, oid = await place(sessions, sim, "sell", "0.4", exit_reason="time")
+    sim.process_bar(bar(2))
+
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"
+    (pos,) = await positions(sessions)
+    assert (pos.qty, pos.closed_at) == (D("0.6"), None)
+
+
+async def test_the_position_closes_only_after_its_entry_settles(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    sim.script(BTC, "buy", FillPlan((D("0.5"), "cancel")))
+    entry, entry_oid = await place(sessions, sim, "buy", "1")
+    sim.process_bar(bar(1))  # 0.5 filled, the rest still open
+    assert await ledger.apply(await update(sim, entry, entry_oid)) == "applied"
+    exit_row, exit_oid = await place(sessions, sim, "close", "0.5", exit_reason="stop")
+    sim.process_bar(bar(2, 95.0))  # the entry is canceled, the exit sells 0.5
+
+    assert await ledger.apply(await update(sim, exit_row, exit_oid)) == "applied"
+    (pos,) = await positions(sessions)
+    assert (pos.qty, pos.closed_at) == (D("0"), None)  # entry not settled yet: still open
+    assert await ledger.apply(await update(sim, entry, entry_oid)) == "applied"
+    (pos,) = await positions(sessions)
+    # in: 47.5 - 0.11875; out: 50 + 0.125
+    assert (pos.exit_reason, pos.realized_pnl) == ("stop", D("-2.74375"))
+
+
+async def test_a_late_entry_fill_after_a_protective_exit_lands_on_the_open_position(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    sim.script(BTC, "buy", FillPlan((D("0.5"),)))  # the rest fills on the next bar
+    entry, entry_oid = await place(sessions, sim, "buy", "1")
+    sim.process_bar(bar(1))
+    assert await ledger.apply(await update(sim, entry, entry_oid)) == "applied"
+    exit_row, exit_oid = await place(sessions, sim, "close", "0.5", exit_reason="stop")
+    sim.process_bar(bar(2))  # the entry fills its other 0.5, the exit sells 0.5
+
+    assert await ledger.apply(await update(sim, exit_row, exit_oid)) == "applied"
+    assert await ledger.apply(await update(sim, entry, entry_oid)) == "applied"
+    (pos,) = await positions(sessions)
+    assert (pos.qty, pos.closed_at) == (D("0.5"), None)
+    (held,) = await sim.get_positions()
+    assert held.qty == D("0.5")
+
+
+async def test_a_lagging_exit_status_keeps_the_position_open_until_the_exit_settles(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    sim.script(BTC, "buy", FillPlan((D("0.5"), "cancel")))
+    entry, entry_oid = await place(sessions, sim, "buy", "1")
+    sim.process_bar(bar(1))
+    assert await ledger.apply(await update(sim, entry, entry_oid, visible=1)) == "applied"
+    exit_row, exit_oid = await place(sessions, sim, "close", "0.5", exit_reason="stop")
+    sim.process_bar(bar(2))
+    exit_now = await update(sim, exit_row, exit_oid)
+
+    assert await ledger.apply(exit_now.model_copy(update={"status": "new"})) == "applied"
+    assert await ledger.apply(await update(sim, entry, entry_oid)) == "applied"  # entry settles
+    (pos,) = await positions(sessions)
+    assert pos.closed_at is None  # not closed as "dust" while the exit is unsettled
+    assert await ledger.apply(exit_now) == "applied"
+    (pos,) = await positions(sessions)
+    assert pos.exit_reason == "stop"
+
+
+async def test_an_exit_filling_more_than_its_recorded_qty_is_not_overfilled(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await settle_entry(sessions, ledger, sim, 1)
+    row, oid = await place(sessions, sim, "close", "0.5", exit_reason="kill")  # sells all 1
+    sim.process_bar(bar(2))
+
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"
+    (pos,) = await positions(sessions)
+    assert (pos.exit_reason, pos.qty) == ("kill", D("0"))
+    assert not await paused(sessions)
+
+
+# --- ordering and readiness ---------------------------------------------------------------
+
+
+async def test_catch_up_defers_an_exit_whose_entry_lookup_failed(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    entry, _ = await place(sessions, sim, "buy", "1")
+    sim.process_bar(bar(1))
+    exit_row, exit_oid = await place(sessions, sim, "close", "1", exit_reason="stop")
+    sim.process_bar(bar(2))
+
+    exit_only = SyncResult(updates=(await update(sim, exit_row, exit_oid),), failed=(entry,))
+    await ledger.apply_all(exit_only)
+    assert await fills(sessions) == [] and not await paused(sessions)
+    await ledger.apply_all(await sync(sessions, sim))
+    (pos,) = await positions(sessions)
+    assert pos.exit_reason == "stop"
+    assert all(o.settled_at is not None for o in await orders(sessions))
+
+
+async def test_an_oversell_waits_for_incomplete_entry_history_and_keeps_old_dust(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    async with sessions() as s:
+        s.add(m.SymbolDust(symbol=BTC, qty=D("0.00005"), updated_at=T0))
+        await s.commit()
+    sim.script(BTC, "buy", FillPlan((D("0.5"),)))
+    entry, entry_oid = await place(sessions, sim, "buy", "1")
+    sim.process_bar(bar(1))
+    sim.process_bar(bar(2))  # final, filled 1 in two executions
+    exit_row, exit_oid = await place(sessions, sim, "close", "1", exit_reason="stop")
+    sim.process_bar(bar(3))
+
+    first = SyncResult(
+        updates=(
+            await update(sim, entry, entry_oid, visible=1),  # status final 1, only 0.5 shown
+            await update(sim, exit_row, exit_oid),
+        )
+    )
+    await ledger.apply_all(first)
+    exit_order = (await orders(sessions))[1]
+    assert (exit_order.filled_qty, exit_order.settled_at) == (D(0), None)
+    assert not await paused(sessions)
+    assert await dust_balance(sessions) == D("0.00005")
+
+    await ledger.apply_all(await sync(sessions, sim))
+    (pos,) = await positions(sessions)
+    assert (pos.exit_reason, pos.realized_pnl, pos.dust_consumed) == ("stop", D("-0.5"), D(0))
+    assert await dust_balance(sessions) == D("0.00005")
+
+
+async def test_carried_dust_is_consumed_by_the_next_trade(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim(BASE)
+    sim.script(BTC, "buy", FillPlan((D("0.00005"),)))
+    first, first_oid = await place(sessions, sim, "buy", "2.997", limit="100")
+    sim.process_bar(bar(1))
+    assert await ledger.apply(await update(sim, first, first_oid)) == "applied"  # dust
+    await settle_entry(sessions, ledger, sim, 2)  # net 0.9975
+    (held,) = await sim.get_positions()
+    assert held.qty == D("0.99759975")  # the broker merged the dust in
+    row, oid = await place(sessions, sim, "close", str(held.qty), exit_reason="time")
+    sim.process_bar(bar(3))
+
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"
+    _, second = await positions(sessions)
+    # in: 99.759975 - 0.2493999375; out: 100
+    assert (second.dust_consumed, second.dust_qty, second.realized_pnl) == (
+        D("0.00009975"),
+        D("0"),
+        D("-0.4894249375"),
+    )
+    assert await dust_balance(sessions) == D("0")
+    assert await sim.get_positions() == []
+
+
+async def test_a_sell_beyond_open_qty_and_dust_is_an_oversell(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await settle_entry(sessions, ledger, sim, 1)
+    row, oid = await place(sessions, sim, "close", "1", exit_reason="stop")
+    sim.process_bar(bar(2))
+    real = await update(sim, row, oid)
+    bigger = (real.fills[0].model_copy(update={"qty": D("1.5")}),)
+
+    lying = real.model_copy(update={"fills": bigger, "filled_qty": D("1.5")})
+    assert await ledger.apply(lying) == "anomaly"
+    assert anomaly_kind(await event_rows(sessions)) == "oversell"
+    (pos,) = await positions(sessions)
+    assert (pos.qty, pos.closed_at) == (D("1"), None)
+
+
+def _sell_fill(fill_id: str) -> Fill:
+    return Fill(
+        fill_id=fill_id,
+        order_id="x",
+        symbol=BTC,
+        side="sell",
+        qty=D("1"),
+        price=D("100"),
+        fee=D("0.25"),
+        fee_asset="quote",
+        ts=T0,
+    )
+
+
+async def _sell_row(sessions: async_sessionmaker[AsyncSession], status: str = "new") -> int:
+    async with sessions() as s:
+        row = await repo.insert_order(
+            s,
+            cycle_id=None,
+            client_order_id=None,
+            symbol=BTC,
+            mode="paper",
+            type_="market",
+            side="sell",
+            qty=D("1"),
+            limit_price=None,
+            stop_price=None,
+            tp_price=None,
+            status=status,
+            now=T0,
+            exit_reason="flatten",
+        )
+        return row.id
+
+
+async def test_a_sell_without_any_position_is_an_anomaly(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    row = await _sell_row(sessions)
+    lone = OrderUpdate(
+        order_row_id=row,
+        status="filled",
+        filled_qty=D("1"),
+        fills=(_sell_fill("x:1"),),
+        min_qty=RULES.min_qty,
+    )
+    assert await ledger.apply(lone) == "anomaly"
+    assert anomaly_kind(await event_rows(sessions)) == "sell_without_position"
+
+
+async def test_a_sell_without_a_position_waits_for_an_earlier_unsettled_order(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    async with sessions() as s:  # an entry whose submit outcome is unknown (no broker id)
+        await repo.insert_order(
+            s,
+            cycle_id=None,
+            client_order_id="c-1",
+            symbol=BTC,
+            mode="paper",
+            type_="limit",
+            side="buy",
+            qty=D("1"),
+            limit_price=D("100"),
+            stop_price=None,
+            tp_price=None,
+            status="unknown",
+            now=T0,
+        )
+    row = await _sell_row(sessions)
+    lone = OrderUpdate(
+        order_row_id=row,
+        status="filled",
+        filled_qty=D("1"),
+        fills=(_sell_fill("x:1"),),
+        min_qty=RULES.min_qty,
+    )
+    assert await ledger.apply(lone) == "deferred"
+    assert not await paused(sessions)
+
+
+async def test_a_sell_with_two_open_positions_is_ambiguous_and_books_nothing(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    async with sessions() as s:  # check() never admits this; the ledger must not guess
+        for qty in ("0.00005", "1"):
+            s.add(
+                m.Position(
+                    symbol=BTC,
+                    side="long",
+                    qty=D(qty),
+                    entry_price=D("100"),
+                    opened_at=T0,
+                    fees=D(0),
+                    dust_consumed=D(0),
+                )
+            )
+        await s.commit()
+    row = await _sell_row(sessions)
+    small = _sell_fill("x:1").model_copy(update={"qty": D("0.00001")})
+    update_ = OrderUpdate(
+        order_row_id=row,
+        status="partially_filled",
+        filled_qty=D("0.00001"),
+        fills=(small,),
+        min_qty=RULES.min_qty,
+    )
+
+    assert await ledger.apply(update_) == "anomaly"
+    assert anomaly_kind(await event_rows(sessions)) == "ambiguous_position"
+    assert [p.qty for p in await positions(sessions)] == [D("0.00005"), D("1")]
+    (order,) = await orders(sessions)
+    assert (order.position_id, order.filled_qty) == (None, D(0))
