@@ -37,11 +37,10 @@ from autotrader.journal import repo
 from autotrader.journal.models import ControlState, Order, Position, RiskDecision, SymbolDust
 from autotrader.journal.models import Event as EventRow
 from autotrader.journal.models import Fill as FillRow
-from autotrader.risk.types import OrderUpdate, SyncResult
+from autotrader.risk.types import FINAL, OrderUpdate, SyncResult
 
 log = structlog.get_logger(__name__)
 
-FINAL = frozenset({"filled", "canceled", "rejected", "not_submitted"})
 _RANK = {"new": 1, "partially_filled": 2}  # pending / unknown: 0, final: 3
 _D0 = Decimal(0)
 CASH_CHECK_KEY = "cash_check"

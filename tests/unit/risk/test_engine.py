@@ -1362,6 +1362,64 @@ async def test_a_final_unsettled_entry_reserves_nothing_but_blocks_its_symbol(
     assert (first.status, first.settled_at) == ("filled", None)
 
 
+async def test_a_canceled_entry_with_hidden_fills_reserves_nothing_but_blocks_its_symbol(
+    sessions: async_sessionmaker[AsyncSession],
+    gate: ControlGate,
+    cycle_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Spec 4.7: a final unsettled row has notional 0, even when the broker's filled_qty
+    # (here 1.4985 of 2.997) leaves an unfilled remainder: a canceled IOC never fills it.
+    broker = _sim(HiddenFillsBroker)
+    broker.script(BTC, "buy", FillPlan((D("0.5"),)))
+    engine = make_engine_(broker, sessions, gate)
+    await engine.check(intent(cycle_id))
+    broker.process_bar(five(30))  # half fills, the IOC remainder is canceled; fills hidden
+    seen = spy_portfolios(monkeypatch)
+
+    result = await engine.check(intent(await new_cycle(sessions)))
+    assert seen[-1].open_entries == (OpenEntry(symbol=BTC, notional=D(0)),)
+    assert "already has a position or open entry" in result.decision.reasons[0]
+    first = (await orders(sessions))[0]
+    assert (first.status, first.settled_at) == ("canceled", None)
+
+
+async def test_a_held_back_local_final_entry_reserves_nothing(
+    sim: SimBroker,
+    sessions: async_sessionmaker[AsyncSession],
+    gate: ControlGate,
+    cycle_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A not_submitted row behind an earlier id-less pending row on its symbol is deferred by
+    # the ledger (stays unsettled): it still blocks ETH but must not reserve notional.
+    async with sessions() as s:
+        for status in ("pending", "not_submitted"):
+            await repo.insert_order(
+                s,
+                cycle_id=None,
+                client_order_id=None,
+                symbol="ETH/USD",
+                mode="paper",
+                type_="limit",
+                side="buy",
+                qty=D("1"),
+                limit_price=D("10"),
+                stop_price=None,
+                tp_price=None,
+                status=status,
+                now=NOW,
+            )
+    seen = spy_portfolios(monkeypatch)
+
+    await make_engine_(sim, sessions, gate).check(intent(cycle_id))
+    assert seen[-1].open_entries == (
+        OpenEntry(symbol="ETH/USD", notional=D("10")),  # pending: full reservation
+        OpenEntry(symbol="ETH/USD", notional=D(0)),  # not_submitted, held back
+    )
+    assert [o.settled_at for o in await orders(sessions)][:2] == [None, None]
+
+
 async def test_an_unreadable_order_fails_entries_closed_but_the_rest_is_booked(
     sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
 ) -> None:

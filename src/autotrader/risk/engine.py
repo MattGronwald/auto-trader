@@ -57,6 +57,7 @@ from autotrader.journal import repo
 from autotrader.journal.models import Order
 from autotrader.risk.checks import check_entry, check_exit
 from autotrader.risk.types import (
+    FINAL,
     EntryIntent,
     ExitRequest,
     HeldPosition,
@@ -220,6 +221,9 @@ class RiskEngine:
             # check 5 ignores.
             journal_open = await repo.open_position_symbols(session)
         broker_filled = {u.order_row_id: u.filled_qty for u in synced.updates}
+        # The sync's status is at least as new as the row's: a deferred update (spec 4.3)
+        # leaves the row behind the broker, and a final order never fills its remainder.
+        status = {u.order_row_id: u.status for u in synced.updates}
         account = await self._within(deadline, self._broker.get_account)
         # Persist a new peak (or the first-ever baseline) right after the account read,
         # before anything else here can fail: otherwise a spike seen by a check that then
@@ -252,10 +256,13 @@ class RiskEngine:
             open_entries=tuple(
                 # symbol is always set by insert_order; "" only guards legacy NULL rows and
                 # still counts toward max_positions (conservative). The notional is the
-                # unfilled remainder: the filled part is already a priced position.
+                # unfilled remainder: the filled part is already a priced position. A final
+                # unsettled row reserves 0 but still blocks its symbol (spec 4.7).
                 OpenEntry(
                     symbol=o.symbol or "",
-                    notional=max(
+                    notional=Decimal(0)
+                    if status.get(o.id, o.status) in FINAL
+                    else max(
                         o.qty - max(broker_filled.get(o.id, o.filled_qty), o.filled_qty),
                         Decimal(0),
                     )

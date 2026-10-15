@@ -378,7 +378,8 @@ async def update_order(
 async def open_entry_orders(session: AsyncSession) -> list[Order]:
     """Entry orders that still reserve their symbol: every buy not yet settled by the
     ledger (WP 1.5b), whatever its status. A final but unsettled row (fills not booked
-    yet) keeps reserving until the ledger settles it."""
+    yet) keeps blocking its symbol until the ledger settles it; the engine prices it at
+    notional 0 (spec 4.7)."""
     rows = await session.scalars(
         select(Order)
         .where(Order.side == "buy", Order.settled_at.is_(None))

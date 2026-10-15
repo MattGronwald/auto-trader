@@ -87,6 +87,12 @@ class RiskDecision(_Frozen):
     pause: Pause | None = None  # side effect the engine must apply on rejection
 
 
+# Order statuses after which nothing more fills (broker finals plus the local
+# "not_submitted"). A final row settles once its fills are all booked (spec 4.3); until
+# then it blocks its symbol but reserves no notional (spec 4.7).
+FINAL = frozenset({"filled", "canceled", "rejected", "not_submitted"})
+
+
 class OrderUpdate(_Frozen):
     """One order's broker view for the ledger (WP 1.5b, spec section 4.2). `status` and
     `fills` are two separate broker reads, so the fills may be ahead of `filled_qty`."""
