@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from autotrader.broker.base import AssetRules, BrokerOrder, Dec, FeeSchedule
+from autotrader.broker.base import AssetRules, BrokerOrder, Dec, FeeSchedule, Fill
 
 
 class _Frozen(BaseModel):
@@ -85,3 +85,30 @@ class RiskDecision(_Frozen):
     qty: Dec | None = None
     order: BrokerOrder | None = None
     pause: Pause | None = None  # side effect the engine must apply on rejection
+
+
+class OrderUpdate(_Frozen):
+    """One order's broker view for the ledger (WP 1.5b, spec section 4.2). `status` and
+    `fills` are two separate broker reads, so the fills may be ahead of `filled_qty`."""
+
+    order_row_id: int
+    status: str  # a broker OrderState, or the local finals "not_submitted" / "rejected"
+    filled_qty: Dec  # the broker's cumulative filled qty (0 for local finals)
+    fills: tuple[Fill, ...] = ()
+    min_qty: Dec | None = None  # None only for local finals: no broker call, no fills
+
+
+class SyncResult(_Frozen):
+    """One sync pass. `failed` lists order rows whose broker state could not be read."""
+
+    updates: tuple[OrderUpdate, ...] = ()
+    failed: tuple[int, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.failed
+
+
+class SyncIncomplete(RuntimeError):
+    """An unsettled order's broker state could not be read: entries fail closed (PLAN 3.2
+    item 4) until it is resolved."""
