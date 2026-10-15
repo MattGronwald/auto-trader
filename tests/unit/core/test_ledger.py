@@ -704,6 +704,39 @@ async def test_a_partial_exit_keeps_the_position_open(
     assert (pos.qty, pos.closed_at) == (D("0.6"), None)
 
 
+async def test_an_exit_in_two_fills_reduces_then_closes_with_exact_pnl(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await settle_entry(sessions, ledger, sim, 1)
+    sim.script(BTC, "sell", FillPlan((D("0.4"),)))  # the rest sells on the next bar
+    row, oid = await place(sessions, sim, "close", "1", exit_reason="trailing")
+    sim.process_bar(bar(2, 110.0))  # sells 0.4
+
+    first = await update(sim, row, oid)
+    assert first.status == "partially_filled"
+    assert await ledger.apply(first) == "applied"
+    (pos,) = await positions(sessions)
+    assert (pos.qty, pos.closed_at) == (D("0.6"), None)
+    exit_order = (await orders(sessions))[1]
+    assert (exit_order.filled_qty, exit_order.settled_at) == (D("0.4"), None)
+
+    sim.process_bar(bar(3, 105.0))  # sells the other 0.6: the exit is filled
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"
+    (pos,) = await positions(sessions)
+    # in: 44 - 0.11 + 63 - 0.1575 = 106.7325; out: 100 + 0.25
+    assert (pos.exit_reason, pos.qty, pos.realized_pnl, pos.fees, pos.dust_qty) == (
+        "trailing",
+        D("0"),
+        D("6.4825"),
+        D("0.5175"),
+        D("0"),
+    )
+    assert pos.closed_at == T0 + timedelta(minutes=3)
+    assert len(await fills(sessions)) == 3
+    assert not await paused(sessions)
+
+
 async def test_the_position_closes_only_after_its_entry_settles(
     sessions: async_sessionmaker[AsyncSession], ledger: Ledger
 ) -> None:
