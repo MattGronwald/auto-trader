@@ -735,3 +735,45 @@ async def test_a_failing_rollback_after_a_commit_error_is_logged_and_the_read_ba
         out = await hbus.publish_tx(note_build("a"), note_visible)
     assert isinstance(out, Note)
     assert any(e["event"] == "bus.rollback_failed" for e in logs)
+
+
+async def test_publish_tx_commits_several_events_atomically_in_order(
+    bus: EventBus, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    got: list[DomainEvent] = []
+
+    async def handler(event: DomainEvent) -> None:
+        got.append(event)
+
+    bus.subscribe(DomainEvent, handler)
+
+    async def build(session: AsyncSession) -> tuple[DomainEvent, ...]:
+        session.add(m.ControlState(key="k", value=1))
+        return (Ping(ts=T0, n=1), Pong(ts=T0, text="two"))
+
+    async def verify(session: AsyncSession, event: DomainEvent) -> bool:
+        return False
+
+    out = await bus.publish_tx(build, verify)
+    await bus.drain()
+    assert isinstance(out, Ping) and out.n == 1
+    assert [e.type for e in await _events(sessions)] == ["Ping", "Pong"]
+    assert [type(e).__name__ for e in got] == ["Ping", "Pong"]
+    async with sessions() as s:
+        assert await repo.get_control(s, "k") == 1
+
+
+async def test_publish_tx_empty_tuple_writes_and_delivers_nothing(
+    bus: EventBus, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    async def build(session: AsyncSession) -> tuple[DomainEvent, ...]:
+        session.add(m.ControlState(key="k", value=1))
+        return ()
+
+    async def verify(session: AsyncSession, event: DomainEvent) -> bool:
+        return False
+
+    assert await bus.publish_tx(build, verify) is None
+    assert await _events(sessions) == []
+    async with sessions() as s:
+        assert await repo.get_control(s, "k") is None
