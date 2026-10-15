@@ -1465,6 +1465,72 @@ async def test_a_failing_ledger_fails_entries_closed(
     assert result.decision.reasons == ("state unavailable: RuntimeError",)
 
 
+ETH = "ETH/USD"
+
+
+class OverfilledEthBroker(SimBroker):
+    """Reports a journal ETH buy of qty 1 as filled 2: a ledger anomaly (`overfilled`)."""
+
+    async def get_order(self, order_id: str) -> OrderStatus:
+        if order_id != "eth-1":
+            return await super().get_order(order_id)
+        return OrderStatus(
+            order_id=order_id, status="filled", filled_qty=D("2"), avg_fill_price=D("10")
+        )
+
+    async def order_fills(self, order_id: str) -> list[Fill]:
+        if order_id != "eth-1":
+            return await super().order_fills(order_id)
+        return [
+            Fill(
+                fill_id="eth-f1",
+                order_id=order_id,
+                symbol=ETH,
+                side="buy",
+                qty=D("2"),
+                price=D("10"),
+                fee=D("0.05"),
+                fee_asset="quote",
+                ts=NOW,
+            )
+        ]
+
+    async def asset_rules(self, symbol: str) -> AssetRules:
+        return RULES if symbol == ETH else await super().asset_rules(symbol)
+
+
+async def test_an_anomaly_found_by_this_checks_sync_rejects_the_entry_as_paused(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    # The gate is read after the ledger booked the sync: a pause set by this very pass
+    # rejects the entry, so no approved decision and no pending order row are written.
+    broker = _sim(OverfilledEthBroker)
+    async with sessions() as s:
+        eth = await repo.insert_order(
+            s,
+            cycle_id=None,
+            client_order_id=None,
+            symbol=ETH,
+            mode="paper",
+            type_="limit",
+            side="buy",
+            qty=D("1"),
+            limit_price=D("10"),
+            stop_price=None,
+            tp_price=None,
+            status="pending",
+            now=NOW,
+        )
+        await repo.update_order(s, eth.id, status="new", now=NOW, broker_order_id="eth-1")
+
+    result = await make_engine_(broker, sessions, gate).check(intent(cycle_id))
+    assert not result.decision.approved
+    assert result.decision.reasons[0].startswith("control: trading paused")
+    assert [o.id for o in await orders(sessions)] == [eth.id]  # no pending BTC row
+    (dec,) = await decisions(sessions)
+    assert not dec.approved
+
+
 async def test_sync_orders_reads_every_unsettled_row_once(
     sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
 ) -> None:

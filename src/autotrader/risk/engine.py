@@ -207,13 +207,14 @@ class RiskEngine:
     ) -> tuple[ControlStatus, PortfolioState, MarketSnapshot]:
         """Only the network/gate awaits are budgeted; a timeout raises out of here and
         `check()` turns it into the persisted `state unavailable` rejection."""
-        control = await self._within(deadline, lambda: self._gate.status(now))
         # Book our own orders BEFORE reading positions: a fill the sync observed is then in
         # the journal and in the positions read below (never neither position nor entry).
         synced = await self._sync(deadline)
         await self._ledger.apply_all(synced)
         if not synced.complete:  # PLAN 3.2 item 4: an unreadable order fails entries closed
             raise SyncIncomplete(f"order rows not synced: {list(synced.failed)}")
+        # After the booking: a pause this pass set (ledger anomaly) already rejects here.
+        control = await self._within(deadline, lambda: self._gate.status(now))
         async with self._sessions() as session:
             open_rows = await repo.open_entry_orders(session)
             # One open journal trade per symbol (PR #25 review): a trade stays open (e.g.
