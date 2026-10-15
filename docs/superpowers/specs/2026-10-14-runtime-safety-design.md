@@ -2,6 +2,8 @@
 
 Date: 2026-10-14. Status: approved (three Codex spec rounds and two plan rounds on PR #23), then revised by the self-review below.
 
+Revised 2026-10-15 after a CI failure on PR #23: teardown no longer cancels the stream right after `source.stop()`. It waits for the stream within the remaining budget, so a bar in flight finishes its journal writes (section 4, step 2).
+
 Revised 2026-10-14 after a self-review against the code, before implementation:
 - the watchdog is never cancelled once armed, because interpreter exit can hang on non-daemon aiosqlite threads;
 - startup races the stop request, so a signal during the broker connect or the backfill is bounded too;
@@ -142,7 +144,7 @@ Loops registered in 1.5a:
 - It then runs the ordered teardown:
   0. An unfinished startup (see section 3), bounded by the remaining time.
   1. Admission: nothing to close in 1.5a. 1.5d inserts "close admission, then `runner.close()`" here.
-  2. `source.stop()`, then `supervisor.stop(deadline)`.
+  2. `source.stop()`, then `supervisor.stop(deadline)`, then the stream task, bounded by the remaining time. It is not cancelled up front: once stopped it ends on its own after the bar in hand, and cancelling it mid-bar could commit a bar without its `BarClosed` event. It is cancelled only at the deadline (forced); a stream that raised fails the step.
   3. `bus.close()`, bounded by the remaining time.
   4. `engine.dispose()`, bounded by the remaining time but given **at least 1 s** even after the deadline (still inside the 5 s watchdog grace). Otherwise a stuck earlier step would leave the journal's connections open on every forced teardown.
 - **The deadline is enforced by not waiting.** Cancellation alone can't enforce it: a task that catches `CancelledError` keeps `wait_for` pending. So each step is waited on with `asyncio.wait(..., timeout=remaining)`. When time runs out, the step's task is cancelled once and then *left behind*, without awaiting it again.

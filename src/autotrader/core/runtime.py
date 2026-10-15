@@ -21,8 +21,10 @@ WP 1.5a (spec 2026-10-14):
   deadline is cancelled once and left behind (`core.shutdown_forced`), and abandoned work
   stays in the journal for startup recovery (WP 1.5d). A startup failure or stream death is
   logged as `core.failed` (with the traceback) before teardown: here once shutdown began, by
-  the CLI for one raised before it (preconditions, journal engine). A stream error that lands
-  as the stop is requested fails the `stream` step (`core.shutdown_failed`, exit 1).
+  the CLI for one raised before it (preconditions, journal engine). The stopped stream gets
+  the remaining budget to end on its own, so a bar in flight finishes its journal writes; a
+  stream error, including one that lands as the stop is requested, fails the `stream` step
+  (`core.shutdown_failed`, exit 1).
 """
 
 import asyncio
@@ -276,18 +278,15 @@ async def _teardown(
     forced: list[str] = []  # timed out: cancelled once and left behind
     failed: list[str] = []  # completed, but raised or was cancelled
 
-    async def bounded(
-        name: str, work: Awaitable[object], floor_s: float = 0.0, cancel_ok: bool = False
-    ) -> None:
+    async def bounded(name: str, work: Awaitable[object], floor_s: float = 0.0) -> None:
         task = asyncio.ensure_future(work)
         done, _ = await asyncio.wait({task}, timeout=max(control.remaining(), floor_s))
         if not done:
             task.cancel()
             forced.append(name)
         elif task.cancelled():
-            if not cancel_ok:
-                failed.append(name)
-                log.error("core.shutdown_step_failed", step=name, error="cancelled")
+            failed.append(name)
+            log.error("core.shutdown_step_failed", step=name, error="cancelled")
         elif (error := task.exception()) is not None:
             failed.append(name)
             log.error("core.shutdown_step_failed", step=name, error=repr(error))
@@ -300,16 +299,14 @@ async def _teardown(
     await bounded("source.stop", source.stop())
     if supervisor is not None:
         forced += [f"loop:{name}" for name in await supervisor.stop(deadline)]
-    if stream_task is not None and not stream_task.done():
-        stream_task.cancel()
-        await bounded("stream", stream_task, cancel_ok=True)  # we cancelled it ourselves
-    elif stream_task is not None and not stream_died and not stream_task.cancelled():
-        # It ended while the stop was being requested, before the supervise loop looked: read
-        # its error here (else it is never retrieved and the exit would read clean). A stream
-        # that returned normally after `source.stop()` stays clean.
-        if (error := stream_task.exception()) is not None:
-            failed.append("stream")
-            log.error("core.shutdown_step_failed", step="stream", error=repr(error))
+    if stream_task is not None and not stream_died:
+        # After `source.stop()` the stream ends on its own once the bar in hand is handled, so
+        # it gets the remaining budget instead of an immediate cancel, which could commit a bar
+        # without its BarClosed event (PR #23 CI). It is cancelled only at the deadline
+        # (forced). A stream that raised, including one that ended while the stop was being
+        # requested, before the supervise loop looked, fails the step; a normal return is
+        # clean.
+        await bounded("stream", stream_task)
     await bounded("bus.close", bus.close(budget_s=control.remaining()))
     # A floor even after the deadline (inside the watchdog's 5 s grace): a forced teardown
     # must still close the journal's connections (dry run, spec revision 2026-10-14).

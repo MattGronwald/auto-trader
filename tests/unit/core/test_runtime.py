@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from autotrader.broker.base import Account, BrokerError, FeeSchedule
 from autotrader.core.bus import EventBus
 from autotrader.core.config import AppConfig, Settings, load_config, load_profile
-from autotrader.core.feed import Latest
+from autotrader.core.feed import Latest, MarketFeed
 from autotrader.core.kill import ControlStatus
 from autotrader.core.lock import JournalLock, acquire
 from autotrader.core.logging import configure_logging
@@ -656,3 +656,41 @@ async def test_stream_error_at_the_stop_request_is_read_and_fails_the_exit(
     assert step["step"] == "stream" and "stream died at stop" in step["error"]
     assert "core.stopped" not in [ln["event"] for ln in _log_lines(buf)]
     assert unhandled == []  # no "Task exception was never retrieved"
+
+
+async def test_stop_lets_a_bar_in_flight_finish_its_journal_writes(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop that lands while the stream is persisting a bar must not cut that bar's writes:
+    the stream gets the remaining budget to end on its own (CI flake on PR #23, where a bar
+    row was committed without its BarClosed event)."""
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    real_on_bar = MarketFeed.on_bar
+    in_second, release = asyncio.Event(), asyncio.Event()
+    seen: list[Bar] = []
+
+    async def gated_on_bar(self: MarketFeed, bar: Bar) -> None:
+        seen.append(bar)
+        if len(seen) == 2:  # the second bar is still being handled when the stop arrives
+            in_second.set()
+            await release.wait()
+        await real_on_bar(self, bar)
+
+    monkeypatch.setattr(MarketFeed, "on_bar", gated_on_bar)
+    control, _ = make_control()
+    task = start_core(cfg, lock, control)
+    await asyncio.wait_for(in_second.wait(), timeout=5)
+    control.begin("stop")
+    await _wait_for(lambda: any(ln["event"] == "core.stopping" for ln in _log_lines(buf)))
+    release.set()  # teardown is under way: the bar finishes only if teardown waits for it
+
+    assert await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN
+    engine = make_engine(cfg.database.url)
+    try:
+        async with make_sessionmaker(engine)() as s:
+            assert await s.scalar(select(func.count()).select_from(m.BarRow)) == 2
+            closed = [e.payload for e in await s.scalars(select(m.Event)) if e.type == "BarClosed"]
+    finally:
+        await engine.dispose()
+    assert [p["timeframe"] for p in closed].count("1m") == 2
