@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -282,20 +282,16 @@ async def test_client_order_id_is_unique(session: AsyncSession) -> None:
         await repo.insert_order(session, **kw)
 
 
-async def test_open_entry_orders_and_update(session: AsyncSession) -> None:
+async def test_open_entry_orders_are_the_unsettled_buys(session: AsyncSession) -> None:
     keep = [
-        await _order(session, status=s) for s in ("pending", "new", "partially_filled", "unknown")
-    ]
-    for s in ("filled", "canceled", "rejected", "not_submitted"):
         await _order(session, status=s)
+        for s in ("pending", "new", "partially_filled", "unknown", "filled", "canceled")
+    ]
+    done = await _order(session, status="filled")
+    await session.execute(update(m.Order).where(m.Order.id == done.id).values(settled_at=T0))
+    await session.commit()
     await _order(session, status="new", side="sell")
     assert {o.id for o in await repo.open_entry_orders(session)} == {o.id for o in keep}
-    await repo.update_order(session, keep[1].id, status="filled", now=T0, broker_order_id="b1")
-    assert {o.id for o in await repo.open_entry_orders(session)} == {
-        keep[0].id,
-        keep[2].id,
-        keep[3].id,
-    }
 
 
 async def test_count_entry_orders_window(session: AsyncSession) -> None:
@@ -496,3 +492,36 @@ async def test_open_cycles_and_order_lookup(session: AsyncSession) -> None:
         now=T0,
     )
     assert await repo.has_order_for_cycle(session, open_.id)
+
+
+async def test_insert_order_records_exit_reason_and_starts_unsettled(session: AsyncSession) -> None:
+    row = await repo.insert_order(
+        session,
+        cycle_id=None,
+        client_order_id=None,
+        symbol="BTC/USD",
+        mode="paper",
+        type_="market",
+        side="sell",
+        qty=Decimal("1"),
+        limit_price=None,
+        stop_price=None,
+        tp_price=None,
+        status="pending",
+        now=T0,
+        exit_reason="stop",
+    )
+    assert (row.exit_reason, row.filled_qty, row.settled_at, row.position_id) == (
+        "stop",
+        Decimal(0),
+        None,
+        None,
+    )
+
+
+async def test_unsettled_orders_are_every_row_without_settled_at(session: AsyncSession) -> None:
+    open_ = [await _order(session, status=s) for s in ("new", "filled", "not_submitted")]
+    done = await _order(session, status="filled", side="sell")
+    await session.execute(update(m.Order).where(m.Order.id == done.id).values(settled_at=T0))
+    await session.commit()
+    assert [o.id for o in await repo.unsettled_orders(session)] == [o.id for o in open_]

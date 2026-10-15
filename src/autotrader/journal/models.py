@@ -131,13 +131,30 @@ class Order(Base):
     status: Mapped[str] = mapped_column(String(16))
     submitted_at: Mapped[datetime]
     updated_at: Mapped[datetime]
+    # WP 1.5b (spec 2026-10-15): the applied fill qty (never the broker's figure), the
+    # settlement time (NULL = effects unapplied = still reserving), the trade it belongs to
+    # (kill/flatten exits have no cycle) and, for exits, why.
+    filled_qty: Mapped[Decimal] = mapped_column(default=Decimal(0), server_default="0")
+    settled_at: Mapped[datetime | None]
+    position_id: Mapped[int | None] = mapped_column(ForeignKey("positions.id"))
+    exit_reason: Mapped[str | None] = mapped_column(String(16))
 
 
 class Fill(Base):
+    """One broker execution, booked once (`broker_fill_id`, WP 1.5b). `fee` stays in the
+    asset that paid it (`fee_asset`); qty/price/fee are written by value."""
+
     __tablename__ = "fills"
+    __table_args__ = (
+        CheckConstraint("side IN ('buy', 'sell')", name="side"),
+        CheckConstraint("fee_asset IN ('base', 'quote')", name="fee_asset"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"))
+    broker_fill_id: Mapped[str] = mapped_column(String(64), unique=True)
+    side: Mapped[str] = mapped_column(String(8))
+    fee_asset: Mapped[str] = mapped_column(String(8))
     qty: Mapped[Decimal]
     price: Mapped[Decimal]
     fee: Mapped[Decimal]
@@ -166,6 +183,23 @@ class Position(Base):
     r_multiple: Mapped[Decimal | None]
     llm_cost_usd: Mapped[Decimal | None]
     benchmark_return: Mapped[Decimal | None]
+    # WP 1.5b: `qty` is the open (remaining) qty. The R denominator at entry (never changed
+    # by trailing), the remainder written off at close, and carried dust of earlier trades
+    # that this trade's sells consumed (D17).
+    initial_risk: Mapped[Decimal | None]
+    dust_qty: Mapped[Decimal | None]
+    dust_consumed: Mapped[Decimal] = mapped_column(default=Decimal(0), server_default="0")
+
+
+class SymbolDust(Base):
+    """Dust the broker still holds per symbol after write-off closes (WP 1.5b, D17). A close
+    adds its remainder; a later sell beyond its open qty consumes it."""
+
+    __tablename__ = "symbol_dust"
+
+    symbol: Mapped[str] = mapped_column(String(32), primary_key=True)
+    qty: Mapped[Decimal]
+    updated_at: Mapped[datetime]
 
 
 class BarRow(Base):

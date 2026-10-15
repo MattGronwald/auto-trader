@@ -296,11 +296,6 @@ async def set_control(session: AsyncSession, key: str, value: Any) -> None:
 
 # --- risk decisions / orders / equity (WP 1.3) ---------------------------------------
 
-# Entry orders that may still fill: not yet acked, acked and not final (including partly
-# filled with the rest still open), or unknown after an ambiguous submit failure (WP 1.5
-# reconciles those by client_order_id). "partially_filled" fits orders.status String(16).
-OPEN_ENTRY_STATUSES = ("pending", "new", "partially_filled", "unknown")
-
 
 async def record_risk_decision(
     session: AsyncSession,
@@ -342,6 +337,7 @@ async def insert_order(
     tp_price: Decimal | None,
     status: str,
     now: datetime,
+    exit_reason: str | None = None,
 ) -> Order:
     row = Order(
         cycle_id=cycle_id,
@@ -357,6 +353,7 @@ async def insert_order(
         status=status,
         submitted_at=now,
         updated_at=now,
+        exit_reason=exit_reason,
     )
     session.add(row)
     await session.commit()
@@ -379,9 +376,25 @@ async def update_order(
 
 
 async def open_entry_orders(session: AsyncSession) -> list[Order]:
+    """Entry orders that still reserve their symbol: every buy not yet settled by the
+    ledger (WP 1.5b), whatever its status. A final but unsettled row (fills not booked
+    yet) keeps blocking its symbol until the ledger settles it; the engine prices it at
+    notional 0 (spec 4.7)."""
     rows = await session.scalars(
         select(Order)
-        .where(Order.side == "buy", Order.status.in_(OPEN_ENTRY_STATUSES))
+        .where(Order.side == "buy", Order.settled_at.is_(None))
+        .order_by(Order.id)
+        .execution_options(populate_existing=True)
+    )
+    return list(rows)
+
+
+async def unsettled_orders(session: AsyncSession) -> list[Order]:
+    """Every order whose effects are not fully applied yet (WP 1.5b), in id order: the
+    ledger books a symbol's orders oldest first."""
+    rows = await session.scalars(
+        select(Order)
+        .where(Order.settled_at.is_(None))
         .order_by(Order.id)
         .execution_options(populate_existing=True)
     )

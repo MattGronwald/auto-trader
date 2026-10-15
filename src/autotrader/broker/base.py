@@ -71,11 +71,12 @@ class OrderStatus(_Frozen):
 
 
 class Fill(_Frozen):
-    """One broker execution. `fill_id` is unique and stable per execution, so a consumer
-    applies each fill once (WP 1.5). `qty` is the gross qty traded at `price`; `fee` is
-    denominated in `fee_asset`: a buy with `FeeSchedule.buy_fee_asset == "base"` pays
-    it in the coin (net coins received = qty - fee), every sell and every "quote" buy
-    pays it in USD (G10, D10, docs/alpaca-notes.md)."""
+    """One broker execution. `fill_id` is unique and stable per execution, so the ledger
+    books each fill once (WP 1.5b, `fills.broker_fill_id`). `qty` is the gross qty traded
+    at `price`; `fee` is denominated in `fee_asset`: a buy with
+    `FeeSchedule.buy_fee_asset == "base"` pays it in the coin (net coins received =
+    qty - fee), every sell and every "quote" buy pays it in USD (G10, D10,
+    docs/alpaca-notes.md)."""
 
     fill_id: str
     order_id: str
@@ -126,6 +127,19 @@ class OrderRejected(BrokerError):
     pass
 
 
+class DustRemainder(OrderRejected):
+    """A full close was refused: what is left is below the minimum order qty (dust).
+
+    Typed so kill/flatten can report dust explicitly (PLAN 3.2 item 5, WP 1.5b) instead of
+    matching message text. It is an `OrderRejected`, so existing handlers stay correct."""
+
+    def __init__(self, symbol: str, qty: Decimal, min_qty: Decimal) -> None:
+        super().__init__(f"dust below minimum: {qty} < min_qty {min_qty}")
+        self.symbol = symbol
+        self.qty = qty
+        self.min_qty = min_qty
+
+
 class OrderNotFound(BrokerError):
     pass
 
@@ -136,6 +150,7 @@ class Broker(Protocol):
     async def submit_order(self, order: BrokerOrder) -> OrderAck: ...
     async def cancel_order(self, order_id: str) -> None: ...
     async def get_order(self, order_id: str) -> OrderStatus: ...
+    async def order_fills(self, order_id: str) -> list[Fill]: ...
     async def close_position(self, symbol: str) -> OrderAck: ...
     async def close_all(self) -> list[OrderAck]: ...
     def stream_fills(self) -> AsyncIterator[Fill]: ...

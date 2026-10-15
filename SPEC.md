@@ -344,9 +344,10 @@ cycles            (id, strategy_id, symbol, rule_id, signal_features json, state
 agent_calls       (id, cycle_id, agent, model, prompt_version, prompt_hash, input json, output json, tokens_in, tokens_out, cost_usd, latency_ms, ts)
 order_intents     (id, cycle_id, json, confidence, thesis, strongest_counter, learnings_applied json)
 risk_decisions    (id, cycle_id, kind, approved, reasons json, adjusted json, computed_size, ts)
-orders            (id, cycle_id, broker_order_id, client_order_id, symbol, mode, type, side, qty, limit_price, stop_price, tp_price, status, submitted_at, updated_at)
-fills             (id, order_id, qty, price, fee, ts)
-positions         (id, cycle_id, symbol, side, qty, entry_price, stop, tp, time_limit_at, opened_at, closed_at, exit_reason, realized_pnl, fees, mae, mfe, r_multiple, llm_cost_usd, benchmark_return)
+orders            (id, cycle_id, broker_order_id, client_order_id, symbol, mode, type, side, qty, limit_price, stop_price, tp_price, status, submitted_at, updated_at, filled_qty, settled_at, position_id, exit_reason)
+fills             (id, order_id, broker_fill_id, side, fee_asset, qty, price, fee, ts)
+positions         (id, cycle_id, symbol, side, qty, entry_price, stop, tp, time_limit_at, opened_at, closed_at, exit_reason, realized_pnl, fees, mae, mfe, r_multiple, llm_cost_usd, benchmark_return, initial_risk, dust_qty, dust_consumed)
+symbol_dust       (symbol, qty, updated_at)   -- dust the broker still holds per symbol (WP 1.5b)
 bars              (symbol, timeframe, ts, o, h, l, c, v)   -- 1m persisted; others derived
 equity_snapshots  (ts, equity, cash, exposure, hwm, daily_pnl, benchmark_equity)
 events            (id, ts, type, cycle_id, payload json)    -- append-only
@@ -355,7 +356,7 @@ reviews           (id, strategy_id, period_start, period_end, report json, cost_
 control_state     (key, value)   -- paused, paused_until, kill, mode
 ```
 
-This is a logical schema summary; `journal/models.py` and migrations define the installed schema (head `0003` at this review). `cycle_id` is nullable for reviewer calls and control-driven exits; broker/client order ids are unique when present. `equity_snapshots.exposure = NULL` means unknown, not zero. WP 1.4 stores stub intent fields in transition details; it does not yet populate the `order_intents` table. WP 1.5 must preserve position exit metadata; WP 1.6 adds durable broker fill identity; WP 3.1 adds fee-activity provenance/reconciliation. Schema presence alone does not mean a component writes it.
+This is a logical schema summary; `journal/models.py` and migrations define the installed schema (head `0003` at this review). `cycle_id` is nullable for reviewer calls and control-driven exits; broker/client order ids are unique when present. `equity_snapshots.exposure = NULL` means unknown, not zero. WP 1.4 stores stub intent fields in transition details; it does not yet populate the `order_intents` table. WP 1.5 must preserve position exit metadata. **2026-10-15 (WP 1.5b):** migration `0004` adds fill identity (`broker_fill_id`, unique) and fee asset, order settlement (`filled_qty`, `settled_at`, `position_id`, `exit_reason`), position `initial_risk`/`dust_qty`/`dust_consumed` and `symbol_dust`; 1.5b books fills from SimBroker, WP 1.6 adds the Alpaca fill path; WP 3.1 adds fee-activity provenance/reconciliation. Schema presence alone does not mean a component writes it.
 
 Indexes on `cycles(created_at)`, `positions(closed_at)`, `events(ts)`, `agent_calls(cycle_id)`.
 

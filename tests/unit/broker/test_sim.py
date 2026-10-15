@@ -10,6 +10,7 @@ from autotrader.broker.base import (
     AssetRules,
     Broker,
     BrokerOrder,
+    DustRemainder,
     FeeSchedule,
     Fill,
     OrderNotFound,
@@ -1127,3 +1128,39 @@ async def test_paper_fill_rounding_makes_the_loss_strictly_larger() -> None:
     # simulated loss must exceed the unrounded D16 estimate, by at most one quantum.
     loss, expected, bound = await stop_out(D("82994.2"), D("80000"), D("0.000118113"), BASE, FINE)
     assert TINY < loss - expected <= bound
+
+
+async def test_order_fills_lists_every_execution_of_one_order() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    sim.script(BTC, "buy", FillPlan((D("0.5"),)))
+    ack = await sim.submit_order(market("buy", "1"))
+    other = await sim.submit_order(market("buy", "0.1"))
+    sim.process_bar(bar(1, 100.0))
+    sim.process_bar(bar(2, 100.0))
+
+    fills = await sim.order_fills(ack.order_id)
+    assert [f.fill_id for f in fills] == [f"{ack.order_id}:1", f"{ack.order_id}:2"]
+    assert sum(f.qty for f in fills) == (await sim.get_order(ack.order_id)).filled_qty
+    assert [f.fill_id for f in await sim.order_fills(other.order_id)] == [f"{other.order_id}:1"]
+
+
+async def test_order_fills_of_an_unknown_order_raises() -> None:
+    with pytest.raises(OrderNotFound):
+        await make_sim().order_fills("sim-404")
+
+
+async def test_dust_close_raises_the_typed_dust_signal() -> None:
+    sim = make_sim(fees=BASE)
+    sim.process_bar(bar(0, 20000.0))
+    await sim.submit_order(market("buy", "0.0001"))
+    sim.process_bar(bar(1, 20000.0))  # net 0.00009975 < min_qty 0.0001
+
+    with pytest.raises(DustRemainder) as caught:
+        await sim.close_position(BTC)
+    assert (caught.value.symbol, caught.value.qty, caught.value.min_qty) == (
+        BTC,
+        D("0.00009975"),
+        D("0.0001"),
+    )
+    assert isinstance(caught.value, OrderRejected)  # existing handlers stay correct

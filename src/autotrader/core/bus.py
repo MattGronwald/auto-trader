@@ -20,15 +20,16 @@ past `HIGH_WATER` is logged. A handler that raises is logged (with the event's
 `close()` such a publish raises `BusClosedError` like any other.
 
 `publish_tx(build, verify, on_uncertain=)` (WP 1.4, D15) commits a caller's writes and
-their event in one transaction: under the same lock, `build(session)` writes without
-committing and returns the event (or `None`: roll back, nothing to do), the bus appends
-the event, commits once and enqueues. The unit runs in a bus-owned task the caller
-awaits through `asyncio.shield`, so cancelling the caller never interrupts a commit or
-loses a committed event's delivery. A commit that raises is not proof of rollback: the
-bus asks `verify` once in a fresh session; only a positive answer confirms (deliver),
-anything else raises `CommitUncertain` after calling `on_uncertain` from the unit
-itself. Delivery is exactly once for confirmed commits; an uncertain or abandoned unit
-may be persisted without delivery (the `events` table stays the record).
+their event(s) in one transaction: under the same lock, `build(session)` writes without
+committing and returns the event, a tuple of events (all committed in the same
+transaction, verified by the first; WP 1.5b), or `None`/`()`: roll back, nothing to do;
+the bus appends the event(s), commits once and enqueues. The unit runs in a bus-owned
+task the caller awaits through `asyncio.shield`, so cancelling the caller never
+interrupts a commit or loses a committed event's delivery. A commit that raises is not
+proof of rollback: the bus asks `verify` once in a fresh session; only a positive answer
+confirms (deliver), anything else raises `CommitUncertain` after calling `on_uncertain`
+from the unit itself. Delivery is exactly once for confirmed commits; an uncertain or
+abandoned unit may be persisted without delivery (the `events` table stays the record).
 
 `close(budget_s)` is bounded: it marks the bus closed, waits for in-flight publishes
 and units and for the subscriber backlog until the deadline, then stops the workers.
@@ -79,7 +80,7 @@ class CommitUncertain(RuntimeError):
     """A transactional publish may or may not have committed (D15)."""
 
 
-Build = Callable[[AsyncSession], Awaitable[DomainEvent | None]]
+Build = Callable[[AsyncSession], Awaitable[DomainEvent | tuple[DomainEvent, ...] | None]]
 Verify = Callable[[AsyncSession, DomainEvent], Awaitable[bool]]
 OnUncertain = Callable[[CommitUncertain], None]
 
@@ -132,7 +133,8 @@ class EventBus:
     async def publish_tx(
         self, build: Build, verify: Verify, *, on_uncertain: OnUncertain | None = None
     ) -> DomainEvent | None:
-        """Commit `build`'s writes and the event it returns together, then deliver."""
+        """Commit `build`'s writes and the event(s) it returns together, then deliver them in
+        order; returns the first."""
         if self._closed:
             raise BusClosedError("event bus is closed")
         unit = asyncio.create_task(self._unit(build, verify, on_uncertain), name="bus:unit")
@@ -145,8 +147,10 @@ class EventBus:
         if unit.cancelled():
             return
         exc = unit.exception()  # retrieved here; a caller that is still waiting re-raises it
-        if exc is not None and not isinstance(exc, CommitUncertain):  # that one is logged
+        if exc is not None and not isinstance(exc, CommitUncertain | repo.StaleTransition):
             # The caller may be gone (cancelled): without this the failure would vanish.
+            # CommitUncertain is logged by the unit; StaleTransition by its caller (the
+            # runner logs cycle.completed_elsewhere or cycle.stuck).
             log.error("bus.unit_failed", error=repr(exc))
 
     async def _unit(
@@ -154,19 +158,24 @@ class EventBus:
     ) -> DomainEvent | None:
         async with self._lock:
             async with self._sessions() as session:
-                event = await build(session)
-                if event is None:
+                built = await build(session)
+                events: tuple[DomainEvent, ...] = (
+                    built if isinstance(built, tuple) else () if built is None else (built,)
+                )
+                if not events:
                     await session.rollback()
                     return None
+                event = events[0]  # all commit together, so verifying one verifies all
                 event_type = type(event).__name__
-                await repo.append_event(
-                    session,
-                    event_type,
-                    event.payload(),
-                    cycle_id=event.cycle_id,
-                    ts=event.ts,
-                    commit=False,
-                )
+                for each in events:
+                    await repo.append_event(
+                        session,
+                        type(each).__name__,
+                        each.payload(),
+                        cycle_id=each.cycle_id,
+                        ts=each.ts,
+                        commit=False,
+                    )
                 try:
                     await session.commit()
                 except Exception as e:
@@ -193,7 +202,8 @@ class EventBus:
                     log.warning(
                         "bus.commit_recovered", event_type=event_type, cycle_id=event.cycle_id
                     )
-            self._enqueue(event)
+            for each in events:
+                self._enqueue(each)
         return event
 
     async def _confirmed(self, verify: Verify, event: DomainEvent) -> bool:

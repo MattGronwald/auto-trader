@@ -1063,3 +1063,36 @@ async def test_recover_must_run_before_admission(
         await runner.recover()
     risk.release.set()
     await runner.join()
+
+
+class LedgerFirstRisk(FakeRisk):
+    """check() returns after another check's sync already completed this cycle (WP 1.5b)."""
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        super().__init__(approved("new"))
+        self.sessions = sessions
+
+    async def check(self, intent: EntryIntent) -> OrderResult:
+        result = await super().check(intent)
+        async with self.sessions() as s:
+            await repo.transition_cycle(
+                s, intent.cycle_id, from_state="RISK_CHECK", to_state="FILLED", now=NOW
+            )
+            await s.commit()
+        return result
+
+
+async def test_a_cycle_the_ledger_completed_first_is_not_stuck(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    runner = make_runner(sessions, bus, gate, LedgerFirstRisk(sessions), strategy_id)
+    cid = await new_cycle(sessions, strategy_id)
+    with capture_logs() as logs:
+        await runner._run(cid, candidate())
+    assert (await cycle_row(sessions, cid)).state == "FILLED"
+    names = [e["event"] for e in logs]
+    assert "cycle.completed_elsewhere" in names
+    assert "cycle.stuck" not in names and "bus.unit_failed" not in names

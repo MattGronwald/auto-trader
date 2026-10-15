@@ -292,3 +292,9 @@ async def test_malformed_position_payload_is_a_broker_error() -> None:
 async def test_cancellation_is_not_swallowed() -> None:
     with pytest.raises(asyncio.CancelledError):
         await connect(FailingClient("get_account", asyncio.CancelledError()))
+
+
+async def test_order_fills_is_not_implemented_until_wp_1_6() -> None:
+    broker = await connect(FakeClient())
+    with pytest.raises(BrokerError, match=r"order_fills is not implemented until WP 1\.6"):
+        await broker.order_fills("any")

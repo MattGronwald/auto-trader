@@ -146,6 +146,9 @@ class AlpacaBroker:
     async def get_order(self, order_id: str) -> OrderStatus:
         _not_yet("get_order")
 
+    async def order_fills(self, order_id: str) -> list[Fill]:
+        _not_yet("order_fills")
+
     async def close_position(self, symbol: str) -> OrderAck:
         _not_yet("close_position")
 

@@ -26,8 +26,8 @@ Fill model, driven by `process_bar()`:
 - Spot only: sells can never exceed the position (no shorting).
 - `close_position` sells the exact held qty minus pending sell remainders, even when it
   is not a multiple of `qty_increment` (Alpaca accepted the exact net qty on paper); a
-  remainder below `min_qty` is dust and is rejected (spec section 4). Whether Alpaca rejects
-  a sell below `min_order_size` is unverified (WP 1.6).
+  remainder below `min_qty` is dust and is rejected with `DustRemainder` (spec section 4).
+  Whether Alpaca rejects a sell below `min_order_size` is unverified (WP 1.6).
 
 Cash is checked at submit (reserving pending buys) and again at fill, because the price
 can gap; a buy that no longer fits is rejected at fill. Bar floats are converted via
@@ -48,6 +48,7 @@ from autotrader.broker.base import (
     Account,
     AssetRules,
     BrokerOrder,
+    DustRemainder,
     FeeSchedule,
     Fill,
     Mode,
@@ -230,6 +231,12 @@ class SimBroker:
             reason=o.reason,
         )
 
+    async def order_fills(self, order_id: str) -> list[Fill]:
+        """Every execution of `order_id` so far, oldest first (the WP 1.5b pull path).
+        Unknown ids raise `OrderNotFound`, like `get_order`."""
+        self._get(order_id)
+        return [f for f in self._fill_log.values() if f.order_id == order_id]
+
     async def close_position(self, symbol: str) -> OrderAck:
         if symbol not in self._holdings:
             raise OrderRejected(f"no position in {symbol}")
@@ -238,7 +245,7 @@ class SimBroker:
             raise OrderRejected(f"position in {symbol} is already fully reserved by pending sells")
         rules = self.asset_rules_by_symbol[symbol]
         if qty < rules.min_qty:  # unsellable remainder: stays as dust (HeldPosition.is_dust)
-            raise OrderRejected(f"dust below minimum: {qty} < min_qty {rules.min_qty}")
+            raise DustRemainder(symbol, qty, rules.min_qty)
         return await self._submit(
             BrokerOrder(symbol=symbol, side="sell", qty=qty, type="market"), full_close=True
         )

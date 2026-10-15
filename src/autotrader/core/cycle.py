@@ -10,8 +10,9 @@ walks
 
 with REJECTED / EXPIRED / ERROR exits (§4). `check()` is called once, never retried,
 and never timed out by the runner (only `close()` forces it). After submission only
-proven outcomes are mapped; `new` / `unknown` / `canceled` stay SUBMITTED until WP 1.5
-reconciles the order. Orders are reconciled by order row, not cycle state: an ERROR
+proven outcomes are mapped; `new` / `canceled` stay SUBMITTED until the ledger (WP 1.5b)
+settles the order from the broker's filled qty; an `unknown` row without a broker id waits for
+the 1.5d resolver. Orders are reconciled by order row, not cycle state: an ERROR
 cycle may own a real `pending` order.
 
 Any `CommitUncertain` suspends admission for the rest of the process; `recover()` on
@@ -84,7 +85,8 @@ RUNNER_EDGES: frozenset[tuple[CycleState, CycleState]] = frozenset(
         *((s, S.ERROR) for s in S if s not in TERMINAL),
     }
 )
-# Taken only by WP 1.5 reconciliation, from the broker's filled qty (§4).
+# Taken only by the ledger (WP 1.5b) when an entry order settles, from the broker's filled qty
+# (§4).
 RECONCILIATION_ONLY_EDGES: frozenset[tuple[CycleState, CycleState]] = frozenset(
     {(S.SUBMITTED, S.EXPIRED), (S.RISK_CHECK, S.FILLED)}
 )
@@ -344,7 +346,8 @@ class CycleRunner:
     # --- recovery --------------------------------------------------------------------
 
     async def recover(self) -> None:
-        """Startup: end cycles that provably sent nothing; leave the rest to WP 1.5.
+        """Startup: end cycles that provably sent nothing; leave the rest to the ledger (WP 1.5b;
+        startup reconciliation is 1.5d).
 
         Must run before the first admission (`RuntimeError` otherwise): run later, it could
         move a live cycle's RISK_CHECK to ERROR before `check()` inserts its order row.
@@ -587,7 +590,7 @@ class CycleRunner:
                 await self._after_check(cur, S.FILLED)
             elif result.status in ("rejected", "not_submitted"):
                 await self._after_check(cur, S.REJECTED, reason=f"order {result.status}")
-            else:  # new / unknown / canceled: WP 1.5 reconciles from the broker's fill qty
+            else:  # new / unknown / canceled: the ledger settles from the broker's fill qty (1.5b)
                 log.info("cycle.awaiting_order", status=result.status)
         finally:
             self._checks.pop(cur.cycle_id, None)
@@ -604,6 +607,14 @@ class CycleRunner:
             return True
         except asyncio.CancelledError:
             raise
+        except _WriteFailed as e:
+            if isinstance(e.__cause__, repo.StaleTransition):
+                # Another check()'s sync booked this cycle's order first and the ledger
+                # completed the cycle (WP 1.5b): its state is final, nothing is stuck.
+                log.info("cycle.completed_elsewhere", state=cur.state, to_state=to)
+            else:
+                log.exception("cycle.stuck", state=cur.state, to_state=to)
+            return False
         except Exception:  # incl. CommitUncertain: the order row decides what happens
             log.exception("cycle.stuck", state=cur.state, to_state=to)
             return False
