@@ -30,6 +30,13 @@ Full check, used at the end of every task:
 uv run ruff format && uv run ruff check --fix && uv run ruff format && uv run mypy && uv run pytest -q --cov && uv run coverage report --include='src/autotrader/risk/*' --fail-under=100 --show-missing
 ```
 
+**Plan dry run (2026-10-19):** all 13 tasks were applied verbatim in a throwaway worktree, running every check after each task: all green, 982 tests, `risk/` at 100 %. This revision folds in the 7 snippet bugs and 8 design findings it reported:
+- clarifications 15-17;
+- the owner's choices on findings 3 and 6 (2026-10-19: keep the spec's qualification rule; add the lock-first write);
+- the decisions it had to make where the plan was silent (clarification 18).
+
+The `position_manager.py` paths no test reaches (about 93 % covered: `settling`, the `qty == 0` skip, an invalid trigger, `CommitUncertain` on completion, a failed holdings read or cancel, a `pending`/`unknown` external outcome) get one test each in Tasks 9-10.
+
 ## Spec clarifications made while planning (flag in the PR description)
 
 1. **External-sale dust allocation is durable** (Codex plan note on PR #26). It happens once, in the external sell's **settlement** unit, computed from the order's booked `fills` rows, never from memory. Partial fills and restarts therefore can't double-consume `symbol_dust`. `ExternalHoldingSold` is published only when the settled order sold something (a zero-fill external order settles silently).
@@ -46,6 +53,22 @@ uv run ruff format && uv run ruff check --fix && uv run ruff format && uv run my
 12. **`ledger._verify` becomes the public `verify_unit`**, and the Position Manager's events subclass `LedgerEvent` (unit-exact commit verification, the 1.5b pattern).
 13. **No trailing update on a step where a trigger fires.** The trigger is evaluated against the stored values first (spec 4.3.1).
 14. **`positions.flatten_pending` and the non-flat `flatten_result` refresh both run every 10 s** (the first at once), not every step.
+15. **External retries wait for the sync loop** (dry run, owner 2026-10-19: spec rule kept). A failed external attempt leaves an id-less `rejected` (or `not_submitted`) row, and that symbol does not qualify again until the ledger settles the row (spec 4.4.1: no unsettled order of either side). In `run core` that takes up to 2 s, so external retries run every max(backoff, about 2 s).
+16. **Lock-first writes for the flatten state** (dry run, owner 2026-10-19). On SQLite (pysqlite's legacy mode), `BEGIN` is only issued at the first DML, so a guard's `SELECT` would run before the write lock. Every read-check-write of `flatten_requested`/`flatten_result` therefore starts with `flatten.lock_flatten_state(session)`, a no-op `UPDATE control_state SET key = key WHERE key = 'flatten_requested'`. It takes SQLite's write lock before the guard reads. The writes that need it:
+    - the completion unit;
+    - the non-flat refresh;
+    - `request_flatten`;
+    - `cancel_flatten`.
+
+    A concurrent `flatten --cancel` from another process then either commits before the guard reads (and the guard sees it) or waits for our commit. Postgres needs `SELECT ... FOR UPDATE` instead; the Postgres ownership work in WP 3.5 owns that.
+17. **Error containment beyond positions** (dry run). The whole control phase is wrapped (`positions.control_failed`), and so is each external `exit()` call (`positions.external_failed`, which counts a backoff failure). A raising external sale or cancel never stops the position exits on the same step (spec 4.3).
+18. **Decisions the dry run had to make:**
+    - `positions.entry_unresolved` is only logged when cancels run (the broker can trade).
+    - A latch whose guard matched nothing skips the position for this step.
+    - Cleared control values are written as JSON null, not deleted rows.
+    - External-sale backoff is a separate per-symbol dict.
+    - `core_running` probes with `LOCK_SH | LOCK_NB` on an `O_RDONLY` descriptor.
+    - Log assertions use `structlog.testing.capture_logs`.
 
 ## Review Focus
 
@@ -212,7 +235,7 @@ async def test_an_external_exit_marks_its_order_row(
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `uv run pytest tests/unit/journal/test_db.py tests/unit/risk/test_engine.py -q -k "0005 or external_exit or matches_models"`
-Expected: FAIL (`ValidationError: external ... extra inputs are not permitted`, no revision `0005`).
+Expected: FAIL (`ValidationError` on `external` for `ExitRequest`, `AttributeError: external` on the order row).
 
 - [ ] **Step 3: Implement**
 
@@ -495,7 +518,7 @@ async def test_a_marked_sell_against_an_open_position_books_normally_and_oversel
     assert pos.realized_pnl is None  # no external proceeds in a trade's P&L
 ```
 
-The existing `test_a_sell_without_any_position_is_an_anomaly` and `test_a_sell_without_a_position_waits_for_an_earlier_unsettled_order` keep pinning the unmarked behaviour.
+`test_a_marked_sell_against_an_open_position_books_normally_and_oversells` is a **regression pin**: it already passes before this task (it pins the 1.5b path that marked sells must keep), so Step 2 expects the other three to fail and this one to pass. The existing `test_a_sell_without_any_position_is_an_anomaly` and `test_a_sell_without_a_position_waits_for_an_earlier_unsettled_order` keep pinning the unmarked behaviour.
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -620,7 +643,7 @@ Write it with exact equality on floats built from whole seconds.
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `uv run pytest tests/unit/risk/test_engine.py tests/unit/core/test_feed.py -q -k "cancel_open or sellable or price_age"`
-Expected: FAIL (`AttributeError`).
+Expected: FAIL (`ImportError: cannot import name 'CancelResult'`; `AttributeError: price_age_s`).
 
 - [ ] **Step 3: Implement** the three methods and `CancelResult` as specified in Interfaces. Module docstring of `engine.py`: one sentence on `cancel_open_entries` (exit lock, own budget) and `sellable_positions`.
 
@@ -648,7 +671,7 @@ git commit -m "feat: engine cancel_open_entries/sellable_positions and feed pric
   - `ExitRules` (frozen dataclass): `trailing: Trailing` (from `core/config.py`), `stale_exit_enabled: bool`, `stale_exit_s: float`.
   - `evaluate(state: ExitState, bid: Decimal | None, price_age_s: float | None, now: datetime, rules: ExitRules) -> tuple[ExitReason | None, TrailUpdate | None]`. `bid` None means no trusted price; `price_age_s` None means unknown age (never stale).
   - `evaluate_bar(state: ExitState, bar: Bar) -> ExitReason | None`: bar-based callers only (tests, WP 1.7).
-  - `SellState = Literal["attempt", "unresolved", "in_flight", "settling"]` and `classify_sells(rows: Sequence[SellRow]) -> SellState`, where `SellRow` is a Protocol with `broker_order_id: str | None` and `status: str` (an `Order` row satisfies it). `rows` are the symbol's unsettled sell rows.
+  - `SellState = Literal["attempt", "unresolved", "in_flight", "settling"]` and `classify_sells(rows: Sequence[SellRow]) -> SellState`, where `SellRow` is a Protocol with **read-only properties** `broker_order_id -> str | None` and `status -> str`. Plain protocol attributes would not be satisfied by SQLAlchemy `Mapped` attributes or a frozen dataclass; with properties, an `Order` row and the tests' `Row` both satisfy it. `rows` are the symbol's unsettled sell rows.
   - `Backoff` (mutable dataclass): `failures: int = 0`, `next_at: datetime | None = None`; `due(now) -> bool`; `fail(now) -> bool` (records a failure, returns True when an alert is due); `reset()`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -871,7 +894,8 @@ git commit -m "feat: pure exit rules: triggers, trailing, same-bar rule, sell st
   - `async def read_request(session: AsyncSession) -> FlattenRequest | None`; `async def read_result(session: AsyncSession) -> dict[str, Any] | None`.
   - `async def request_flatten(sessions, *, source: str, reason: str | None, now: datetime) -> tuple[FlattenRequest, bool]`: one transaction. It sets `paused = True` and writes a new request unless one is pending, then returns `(the pending or new request, created)` (clarification 8).
   - `async def cancel_flatten(sessions, *, now: datetime) -> FlattenRequest | None`: one transaction. It clears the request and writes `flatten_result = {"request_ts", "flat": False, "cancelled": True, "ts"}`. The pause is never touched. Returns the cancelled request, or None if none was pending (then it writes nothing).
-  - `async def wait_for_result(sessions, request_ts: str, *, wait_s: float, poll_s: float = 0.5) -> dict[str, Any] | None`: polls `read_result` until a result for `request_ts` is `flat` or `cancelled`, or `wait_s` (event-loop time) runs out. Returns the last result for that request seen, or None.
+  - `async def wait_for_result(sessions, request_ts: str, *, wait_s: float, poll_s: float = 0.5) -> dict[str, Any] | None`: polls `read_result` until a result for `request_ts` is `flat` or `cancelled`, or `wait_s` (event-loop time) runs out. Returns the last result for that request seen, or None. It never sleeps past the deadline: `await asyncio.sleep(min(poll_s, deadline - loop.time()))`. A full `poll_s` sleep overran the shutdown budget in the dry run and forced the teardown.
+  - `async def lock_flatten_state(session: AsyncSession) -> None`: executes `update(ControlState).where(ControlState.key == FLATTEN_REQUESTED_KEY).values(key=ControlState.key)` and does not commit. On SQLite this takes the write lock before the caller's guard reads (clarification 16). `request_flatten`, `cancel_flatten`, and the Position Manager's completion and non-flat refresh (Task 10) call it first.
 - Produces (`core/lock.py`): `core_running(url: str) -> bool`. It probes with a non-blocking `flock` on the lock file and writes nothing. A non-file journal (`canonical_journal` raises) is False, since no core can run on it. A missing lock file is False.
 
 - [ ] **Step 1: Write the failing tests**
@@ -917,6 +941,28 @@ async def test_wait_returns_the_matching_final_result(sessions) -> None:
     assert await waiter == {"request_ts": req.ts, "flat": True}
 
 
+async def test_the_lock_first_write_blocks_other_writers_until_commit(sessions, db_url) -> None:
+    other = create_async_engine(db_url, connect_args={"timeout": 0.05})  # a second process
+    try:
+        async with sessions() as s:
+            await lock_flatten_state(s)  # holds SQLite's write lock, uncommitted
+            with pytest.raises(OperationalError, match="locked"):
+                async with async_sessionmaker(other)() as o:
+                    await repo.set_control(o, FLATTEN_REQUESTED_KEY, None)
+            await s.commit()
+        async with async_sessionmaker(other)() as o:  # released: the write goes through
+            await repo.set_control(o, FLATTEN_REQUESTED_KEY, None)
+    finally:
+        await other.dispose()
+
+
+def test_wait_never_sleeps_past_its_deadline() -> None:
+    # wait_for_result(wait_s=0.01, poll_s=10.0) on a journal without a result returns None
+    # well before poll_s: assert the loop time it took is < 1.0 (an upper bound far from the
+    # value under test, not a timing assertion on the deadline itself).
+    ...
+
+
 async def test_a_malformed_request_reads_as_none(sessions) -> None:
     async with sessions() as s:
         await repo.set_control(s, FLATTEN_REQUESTED_KEY, ["junk"])
@@ -947,7 +993,9 @@ def test_core_running_probes_without_writing(tmp_path: Path) -> None:
 Run: `uv run pytest tests/unit/core/test_flatten.py tests/unit/core/test_lock.py -q`
 Expected: FAIL (`ModuleNotFoundError`, `ImportError: core_running`).
 
-- [ ] **Step 3: Implement** both modules per Interfaces. `request_flatten`/`cancel_flatten` use `session.merge(ControlState(...))` and one `commit()` (`repo.set_control` commits per key, so it can't make two keys atomic). The `core/flatten.py` docstring covers the protocol (spec 4.7): request identity is `ts`; the core clears the request on completion; `--cancel` never lifts the pause.
+(Imports for the lock test: `create_async_engine` and `async_sessionmaker` from `sqlalchemy.ext.asyncio`, `OperationalError` from `sqlalchemy.exc`. Write the elided wait test as an async test from its comment.)
+
+- [ ] **Step 3: Implement** both modules per Interfaces. `request_flatten`/`cancel_flatten` first call `lock_flatten_state`, then read, `session.merge(ControlState(...))` and one `commit()` (`repo.set_control` commits per key, so it can't make two keys atomic). The `core/flatten.py` docstring covers the protocol (spec 4.7): request identity is `ts`; the core clears the request on completion; `--cancel` never lifts the pause.
 
 - [ ] **Step 4: Run the full check.** Expected: green.
 
@@ -976,7 +1024,8 @@ git commit -m "feat: flatten request/result in control_state and a read-only cor
   - `latch_exit(session, position_id: int, *, reason: str, at: datetime) -> bool`: guarded by `exit_trigger IS NULL AND closed_at IS NULL`; **no commit** (runs inside `publish_tx`); returns `rowcount == 1`.
 - Produces (`core/position_manager.py`):
   - `ExitTriggered(LedgerEvent)`: `position_id: int`, `symbol: str`, `reason: str`, `bid: Decimal | None` (`cycle_id` = the position's).
-  - Protocols `ExitEngine` (`exit`, `cancel_open_entries(exclude: Collection[int] = ())`, `sellable_positions`, `can_place_orders`), `ExitMarketView` (`quote`, `is_stale`, `price_age_s`) and `ControlSource` (`latest: ControlStatus | None`, a read-only property).
+  - Protocols `ExitEngine` (`exit`, `cancel_open_entries(exclude: Collection[int] = ())`, `sellable_positions`, `can_place_orders`), `ExitMarketView` (`quote`, `is_stale`, `price_age_s`) and `ControlSource`. `ControlSource` declares `latest` as a `@property` returning `ControlStatus | None`, so `ControlPoller`'s plain attribute and the harness dataclass both satisfy it.
+  - `_as_reason(value: str) -> ExitReason`: `Position.exit_trigger` is a `str` column and `ExitRequest.reason` the `ExitReason` Literal (mypy rejects passing one as the other). It checks the value against `typing.get_args(ExitReason)` and `cast`s; an unknown value raises `ValueError`, which the per-position `try` logs as `positions.step_failed`.
   - `PositionManager(risk: ExitEngine, market: ExitMarketView, sessions, bus: EventBus, controls: ControlSource, *, profile: StrategyProfile, config: AppConfig, clock: Callable[[], datetime] = lambda: datetime.now(UTC))`; `async def step(self) -> None`. It records `clock()` at construction as its start time (cold-start stale grace).
   - Log events: `positions.broker_cannot_trade` (warning, once per process), `positions.unprotected` (warning, once per position), `positions.stale_held` (warning, once per stale episode), `positions.exit_triggered` (warning), `positions.latch_uncertain` (error), `positions.exit_dust` (warning), `positions.exit_failing` (error), `positions.exit_unresolved` (error, every 60 s), `positions.exit_stuck` (error, after 60 s in flight, then every 60 s), `positions.step_failed` (exception).
 
@@ -1001,7 +1050,7 @@ git commit -m "feat: flatten request/result in control_state and a read-only cor
   - `settling`: wait.
   - `attempt`: go on below.
 - Skip when `pos.qty == 0` (clarification 6). Skip when a dust hold for this position is armed: `(held_qty, min_qty)` stays armed until `pos.qty > held_qty and pos.qty >= min_qty`, which disarms it. Skip when the position's `Backoff` is not `due(now)`.
-- `result = await risk.exit(ExitRequest(symbol=pos.symbol, reason=pos.exit_trigger, cycle_id=pos.cycle_id))`:
+- `result = await risk.exit(ExitRequest(symbol=pos.symbol, reason=_as_reason(pos.exit_trigger), cycle_id=pos.cycle_id))`:
   - `result.dust`: if `result.min_qty is not None and pos.qty >= result.min_qty`, it is a failure (journal and broker disagree). Otherwise arm the dust hold with `(pos.qty, result.min_qty or pos.qty)` and log `positions.exit_dust`; no failure is counted.
   - `result.broker_order_id is not None and result.status not in ("rejected", "not_submitted")`: success; `backoff.reset()`.
   - `result.status in ("pending", "unknown")`: nothing (the next step classifies the row).
@@ -1214,7 +1263,13 @@ async def event_payloads(sessions: async_sessionmaker[AsyncSession], type_: str)
         return [e.payload for e in await s.scalars(select(m.Event).where(m.Event.type == type_))]
 ```
 
-Fill in the two elided bodies from their comments (the shape of `place()` in `test_ledger.py`). The docstrings are the contract. Log assertions use `configure_logging(stream=buf)` and parse JSON lines, as in `test_runtime.py`.
+Fill in the two elided bodies from their comments (the shape of `place()` in `test_ledger.py`). The docstrings are the contract. The dry run's choices, now fixed:
+- `submit_entry` registers `PROFILE` as the strategy and creates the cycle as `SUBMITTED`.
+- It writes `adjusted.initial_risk = qty * (100 - stop)` only when a stop is given, and `atr` only when one is given.
+- It submits to the sim before inserting the journal row.
+- `open_position` returns the entry row's `position_id`.
+
+The harness config is fixed at construction: a test that needs another config sets `h.config` and builds `h.new_pm()`. Log assertions use `structlog.testing.capture_logs()`. Log assertions use `configure_logging(stream=buf)` and parse JSON lines, as in `test_runtime.py`.
 
 - [ ] **Step 2: Write the failing tests** in `tests/unit/core/test_position_manager.py`. Fixtures `sessions` and `bus` as in `test_ledger.py`. Each test builds `h = Harness(sessions, bus, ...)`. Prices: entry 100, stop 95, TP 110, ATR 2, R 5, activation 105, trail distance 3, quote fees 25 bps.
 
@@ -1260,6 +1315,11 @@ Further tests, each with the decisive assertions:
 - `test_a_failing_position_never_stops_the_others` (Review Focus 5): `engine_cls` = a `RiskEngine` subclass whose `exit` raises `RuntimeError` for BTC and delegates otherwise; BTC and ETH positions, both quoted at 95; one step → one `positions.step_failed` (symbol BTC), and an ETH sell row exists.
 - `test_an_uncertain_latch_commit_is_retried_next_step`: build the harness on `hooked_sessionmaker(engine, hook)` (`tests/dbhooks.py`); step once at quote 100 (writes `time_limit_at`); quote 95, `hook.fail_before = 1`, step → `positions.latch_uncertain`, `exit_trigger` None; step → `stop`.
 
+Coverage for paths the dry run left unreached (one short test each):
+- `test_a_settling_exit_waits_for_the_ledger`: the sell filled at the sim, no sync → step makes no new sell.
+- `test_a_fully_sold_position_is_not_exited_again`: script the buy with `FillPlan((D("0.5"), D("0.00001")))`. The second step's slice rounds to 0, so on that bar the entry fills nothing and stays open. Latch at 95; the sell fills 0.5 on the next bar; sync → position qty 0 with the entry unsettled → a step makes no new exit decision.
+- `test_an_unknown_trigger_value_is_a_step_failure`: write `exit_trigger = "bogus"` directly → `positions.step_failed`, the other positions are still processed.
+
 `tests/unit/journal/test_repo.py`: `open_positions` excludes closed rows; `set_time_limit` never overwrites a value; `update_trailing` does nothing on a closed position; `latch_exit` returns False on a latched or closed position and True once otherwise.
 
 - [ ] **Step 3: Run them to verify they fail**
@@ -1289,7 +1349,7 @@ git commit -m "feat: Position Manager: triggers, durable latch, exit retries and
 **Interfaces:**
 - Consumes: `flatten` module (Task 8), `CancelResult` (Task 6), `ExternalHoldingSold` payloads (Task 5).
 - Produces (`repo.py`): `order_fill_generation(session) -> tuple[int, int]` (`max(orders.id)`, `max(fills.id)`, 0 for none); `symbol_dust_balances(session) -> dict[str, Decimal]` (balances > 0, compared in Python); `external_sales_since(session, since: datetime) -> list[dict[str, Any]]` (settled `external` orders with `settled_at >= since`, id order; each is `{"order_row_id", "symbol", "external_qty", "dust_consumed", "proceeds_usd"}` from its `ExternalHoldingSold` payload, as strings); `last_anomaly_kinds(session, order_ids: Collection[int]) -> dict[int, str]` (latest `LedgerAnomaly.kind` per order row).
-- Produces (`position_manager.py`): `FlattenCompleted(LedgerEvent)` with `request_ts: str`, `dust: dict[str, str]`, `external_sales: list[dict[str, Any]]`. Log events: `positions.entry_unresolved` (error, once per row), `positions.flatten_pending` (warning, every 10 s), `positions.flat` (info), `positions.flatten_read_failed` (exception), and `positions.exit_failing` with `external=True` for external sales.
+- Produces (`position_manager.py`): `FlattenCompleted(LedgerEvent)` with `request_ts: str`, `dust: dict[str, str]`, `external_sales: list[dict[str, Any]]`. Log events: `positions.entry_unresolved` (error, once per row), `positions.flatten_pending` (warning, every 10 s), `positions.flat` (info), `positions.flatten_read_failed` (exception), `positions.control_failed` (exception), `positions.external_failed` (exception), and `positions.exit_failing` with `external=True` for external sales.
 
 **Control phase** (start of `step()`, after `can_trade` is known):
 1. `request = flatten.read_request(...)`. `killed = controls.latest is not None and controls.latest.killed`.
@@ -1300,6 +1360,8 @@ git commit -m "feat: Position Manager: triggers, durable latch, exit retries and
    - a broker id with an accepted status: `reset()`;
    - `pending`/`unknown`: nothing;
    - anything else: `fail(now)`, and on an alert log `positions.exit_failing` with `external=True`.
+Containment (clarification 17): the whole control phase runs inside `try/except Exception` (log `positions.control_failed`). Each external `exit()` call has its own `try` (log `positions.external_failed` with the symbol, then `backoff.fail(now)`). A raising sale or cancel never keeps the position loop below from running.
+
 5. The position loop (Task 9) runs next. Then, if `request`: `await self._flat_check(request, now, can_trade)`.
 
 **`_flat_check(request, now, can_trade)`** (spec 4.7 step 4):
@@ -1307,13 +1369,13 @@ git commit -m "feat: Position Manager: triggers, durable latch, exit retries and
 2. `holdings = await risk.sellable_positions()` (on an exception: log `positions.flatten_read_failed`, `holdings = None`).
 3. In one session: `open_positions`, `unsettled_orders`, `last_anomaly_kinds` of those rows.
 4. Flat iff `holdings == ()` and there are no open positions and no unsettled rows (clarification 4).
-5. **Flat:** `publish_tx(build, verify_unit)`. `build` re-reads the generation and the current request, and returns None unless `generation == g1` and `read_request(...).ts == request.ts`. Otherwise it merges `flatten_result = {"request_ts", "flat": True, "dust": {symbol: str(qty)}, "external_sales": [...], "ts"}` and `flatten_requested = None`, and returns `FlattenCompleted`. Log `positions.flat` with the dust after a committed event; a `CommitUncertain` is logged and retried by the next step.
+5. **Flat:** `publish_tx(build, verify_unit)`. `build` first calls `flatten.lock_flatten_state(session)` (clarification 16), then re-reads the generation and the current request, and returns None unless `generation == g1` and `read_request(...).ts == request.ts`. Otherwise it merges `flatten_result = {"request_ts", "flat": True, "dust": {symbol: str(qty)}, "external_sales": [...], "ts"}` and `flatten_requested = None`, and returns `FlattenCompleted`. Log `positions.flat` with the dust after a committed event; a `CommitUncertain` is logged and retried by the next step.
 6. **Not flat**, at most every 10 s per request: build `remaining` with these keys:
    - `positions`: `[{position_id, symbol, qty}]`;
    - `holdings`: `[{symbol, qty}]`, or `"unavailable"`;
    - `orders`: `[{order_row_id, symbol, side, status, age_s, unresolved, anomaly}]`, where `unresolved` means no broker id and status `pending`/`unknown`.
 
-   Log `positions.flatten_pending` with it, then write `flatten_result = {"request_ts", "flat": False, "remaining", "ts"}` plus `"reason": "broker cannot place orders"` when not `can_trade`. The write happens only if the request read in the same session still has `ts == request.ts`.
+   Log `positions.flatten_pending` with it, then write `flatten_result = {"request_ts", "flat": False, "remaining", "ts"}` plus `"reason": "broker cannot place orders"` when not `can_trade`. The write happens only if the request read in the same session, after `lock_flatten_state(session)`, still has `ts == request.ts`.
 
 - [ ] **Step 1: Write the failing tests** in `tests/unit/core/test_position_manager_control.py` (harness from Task 9; `KILLED = ControlStatus(True, ("kill set",))`). Two test doubles, defined in this module:
 - `CancelSpy(SimBroker)` records `cancels: list[str]` and raises `OrderRejected` for ids in `fail: set[str]` (the Task 6 pattern).
@@ -1348,9 +1410,15 @@ The remaining tests, each with the decisive assertions:
 - `test_flatten_sells_positions_and_external_holdings_then_reports_flat`: BTC position, plus ETH held at the sim with no journal row (a `hold_externally` helper like Task 5's). Set `symbol_dust` BTC to `0.00005`. `request_flatten(sessions, source="cli", reason="t", now=T0)`; step → BTC latched `flatten`, an ETH sell with `external=True`. Bars for both, sync, step → in one transaction `flatten_result.flat is True` and `flatten_requested` is None. Its `dust` is `{"BTC/USD": "0.00005"}` and its `external_sales` has one ETH item with `external_qty == "1"`. `paused` stays True; one `FlattenCompleted` event; no `LedgerAnomaly`.
 - `test_kill_flatten_sells_an_external_holding`: `kill_flatten=True`, killed, ETH held externally → ETH sell `external=True`, reason `kill`; after its bar, sync and a step, there is no second ETH sell, and an `ExternalHoldingSold` event exists.
 - `test_an_external_holding_waits_for_an_unsettled_entry_on_its_symbol`: ETH held externally plus an id-less `pending` ETH buy row. Flatten step → no ETH sell; `flatten_result.remaining.orders` lists the row with `unresolved: true`. Mark the row `not_submitted` (`repo.update_order`), sync (it settles), step → the ETH sell; after its bar and sync, no `oversell` anomaly.
-- `test_external_failures_back_off_per_symbol_and_alert_after_three`: a sim whose `close_position` raises `OrderRejected` for ETH; flatten request; steps at 0, 1, 3 s → three ETH exit rows and one `positions.exit_failing` with `external: true`.
+- `test_external_failures_back_off_per_symbol_and_alert_after_three`: a sim whose `close_position` raises `OrderRejected` for ETH; flatten request. Run `await h.sync()` before each step, at 0, 1 and 3 s: each failed attempt leaves an unsettled `rejected` row that blocks the symbol until the ledger settles it (clarification 15). Expect three ETH exit rows and one `positions.exit_failing` with `external: true`. Without the syncs only one row appears; assert that too, in the same test.
+- `test_a_failing_external_sale_never_stops_position_exits` (clarification 17): flatten request, a BTC position, and an ETH external holding whose `exit()` raises `RuntimeError` (a `RiskEngine` subclass raising for ETH when `request.external`). One step → one `positions.external_failed`, and BTC is latched `flatten` with a sell row.
+- Coverage of unreached paths, one short test each:
+  - a `CommitUncertain` on the completion (`hook.fail_before = 1` just before the completing step) is logged, and the next step completes;
+  - `sellable_positions` raising → `positions.flatten_read_failed` and `holdings: "unavailable"` in the refresh;
+  - `cancel_open_entries` raising → `positions.control_failed`, and the position loop still runs;
+  - an external exit returning `unknown` → no failure counted.
 - `test_flat_is_not_reported_while_an_entry_is_unsettled_or_an_exit_unresolved`: an open entry (cancel requested, not yet synced) → not flat on that step. A position whose close raised `RuntimeError` (unknown, id-less) → not flat, with its row listed `unresolved: true`.
-- `test_a_fill_landing_between_the_flat_check_reads_delays_completion`: `engine_cls=RacingEngine`, `fire_on_call=2`, with `h.submit_entry(ETH, limit=None, ack=False)` placed before the request. The callback acks that id-less pending ETH entry (broker id), bars it and syncs it (booked, settled, position open). No completion that step; the next steps latch `flatten` on the new position and exit it, and only then is `flat` reported.
+- `test_a_fill_landing_between_the_flat_check_reads_delays_completion`: `engine_cls=RacingEngine`, `fire_on_call=2`, with `h.submit_entry(ETH, limit=None, ack=False)` placed before the request. The callback acks that id-less pending ETH entry (broker id), bars it and syncs it (booked, settled, position open). No completion that step; the next steps latch `flatten` on the new position and exit it, and only then is `flat` reported. (This race is visible to the journal reads, so it never reaches the generation guard; the next test is the one that pins the guard.)
 - `test_a_changed_generation_blocks_a_completion_that_looks_flat`: nothing held or open, `fire_on_call=2`. The callback inserts a local-final `not_submitted` order row and sets its `settled_at` directly in a session (nothing open) → no completion on that pass (`flatten_requested` still set); the next pass completes.
 - `test_a_completion_never_overwrites_a_cancelled_request`: nothing held, `fire_on_call=2`; the callback calls `cancel_flatten` → `flatten_result` is the cancel record afterwards (with the request's ts), no `FlattenCompleted`.
 - `test_a_pending_refresh_never_overwrites_a_cancel_record`: an unflattenable BTC position (sim with `can_place_orders()` False), `fire_on_call=1`. The callback cancels during the pass → after the step `flatten_result.cancelled is True`.
@@ -1390,7 +1458,7 @@ git commit -m "feat: Position Manager kill handling, external sales and guarded 
 
 - [ ] **Step 1: Write the failing tests**
 
-Remove `["flatten"]` from `test_stub_commands_fail_loudly`'s parameters. Then:
+Remove `["flatten"]` from `test_stub_commands_fail_loudly`'s parameters and update its comment, which also names `flatten`. `test_log_level_option_configures_json_logging` uses `flatten` as its stub and expects exit 2: change it to invoke `["--log-level", "debug", "review-now"]`. Then:
 
 ```python
 def test_flatten_without_a_core_queues_the_request_and_pauses(tmp_path: Path) -> None:
@@ -1529,7 +1597,7 @@ Further tests, each with the decisive assertions:
 - `test_run_core_persists_bars_and_responds_to_kill_file` (existing) still exits `EXIT_CLEAN` with both new loops running and stopped.
 - `test_shutdown_flatten_reports_flat_on_a_graceful_stop`: `cfg` copied with `shutdown.flatten=True` (`cfg.model_copy(update={"shutdown": cfg.shutdown.model_copy(update={"flatten": True})})`). FakeBroker holds nothing, so the core flattens to flat on stop → `core.shutdown_flattened` is logged, `flatten_result.flat is True`, and the exit code is `EXIT_CLEAN`.
 - `test_shutdown_flatten_times_out_and_teardown_continues`: a broker that holds BTC (`get_positions` and `asset_rules` answer), `can_place_orders` False, `timeout_s=0.5` → `core.shutdown_flatten_incomplete` is logged, then `core.stopped`, with `EXIT_CLEAN`.
-- `test_shutdown_flatten_keeps_a_pending_cli_request`: `request_flatten(source="cli")` before the start; after the stop, `flatten_result.request_ts` is the CLI request's ts.
+- `test_shutdown_flatten_keeps_a_pending_cli_request`: `request_flatten(source="cli")` before the start. Use a broker that holds BTC (answering `get_positions` and `asset_rules`) until `control.requested`, then holds nothing. Otherwise the core completes the CLI request on its first step, and the test depends on timing. After the stop, `flatten_result.request_ts` is the CLI request's ts and `flat is True`.
 - `test_shutdown_flatten_is_skipped_after_a_startup_failure`: the failing broker connect with `shutdown.flatten=True` → `core.shutdown_flatten_skipped` is logged, and the error propagates as today.
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -1559,7 +1627,7 @@ git commit -m "feat: run core runs the order-sync and Position Manager loops; sh
 - [ ] **Step 1: Sweep for falsified claims** (job 1 of the docs rule; fix every hit, code comments included):
 
 ```bash
-rg -n --hidden "1\.5c|WP 1\.5\b|Position Manager \(WP|until WP 1\.5|nothing calls|flatten.*1\.5|is a stub|stubs?\b.*flatten|close_all|not implemented" src SPEC.md PLAN.md CLAUDE.md docs tests
+rg -n --hidden "1\.5c|WP 1\.5\b|WP [0-9.]+/1\.5|Position Manager \(WP|until WP 1\.5|nothing calls|flatten.*1\.5|is a stub|stubs?\b.*flatten|close_all|not implemented|does not (trade|place orders)|Implementation boundary" src SPEC.md PLAN.md CLAUDE.md docs tests
 ```
 
 Known hits to fix:
@@ -1569,7 +1637,8 @@ Known hits to fix:
 - `cli.py`'s docstring;
 - `SPEC.md` §4.6 ("`AlpacaBroker` is currently read-only; its order methods are stubs": they raise `OrderMethodsUnavailable`, and `can_place_orders()` is false until 1.6);
 - the `ledger.py` comment "a late fill can still arrive: stay open (1.5c protects it)" (now done: the Position Manager manages it);
-- `PLAN.md`'s repo-state line ("`flatten` ... stubs", "Next: WP 1.5c").
+- `PLAN.md`'s repo-state line ("`flatten` ... stubs", "Next: WP 1.5c");
+- `SPEC.md` line 7 ("Implementation boundary": `run core` does not trade). It now runs the Position Manager's exits; add a dated update, since nothing places entries until 1.5d/1.6.
 
 - [ ] **Step 2: Document the new surface**
 
