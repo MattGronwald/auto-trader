@@ -30,6 +30,8 @@ Full check, used at the end of every task:
 uv run ruff format && uv run ruff check --fix && uv run ruff format && uv run mypy && uv run pytest -q --cov && uv run coverage report --include='src/autotrader/risk/*' --fail-under=100 --show-missing
 ```
 
+**PR #27 review (Codex, 2026-10-19), fixed in this revision.** Accepting an order no longer counts as success. Failures are judged per settled order row (clarification 5, Tasks 9-10), and external sells get their own unresolved/stuck monitoring (Task 10). Neither fix was part of the dry run below.
+
 **Plan dry run (2026-10-19):** all 13 tasks were applied verbatim in a throwaway worktree, running every check after each task: all green, 982 tests, `risk/` at 100 %. This revision folds in the 7 snippet bugs and 8 design findings it reported:
 - clarifications 15-17;
 - the owner's choices on findings 3 and 6 (2026-10-19: keep the spec's qualification rule; add the lock-first write);
@@ -43,7 +45,13 @@ The `position_manager.py` paths no test reaches (about 93 % covered: `settling`,
 2. **`flatten_result.external_sales` is derived from the journal**: settled `external` orders with `settled_at >= request ts`, joined with their `ExternalHoldingSold` payloads (`repo.external_sales_since`).
 3. **`flatten_result.dust` reports the journal's `symbol_dust` balances** (> 0), not a broker read: `sellable_positions()` returns non-dust holdings only.
 4. **The flat check requires no open journal position at all** (spec: "qty ≥ min_qty"). The Position Manager holds no asset rules. The ledger closes a position below `min_qty` as soon as all its orders settle, so an open position below `min_qty` always has an unsettled order, and that already blocks flat.
-5. **A failure is counted once, from the attempt's outcome.** On later steps an unsettled `not_submitted`/`rejected` sell row only means "may attempt again when the backoff is due" (spec 4.4 table, row 2).
+5. **Each failed sell is counted once, by its order row id** (revised after the PR #27 review). Accepting an order is not success: it never resets the backoff.
+   - **Immediate failures** (`not_submitted`, an id-less `rejected`, a decision rejection) are counted at the attempt.
+   - **Broker acks are tracked:** every sell the broker acknowledged (it has a broker id) is remembered as **pending** for its key (position id, or external symbol) until the ledger settles its row.
+   - **A settled pending row is judged once.** `filled_qty == 0` (rejected or canceled after the ack) counts one failure at that step. `filled_qty > 0` is real progress and resets the backoff.
+   - **Rows are re-read by id**, settled or not, so a rejection the ledger settled between two steps is still seen.
+   - **The table state never counts.** On later steps an unsettled `not_submitted`/`rejected` sell row still only means "may attempt again when the backoff is due" (spec 4.4 table, row 2). Seeing the same row again never adds a failure.
+   - **In memory only:** a restart forgets pending ids, consistent with "backoff resets on restart" (spec 4.4).
 6. **No attempt while the journal position's qty is 0.** All coins are sold and the position waits for its other orders to settle. A late fill raises the qty and makes the exit attemptable again.
 7. **`OrderResult` gains `min_qty` and `no_position`.** The Position Manager needs `min_qty` for the dust rules in 4.4 (re-arm, journal ≥ `min_qty` counts as a failure), and the external-sale rule needs to tell "no position to exit" apart from other rejections. Both are set by `exit()` from data it already read.
 8. **`request_flatten()` keeps an already pending request**, for the CLI as well as for `shutdown.flatten`. The CLI says so and waits for that request's result. It still sets the pause.
@@ -66,7 +74,7 @@ The `position_manager.py` paths no test reaches (about 93 % covered: `settling`,
     - `positions.entry_unresolved` is only logged when cancels run (the broker can trade).
     - A latch whose guard matched nothing skips the position for this step.
     - Cleared control values are written as JSON null, not deleted rows.
-    - External-sale backoff is a separate per-symbol dict.
+    - External-sale backoff and pending outcomes share the position maps under the key `("ext", symbol)` (revised after the PR #27 review; the dry run used a separate dict).
     - `core_running` probes with `LOCK_SH | LOCK_NB` on an `O_RDONLY` descriptor.
     - Log assertions use `structlog.testing.capture_logs`.
 
@@ -1043,16 +1051,28 @@ git commit -m "feat: flatten request/result in control_state and a read-only cor
 **Price age:** `price_age_s(symbol)`. When that is None, use `math.inf` once `(now - started).total_seconds() > feed.stale_exit_s`, else None.
 **ExitRules:** `ExitRules(profile.risk.trailing, config.feed_stale_exit_enabled, config.feed.stale_exit_s)`.
 
+**`_judge_outcomes(key, backoff, now) -> None`** (clarification 5; shared with Task 10's external sales, key `("ext", symbol)`):
+1. Read the key's pending order rows by id with `repo.orders_by_id(session, ids) -> list[Order]` (new; id order, `populate_existing`).
+2. For each row with `settled_at` set, remove it from the pending set:
+   - `filled_qty == 0`: `alert = backoff.fail(now)`. When that returns True, log `positions.exit_failing` (with `order_row`, `status`, `failures`, and `external` for external keys).
+   - `filled_qty > 0`: `backoff.reset()`.
+3. Unsettled rows stay pending.
+
+It runs at the start of `_exit_path`, before the classification. Pending sets of positions that are no longer open are dropped at the end of the step, together with their `Backoff`.
+
+**`_alert_unsettled(key, sells, now, *, external: bool)`**: the shared alert half of the classification, used for positions here and for external symbols in Task 10.
+- `unresolved`: log `positions.exit_unresolved` (with the row ids) when 60 s have passed since the last such log for this key (the first one at once).
+- `in_flight`: log `positions.exit_stuck` when the oldest in-flight row's `submitted_at` is more than 60 s old, again at most every 60 s.
+
+Both lines carry `external`. The throttle maps are keyed like the backoff.
+
 **`_exit_path(pos, sells, now)`** (`sells` = the unsettled sell rows of the position's symbol):
-- `state = classify_sells(sells)`.
-  - `unresolved`: log `positions.exit_unresolved` (with the row ids) when 60 s have passed since the last such log for this position (the first one at once).
-  - `in_flight`: log `positions.exit_stuck` when the oldest in-flight row's `submitted_at` is more than 60 s old, again at most every 60 s.
-  - `settling`: wait.
-  - `attempt`: go on below.
+- `await self._judge_outcomes(pos.id, backoff, now)`.
+- `state = classify_sells(sells)`. For `unresolved` and `in_flight`, call `_alert_unsettled(pos.id, sells, now, external=False)` and stop. For `settling`, wait. For `attempt`, go on below.
 - Skip when `pos.qty == 0` (clarification 6). Skip when a dust hold for this position is armed: `(held_qty, min_qty)` stays armed until `pos.qty > held_qty and pos.qty >= min_qty`, which disarms it. Skip when the position's `Backoff` is not `due(now)`.
 - `result = await risk.exit(ExitRequest(symbol=pos.symbol, reason=_as_reason(pos.exit_trigger), cycle_id=pos.cycle_id))`:
   - `result.dust`: if `result.min_qty is not None and pos.qty >= result.min_qty`, it is a failure (journal and broker disagree). Otherwise arm the dust hold with `(pos.qty, result.min_qty or pos.qty)` and log `positions.exit_dust`; no failure is counted.
-  - `result.broker_order_id is not None and result.status not in ("rejected", "not_submitted")`: success; `backoff.reset()`.
+  - `result.broker_order_id is not None and result.status not in ("rejected", "not_submitted")`: accepted. Add `result.order_row_id` to the key's pending set. Do **not** reset the backoff (clarification 5).
   - `result.status in ("pending", "unknown")`: nothing (the next step classifies the row).
   - anything else (`not_submitted`, `rejected`, a decision rejection such as `no position to exit` or `state unavailable`): `backoff.fail(now)`. When that returns True, log `positions.exit_failing` with `position_id`, `symbol`, `failures` and `reasons=list(result.decision.reasons)` plus `status`.
 
@@ -1301,7 +1321,12 @@ Further tests, each with the decisive assertions:
 - `test_a_never_priced_symbol_gets_the_cold_start_grace`: `stale_exit=True`, no quote, no age; the step at T0 latches nothing; after `h.clock.advance(301)` → `stale` (TP/stop untouched, time not reached).
 - `test_an_old_quote_on_a_fresh_symbol_triggers_nothing` (Review Focus 1): `h.quote(BTC, 95.0, age_s=61)` (stale_alert_s 60), symbol not stale → no latch; `age_s=60` → `stop`.
 - `test_a_partial_entry_is_protected_and_a_late_fill_is_exited`: `h.sim.script(BTC, "buy", FillPlan((D("0.5"),)))`, open (qty 0.5, entry unsettled), quote 95, step → one sell for 0.5. The next bar fills the entry remainder and the sell, then sync (position qty 0.5, open), step → second sell. After the bar and sync the position is closed with `exit_reason "stop"` and `len(await h.sells()) == 2`.
-- `test_a_latched_stop_still_exits_after_the_price_recovers`: `h.sim.script(BTC, "sell", FillPlan(("reject",)))`; quote 95, step; bar + sync (the sell is rejected and settled); quote 100, step → a second sell; bar + sync → closed `stop`.
+- `test_a_latched_stop_still_exits_after_the_price_recovers`: `h.sim.script(BTC, "sell", FillPlan(("reject",)))`; quote 95, step; bar + sync (the sell is rejected and settled). Quote 100, step at the same clock → no second sell: the settled zero-fill row counted one failure, so the backoff is 1 s. `h.clock.advance(1)`, step → a second sell; bar + sync → closed `stop`.
+- `test_accepted_then_rejected_exits_back_off_and_alert_after_three` (PR #27 review): script three rejections, `FillPlan(("reject",))` three times. Quote 95; then repeat three times: step (a sell acknowledged `new`), bar + sync (rejected and settled), and steps at the failure's backoff boundary.
+  - New sells appear only at t = 0, 1 and 3 s. A step half a second before each boundary adds none.
+  - Exactly one `positions.exit_failing`, at the third settled rejection, with `failures == 3`.
+  - Re-syncing and stepping again without a new bar counts nothing more (same row ids).
+- `test_a_filled_exit_resets_the_failure_count`: one accepted-then-rejected sell, then a sell that fills 0.5 of 1 (`FillPlan((D("0.5"), "cancel"))`) and settles → backoff reset (the next attempt is due at once). The last part sells and the position closes.
 - `test_a_restart_honours_the_latch_and_never_double_sells` (Review Focus 3): quote 95, step (sell in flight, status `new`); `pm2 = h.new_pm(profile=<copy with max_hold_min=10>)`; `await pm2.step()` twice → still one sell row, `time_limit_at` unchanged; bar + sync → closed.
 - `test_a_restart_re_attempts_at_once`: a broker whose `close_position` raises `OrderRejected` (subclass of `SimBroker`, via `make_sim(cls=...)`); one step → failure (backoff 1 s); `h.new_pm().step()` at the same clock → a second attempt (two exit rows).
 - `test_failed_exits_back_off_and_alert_after_three`: close raising `OrderMethodsUnavailable`; quote 95; steps at t = 0, 0.5, 1, 2, 3 s after the first (`h.clock.advance`) → exit order rows after each step `[1, 1, 2, 2, 3]`; exactly one `positions.exit_failing` line, emitted at the third failure, with `failures == 3`.
@@ -1327,7 +1352,7 @@ Coverage for paths the dry run left unreached (one short test each):
 Run: `uv run pytest tests/unit/core/test_position_manager.py tests/unit/journal/test_repo.py -q`
 Expected: FAIL (`ModuleNotFoundError: autotrader.core.position_manager`).
 
-- [ ] **Step 4: Implement** the repo helpers and `core/position_manager.py` per the behaviour above. State kept in memory per process: `_backoff: dict[int, Backoff]`, `_dust: dict[int, tuple[Decimal, Decimal]]`, `_last_unresolved_log`/`_last_stuck_log: dict[int, datetime]`, `_unprotected: set[int]`, `_stale_held: set[str]`, `_cannot_trade_logged: bool`, `_started: datetime`. Module docstring: spec sections 4.3-4.4, decisions 1-5, 7, 10-12; what is durable (the latch, `time_limit_at`, the trailing values) and what is in memory (backoff, dust hold, alert throttles). Keep `step()` short by delegating to `_control_phase(...)` (Task 10 fills it; here it returns at once), `_manage(...)` and `_flat_check(...)` (Task 10; here not called).
+- [ ] **Step 4: Implement** the repo helpers and `core/position_manager.py` per the behaviour above. Add `repo.orders_by_id` with a `test_repo.py` case. State kept in memory per process: `_backoff: dict[Key, Backoff]`, `_pending: dict[Key, set[int]]`, `_dust: dict[int, tuple[Decimal, Decimal]]`, `_last_unresolved_log`/`_last_stuck_log: dict[Key, datetime]` (with `Key = int | tuple[str, str]`: a position id or `("ext", symbol)`), `_unprotected: set[int]`, `_stale_held: set[str]`, `_cannot_trade_logged: bool`, `_started: datetime`. Module docstring: spec sections 4.3-4.4, decisions 1-5, 7, 10-12; what is durable (the latch, `time_limit_at`, the trailing values) and what is in memory (backoff, dust hold, alert throttles). Keep `step()` short by delegating to `_control_phase(...)` (Task 10 fills it; here it returns at once), `_manage(...)` and `_flat_check(...)` (Task 10; here not called).
 
 - [ ] **Step 5: Run the full check.** Expected: green.
 
@@ -1357,9 +1382,16 @@ git commit -m "feat: Position Manager: triggers, durable latch, exit retries and
 3. Latch reasons: `kill` when `killed and config.kill_flatten`, else `flatten` when `request`; the kill takes precedence. With a reason, latch it (Task 9's latch) on every open position without a trigger, even when `can_trade` is false (decision 10).
 4. External sales with the same reason, only when `can_trade`. Read `sellable_positions()` (the pass's first broker read; the flat check makes the second); a raising call is logged as `positions.flatten_read_failed`, and nothing is sold this step. A holding qualifies when its symbol has no open journal position and no unsettled order row of either side (4.4.1). For a qualifying symbol whose per-symbol `Backoff` (key `("ext", symbol)`) is due, call `risk.exit(ExitRequest(symbol=..., reason=reason, external=True))`:
    - `dust` or `no_position`: ends the attempt, no failure counted;
-   - a broker id with an accepted status: `reset()`;
+   - a broker id with an accepted status: add the order row id to the key's pending set; **no reset** (clarification 5);
    - `pending`/`unknown`: nothing;
    - anything else: `fail(now)`, and on an alert log `positions.exit_failing` with `external=True`.
+
+   Before deciding whether a symbol's backoff is due, run `_judge_outcomes(("ext", symbol), backoff, now)` (Task 9), so a settled zero-fill external sell counts once and a filling one resets.
+
+**External sell monitoring** (every step, after the control phase, whatever the kill/flatten state, holdings or journal positions; PR #27 review):
+- Group the unsettled sell rows with `external = true` by symbol, and call `_alert_unsettled(("ext", symbol), rows, now, external=True)` for each. That gives `positions.exit_unresolved` every 60 s for an id-less `pending`/`unknown` row, and `positions.exit_stuck` after 60 s in flight, then every 60 s.
+- Also run `_judge_outcomes` for every external key that has pending ids, so an outcome settled after the kill/flatten ended is still counted.
+- This never submits anything; the qualification gate above stays the only path to a sale.
 Containment (clarification 17): the whole control phase runs inside `try/except Exception` (log `positions.control_failed`). Each external `exit()` call has its own `try` (log `positions.external_failed` with the symbol, then `backoff.fail(now)`). A raising sale or cancel never keeps the position loop below from running.
 
 5. The position loop (Task 9) runs next. Then, if `request`: `await self._flat_check(request, now, can_trade)`.
@@ -1417,6 +1449,9 @@ The remaining tests, each with the decisive assertions:
   - `sellable_positions` raising → `positions.flatten_read_failed` and `holdings: "unavailable"` in the refresh;
   - `cancel_open_entries` raising → `positions.control_failed`, and the position loop still runs;
   - an external exit returning `unknown` → no failure counted.
+- `test_accepted_then_rejected_external_sales_back_off_and_alert_after_three` (PR #27 review): ETH held externally, three scripted ETH sell rejections, a flatten request. Repeat three times: step, bar + sync, steps at the backoff boundary. ETH sells appear only at t = 0, 1 and 3 s, with exactly one `positions.exit_failing` (`external: true`) at the third settled rejection.
+- `test_an_unknown_external_exit_alerts_every_60_s_without_a_holding` (PR #27 review): `kill_flatten=True`, killed, no CLI request, ETH held externally. The sim subclass's `close_position` for ETH calls `super()` (the sell exists at the broker) and then raises `RuntimeError`. The ack is lost: the engine records `unknown` with no broker id. An ETH bar fills the sell, so the broker holds nothing. Steps at +1, +30 and +61 s give two `positions.exit_unresolved` lines with `external: true` and still one ETH sell row. The same holds after the kill is cleared.
+- `test_a_stuck_external_sell_alerts_without_a_second_sell` (PR #27 review): `kill_flatten=True`, killed, ETH held externally, no ETH bars (the sell stays `new` with a broker id). Steps at +30, +61 and +121 s give two `positions.exit_stuck` lines with `external: true` and one ETH sell row.
 - `test_flat_is_not_reported_while_an_entry_is_unsettled_or_an_exit_unresolved`: an open entry (cancel requested, not yet synced) → not flat on that step. A position whose close raised `RuntimeError` (unknown, id-less) → not flat, with its row listed `unresolved: true`.
 - `test_a_fill_landing_between_the_flat_check_reads_delays_completion`: `engine_cls=RacingEngine`, `fire_on_call=2`, with `h.submit_entry(ETH, limit=None, ack=False)` placed before the request. The callback acks that id-less pending ETH entry (broker id), bars it and syncs it (booked, settled, position open). No completion that step; the next steps latch `flatten` on the new position and exit it, and only then is `flat` reported. (This race is visible to the journal reads, so it never reaches the generation guard; the next test is the one that pins the guard.)
 - `test_a_changed_generation_blocks_a_completion_that_looks_flat`: nothing held or open, `fire_on_call=2`. The callback inserts a local-final `not_submitted` order row and sets its `settled_at` directly in a session (nothing open) → no completion on that pass (`flatten_requested` still set); the next pass completes.
