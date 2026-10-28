@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import subprocess
@@ -14,6 +15,7 @@ from autotrader.core import lock as journal_lock
 from autotrader.core.config import Settings, load_config, load_profile
 from autotrader.core.logging import configure_logging
 from autotrader.core.shutdown import ShutdownControl, Watchdog
+from autotrader.journal import db, repo
 
 runner = CliRunner()
 REPO = Path(__file__).resolve().parents[2]
@@ -41,11 +43,10 @@ def test_run_help_lists_core_and_api() -> None:
         ["run", "api"],
         ["review-now"],
         ["backtest-signals"],
-        ["flatten"],
     ],
 )
 def test_stub_commands_fail_loudly(args: list[str]) -> None:
-    # A stub must never look like success: an operator running `kill` or `flatten`
+    # A stub must never look like success: an operator running a command
     # before it is implemented has to see that nothing happened.
     result = runner.invoke(app, args)
 
@@ -110,7 +111,7 @@ def test_log_level_option_configures_json_logging(monkeypatch: pytest.MonkeyPatc
     calls: list[str] = []
     monkeypatch.setattr("autotrader.cli.configure_logging", lambda level: calls.append(level))
 
-    result = runner.invoke(app, ["--log-level", "debug", "flatten"])
+    result = runner.invoke(app, ["--log-level", "debug", "review-now"])
 
     assert result.exit_code == 2  # still a stub
     assert calls == ["debug"]
@@ -504,3 +505,74 @@ def test_engine_failure_inside_run_core_exits_1_with_a_one_line_summary(
     assert capsys.readouterr().err == "run core failed: RuntimeError: no engine\n"
     (failed,) = _core_failed(buf)
     assert failed["cause"] == "startup_failure" and "no engine" in failed["exception"]
+
+
+def _read_flatten_state(config: Path) -> tuple[dict[str, Any] | None, Any, dict[str, Any] | None]:
+    cfg = load_config(config, Settings(_env_file=None))
+
+    async def read() -> tuple[dict[str, Any] | None, Any, dict[str, Any] | None]:
+        engine = db.make_engine(cfg.database.url)
+        sessions = db.make_sessionmaker(engine)
+        try:
+            async with sessions() as session:
+                request = await repo.get_control(session, "flatten_requested")
+                paused = await repo.get_control(session, "paused")
+                result = await repo.get_control(session, "flatten_result")
+            return request, paused, result
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read())
+
+
+def test_flatten_without_a_core_queues_the_request_and_pauses(tmp_path: Path) -> None:
+    config = _tmp_config(tmp_path)
+    assert runner.invoke(app, ["db", "upgrade", "-c", str(config)]).exit_code == 0
+
+    result = runner.invoke(app, ["flatten", "-c", str(config), "--reason", "test"])
+
+    assert result.exit_code == 0, result.output
+    assert "queued" in result.output
+    request, paused, _ = _read_flatten_state(config)
+    assert request is not None and request["reason"] == "test" and paused is True
+
+
+def test_flatten_with_a_running_core_waits_and_reports_pending(tmp_path: Path) -> None:
+    config = _tmp_config(tmp_path)
+    runner.invoke(app, ["db", "upgrade", "-c", str(config)])
+    cfg = load_config(config, Settings(_env_file=None))
+    held = journal_lock.acquire(cfg.database.url, wait_s=0)  # stands in for a core
+    try:
+        result = runner.invoke(app, ["flatten", "-c", str(config), "--wait-s", "0"])
+    finally:
+        held.release()
+    assert result.exit_code == 1
+    assert "pending" in result.output
+
+
+def test_flatten_cancel_clears_the_request_and_keeps_the_pause(tmp_path: Path) -> None:
+    config = _tmp_config(tmp_path)
+    runner.invoke(app, ["db", "upgrade", "-c", str(config)])
+    assert runner.invoke(app, ["flatten", "-c", str(config)]).exit_code == 0
+
+    cancelled = runner.invoke(app, ["flatten", "-c", str(config), "--cancel"])
+    again = runner.invoke(app, ["flatten", "-c", str(config), "--cancel"])
+
+    assert cancelled.exit_code == 0 and "cancelled" in cancelled.output
+    assert again.exit_code == 0 and "no flatten request" in again.output
+    request, paused, result = _read_flatten_state(config)
+    assert request is None and paused is True
+    assert result is not None and result["cancelled"] is True
+
+
+def test_flatten_twice_keeps_the_first_request(tmp_path: Path) -> None:
+    config = _tmp_config(tmp_path)
+    runner.invoke(app, ["db", "upgrade", "-c", str(config)])
+    runner.invoke(app, ["flatten", "-c", str(config), "--reason", "first"])
+    first, _, _ = _read_flatten_state(config)
+
+    second = runner.invoke(app, ["flatten", "-c", str(config), "--reason", "second"])
+
+    assert second.exit_code == 0 and "already pending" in second.output
+    kept, _, _ = _read_flatten_state(config)
+    assert kept == first
