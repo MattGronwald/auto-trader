@@ -1643,3 +1643,15 @@ async def test_an_exit_on_a_broker_that_cannot_trade_is_not_submitted(
     assert (result.status, result.broker_order_id) == ("not_submitted", None)
     (row,) = await orders(sessions)
     assert row.status == "not_submitted"  # never "unknown": nothing left the process
+
+
+async def test_an_external_exit_marks_its_order_row(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    await _held_btc(sim)
+    result = await make_engine_(sim, sessions, gate).exit(
+        ExitRequest(symbol=BTC, reason="flatten", external=True)
+    )
+    assert result.status == "new"
+    (row,) = await orders(sessions)
+    assert (row.external, row.exit_reason, row.cycle_id) == (True, "flatten", None)

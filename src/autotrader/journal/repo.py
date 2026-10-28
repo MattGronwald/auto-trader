@@ -338,6 +338,7 @@ async def insert_order(
     status: str,
     now: datetime,
     exit_reason: str | None = None,
+    external: bool = False,
 ) -> Order:
     row = Order(
         cycle_id=cycle_id,
@@ -354,6 +355,7 @@ async def insert_order(
         submitted_at=now,
         updated_at=now,
         exit_reason=exit_reason,
+        external=external,
     )
     session.add(row)
     await session.commit()

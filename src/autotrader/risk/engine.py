@@ -497,6 +497,7 @@ class RiskEngine:
                     status="pending",
                     now=now,
                     exit_reason=request.reason,
+                    external=request.external,
                 )
             return await self._submit(
                 row.id, decision, deadline, lambda: self._broker.close_position(request.symbol)
