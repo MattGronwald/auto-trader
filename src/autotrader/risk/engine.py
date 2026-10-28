@@ -46,6 +46,7 @@ from autotrader.broker.base import (
     Fill,
     Mode,
     OrderAck,
+    OrderMethodsUnavailable,
     OrderRejected,
 )
 from autotrader.core.config import StrategyProfile
@@ -145,6 +146,9 @@ class RiskEngine:
         self._exit_lock = asyncio.Lock()  # exit(): never waits for an entry
 
     # --- entries ---------------------------------------------------------------------
+
+    def can_place_orders(self) -> bool:
+        return self._broker.can_place_orders()
 
     async def check(self, intent: EntryIntent) -> OrderResult:
         async with self._entry_lock:
@@ -407,6 +411,12 @@ class RiskEngine:
             log.warning("risk.order_rejected", order_row=row_id, reason=str(e))
             await self._set_status(row_id, "rejected")
             return OrderResult(decision, row_id, "rejected")
+        except OrderMethodsUnavailable:  # nothing left the process
+            log.warning(
+                "risk.order_not_submitted", order_row=row_id, reason="broker cannot place orders"
+            )
+            await self._set_status(row_id, "not_submitted")
+            return OrderResult(decision, row_id, "not_submitted")
         except Exception:  # timeout / network: may or may not exist at the broker
             log.exception("risk.order_unknown", order_row=row_id)
             await self._set_status(row_id, "unknown")

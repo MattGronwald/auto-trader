@@ -22,6 +22,7 @@ from autotrader.broker.base import (
     FeeSchedule,
     Fill,
     OrderAck,
+    OrderMethodsUnavailable,
     OrderRejected,
     OrderStatus,
     Position,
@@ -1621,3 +1622,24 @@ async def test_snapshot_equity_returns_the_account_it_read(
 ) -> None:
     account = await make_engine_(sim, sessions, gate).snapshot_equity()
     assert account.cash == D("1000")
+
+
+class UnavailableBroker(SimBroker):
+    async def close_position(self, symbol: str) -> OrderAck:
+        raise OrderMethodsUnavailable("AlpacaBroker.close_position is not implemented until WP 1.6")
+
+    def can_place_orders(self) -> bool:
+        return False
+
+
+async def test_an_exit_on_a_broker_that_cannot_trade_is_not_submitted(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    broker = _sim(UnavailableBroker)
+    await _held_btc(broker)
+    engine = make_engine_(broker, sessions, gate)
+    assert engine.can_place_orders() is False
+    result = await engine.exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert (result.status, result.broker_order_id) == ("not_submitted", None)
+    (row,) = await orders(sessions)
+    assert row.status == "not_submitted"  # never "unknown": nothing left the process

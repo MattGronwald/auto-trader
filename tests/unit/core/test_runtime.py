@@ -78,6 +78,9 @@ class FakeBroker:
     async def get_positions(self) -> list[Any]:
         return []
 
+    def can_place_orders(self) -> bool:
+        return False
+
     def mode(self) -> str:
         return "paper"
 
