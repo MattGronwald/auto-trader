@@ -25,13 +25,25 @@ from autotrader.core.flatten import (
     request_flatten,
 )
 from autotrader.core.kill import PAUSED_KEY, ControlStatus
+from autotrader.core.types import Quote
 from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
 from autotrader.risk.engine import OrderResult, RiskEngine
 from autotrader.risk.types import CancelResult, ExitRequest, HeldPosition, RiskDecision
 from tests.dbhooks import CommitHook, hooked_sessionmaker
-from tests.pm_harness import BTC, ETH, T0, Harness, app_config, event_payloads, make_sim
+from tests.pm_harness import (
+    BTC,
+    ETH,
+    QUOTE_FEES,
+    RULES,
+    T0,
+    Harness,
+    View,
+    app_config,
+    event_payloads,
+    make_sim,
+)
 
 Logs = list[MutableMapping[str, Any]]
 KILLED = ControlStatus(True, ("kill set",))
@@ -180,6 +192,13 @@ class ScriptedExternal(RiskEngine):
             self.external_calls += 1
             return self.outcome
         return await super().exit(request)
+
+
+class BtcQuoteRaises(View):
+    def quote(self, symbol: str) -> Quote | None:
+        if symbol == BTC:
+            raise RuntimeError("feed view broken")
+        return super().quote(symbol)
 
 
 class BrokenControls:
@@ -448,6 +467,34 @@ async def test_external_failures_back_off_per_symbol_and_alert_after_three(
         rows, logs = await run(other, other_bus, sync=False)
     assert rows == 1  # the unsettled rejected row blocks the symbol
     assert named(logs, "positions.exit_failing") == []
+
+
+async def test_a_failing_latch_never_stops_the_other_latches_or_external_sales(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    sol = "SOL/USD"
+    sim = SimBroker(
+        cash=D("100000"),
+        fees=QUOTE_FEES,
+        slippage_bps=D(0),
+        asset_rules={BTC: RULES, ETH: RULES, sol: RULES},
+    )
+    h = Harness(sessions, bus, sim=sim)
+    for symbol in (BTC, ETH, sol):
+        h.bar(symbol, 100.0)
+    btc = await h.open_position(BTC)  # the first position: its latch raises
+    eth = await h.open_position(ETH)
+    await hold_externally(h, sol)
+    h.view = BtcQuoteRaises(h.clock)
+    pm = h.new_pm()
+    await ask_flatten(h)
+    with capture_logs() as logs:
+        await pm.step()
+    assert btc in [line["position_id"] for line in named(logs, "positions.step_failed")]
+    assert (await h.position(btc)).exit_trigger is None
+    assert (await h.position(eth)).exit_trigger == "flatten"
+    (sale,) = await h.sells(sol)
+    assert (sale.external, sale.exit_reason) == (True, "flatten")
 
 
 async def test_a_failing_external_sale_never_stops_position_exits(

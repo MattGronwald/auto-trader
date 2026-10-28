@@ -237,7 +237,12 @@ class PositionManager:
         for pos in positions:
             if pos.exit_trigger is None:
                 with bind_cycle(pos.cycle_id):
-                    await self._latch(pos, reason, self._trusted_bid(pos.symbol, now), now)
+                    try:  # a failure on one position never stops the others (spec 4.3)
+                        await self._latch(pos, reason, self._trusted_bid(pos.symbol, now), now)
+                    except Exception:
+                        log.exception(
+                            "positions.step_failed", position_id=pos.id, symbol=pos.symbol
+                        )
 
     async def _sell_external(self, reason: ExitReason, now: datetime) -> None:
         """Sell each qualifying broker holding the journal has no position for (4.4.1)."""
