@@ -86,6 +86,28 @@ def acquire(
     return JournalLock(url=canonical, db_path=db_path, lock_path=lock_path, fd=fd)
 
 
+def core_running(url: str) -> bool:
+    """Whether a core holds the journal lock. Probes with a shared non-blocking `flock` on a
+    read-only descriptor and writes nothing; a non-file journal or a missing lock file is False.
+    """
+    try:
+        _, db_path = canonical_journal(url)
+    except JournalLockError:
+        return False
+    try:
+        fd = os.open(db_path.with_name(db_path.name + ".lock"), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+    finally:
+        os.close(fd)
+
+
 def _holder(lock_path: Path) -> str:
     """Diagnostic text the holder wrote ("PID <pid> since <ts>"); never the lock itself."""
     try:
