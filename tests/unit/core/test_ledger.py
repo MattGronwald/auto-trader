@@ -122,6 +122,7 @@ async def place(
     exit_reason: str | None = None,
     limit: str | None = None,
     symbol: str = BTC,
+    external: bool = False,
 ) -> tuple[int, str]:
     """Submit like the Risk Engine does and journal the row. `side`: "buy" (market, or an
     IOC limit with `limit`), "sell" (market) or "close" (close_position). `qty` is what
@@ -162,6 +163,7 @@ async def place(
             status="pending",
             now=T0,
             exit_reason=exit_reason,
+            external=external,
         )
         await repo.update_order(s, row.id, status=ack.status, now=T0, broker_order_id=ack.order_id)
     return row.id, ack.order_id
@@ -1051,6 +1053,123 @@ async def test_a_sell_with_two_open_positions_is_ambiguous_and_books_nothing(
     assert [p.qty for p in await positions(sessions)] == [D("0.00005"), D("1")]
     (order,) = await orders(sessions)
     assert (order.position_id, order.filled_qty) == (None, D(0))
+
+
+# --- external sales (1.5c decision 13, spec 4.4.1) ---------------------------------------
+
+
+async def hold_externally(sim: SimBroker, qty: str, minute: int = 1) -> None:
+    """A holding the journal doesn't know: bought at the sim with no order row."""
+    await sim.submit_order(BrokerOrder(symbol=BTC, side="buy", qty=D(qty), type="market"))
+    sim.process_bar(bar(minute))
+
+
+async def set_dust(sessions: async_sessionmaker[AsyncSession], qty: str) -> None:
+    async with sessions() as s:
+        s.add(m.SymbolDust(symbol=BTC, qty=D(qty), updated_at=T0))
+        await s.commit()
+
+
+async def test_an_external_sale_books_fills_and_cash_but_no_position(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await hold_externally(sim, "1")
+    await set_dust(sessions, "0.0003")
+    await place(sessions, sim, "close", "1", exit_reason="flatten", external=True)
+    sim.process_bar(bar(2))
+
+    assert await ledger.apply_all(await sync(sessions, sim)) == frozenset()
+
+    (order,) = await orders(sessions)
+    assert order.settled_at is not None and order.position_id is None
+    assert await positions(sessions) == []
+    assert [f.side for f in await fills(sessions)] == ["sell"]
+    assert await dust_balance(sessions) == D(0)
+    assert not await paused(sessions)
+    (sold,) = [e.payload for e in await event_rows(sessions) if e.type == "ExternalHoldingSold"]
+    assert (D(sold["qty"]), D(sold["dust_consumed"]), D(sold["external_qty"])) == (
+        D("1"),
+        D("0.0003"),
+        D("0.9997"),
+    )
+    assert (D(sold["proceeds_usd"]), D(sold["fees_usd"])) == (D("100"), D("0.25"))
+
+
+async def test_a_dust_balance_above_the_sold_qty_is_left_as_a_residual(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await hold_externally(sim, "1")
+    await set_dust(sessions, "2")
+    await place(sessions, sim, "close", "1", exit_reason="flatten", external=True)
+    sim.process_bar(bar(2))
+    await ledger.apply_all(await sync(sessions, sim))
+    assert await dust_balance(sessions) == D("1")  # consumed min(1, 2); 1.5d corrects the rest
+
+
+async def test_without_carried_dust_the_whole_sale_is_external(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await hold_externally(sim, "1")
+    await place(sessions, sim, "close", "1", exit_reason="flatten", external=True)
+    sim.process_bar(bar(2))
+    await ledger.apply_all(await sync(sessions, sim))
+    assert await dust_balance(sessions) is None
+    (sold,) = [e.payload for e in await event_rows(sessions) if e.type == "ExternalHoldingSold"]
+    assert (D(sold["dust_consumed"]), D(sold["external_qty"])) == (D(0), D("1"))
+
+
+async def test_a_zero_fill_external_sale_settles_silently(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await hold_externally(sim, "1")
+    await set_dust(sessions, "0.0003")
+    sim.script(BTC, "sell", FillPlan(("cancel",)))
+    await place(sessions, sim, "close", "1", exit_reason="flatten", external=True)
+    sim.process_bar(bar(2))
+    await ledger.apply_all(await sync(sessions, sim))
+    (order,) = await orders(sessions)
+    assert order.settled_at is not None and order.status == "canceled"
+    assert await dust_balance(sessions) == D("0.0003")
+    assert "ExternalHoldingSold" not in await event_types(sessions)
+
+
+async def test_external_dust_is_consumed_once_across_partial_fills(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await hold_externally(sim, "1")
+    await set_dust(sessions, "0.0003")
+    sim.script(BTC, "sell", FillPlan((D("0.5"),)))
+    await place(sessions, sim, "close", "1", exit_reason="flatten", external=True)
+    sim.process_bar(bar(2))
+    await ledger.apply_all(await sync(sessions, sim))  # 0.5 booked, not settled
+    assert await dust_balance(sessions) == D("0.0003")
+    sim.process_bar(bar(3))
+    await ledger.apply_all(await sync(sessions, sim))  # rest booked, settled
+    await ledger.apply_all(await sync(sessions, sim))  # a repeated pass changes nothing
+    assert await dust_balance(sessions) == D(0)
+    assert (await event_types(sessions)).count("ExternalHoldingSold") == 1
+
+
+async def test_a_marked_sell_against_an_open_position_books_normally_and_oversells(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    cycle = await new_cycle(sessions)
+    await place(sessions, sim, "buy", "1", cycle_id=cycle)
+    sim.process_bar(bar(1))
+    await ledger.apply_all(await sync(sessions, sim))
+    await hold_externally(sim, "1", minute=2)  # broker now holds 2, the journal position 1
+    await place(sessions, sim, "close", "2", exit_reason="flatten", external=True)
+    sim.process_bar(bar(3))
+    await ledger.apply_all(await sync(sessions, sim))
+    assert anomaly_kind(await event_rows(sessions)) == "oversell"
+    (pos,) = await positions(sessions)
+    assert pos.realized_pnl is None  # no external proceeds in a trade's P&L
 
 
 # --- cash check (D17, spec 4.6) -----------------------------------------------------------
