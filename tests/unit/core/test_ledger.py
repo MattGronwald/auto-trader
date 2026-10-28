@@ -262,6 +262,7 @@ async def test_full_entry_opens_the_position_and_fills_the_cycle(
         D("0.25"),
     )
     assert (pos.stop, pos.tp, pos.initial_risk, pos.closed_at) == (D("95"), D("110"), D("5"), None)
+    assert pos.atr_at_entry is None  # no `atr` key: no trailing
     (order,) = await orders(sessions)
     assert (order.status, order.filled_qty, order.position_id) == ("filled", D("1"), pos.id)
     assert order.settled_at is not None
@@ -271,6 +272,30 @@ async def test_full_entry_opens_the_position_and_fills_the_cycle(
     assert await event_types(sessions) == ["OrderSettled", "CycleTransitioned"]
     settled = (await event_rows(sessions))[0].payload
     assert (settled["filled_qty"], settled["settled"], settled["status"]) == ("1", True, "filled")
+
+
+async def test_the_entry_decisions_atr_is_frozen_on_the_position(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    cycle = await new_cycle(sessions)
+    async with sessions() as s:
+        await repo.record_risk_decision(
+            s,
+            cycle_id=cycle,
+            kind="entry",
+            approved=True,
+            reasons=[],
+            adjusted={"initial_risk": "5", "atr": "2"},
+            computed_size=D("1"),
+            ts=T0,
+        )
+    row, oid = await place(sessions, sim, "buy", "1", cycle_id=cycle)
+    sim.process_bar(bar(1))
+
+    assert await ledger.apply(await update(sim, row, oid)) == "applied"
+    (pos,) = await positions(sessions)
+    assert (pos.initial_risk, pos.atr_at_entry) == (D("5"), D("2"))
 
 
 async def test_partial_fill_then_cancel_fills_the_cycle_as_partial(

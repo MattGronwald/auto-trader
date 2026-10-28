@@ -104,6 +104,8 @@ class OrderResult:
     status: str | None = None
     broker_order_id: str | None = None
     dust: bool = False
+    min_qty: Decimal | None = None  # the asset's min_qty when the holding is dust
+    no_position: bool = False  # the broker holds nothing in the symbol
 
 
 def _dec(value: float | None) -> Decimal | None:
@@ -406,7 +408,7 @@ class RiskEngine:
         except DustRemainder as e:  # close_position only: report dust as a type (1.5c)
             log.warning("risk.exit_dust", order_row=row_id, qty=str(e.qty), min_qty=str(e.min_qty))
             await self._set_status(row_id, "rejected")
-            return OrderResult(decision, row_id, "rejected", dust=True)
+            return OrderResult(decision, row_id, "rejected", dust=True, min_qty=e.min_qty)
         except OrderRejected as e:
             log.warning("risk.order_rejected", order_row=row_id, reason=str(e))
             await self._set_status(row_id, "rejected")
@@ -476,11 +478,18 @@ class RiskEngine:
                 )
                 await self._persist(request.cycle_id, "exit", decision, now)
                 return OrderResult(decision)
-            decision = check_exit(request, held, mode_matches=self._mode == self._broker.mode())
+            mode_matches = self._mode == self._broker.mode()
+            decision = check_exit(request, held, mode_matches=mode_matches)
             await self._persist(request.cycle_id, "exit", decision, now)
             if decision.qty is None:
                 log.warning("risk.exit_rejected", symbol=request.symbol, reason=decision.reasons[0])
-                return OrderResult(decision)
+                # A mode mismatch is a failure, not dust: say nothing about the holding then.
+                position = next((p for p in held if p.symbol == request.symbol), None)
+                if not mode_matches:
+                    return OrderResult(decision)
+                if position is None:
+                    return OrderResult(decision, no_position=True)
+                return OrderResult(decision, dust=True, min_qty=position.min_qty)
             async with self._sessions() as session:
                 row = await repo.insert_order(
                     session,

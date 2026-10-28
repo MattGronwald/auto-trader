@@ -1591,8 +1591,41 @@ async def test_a_dust_close_is_reported_as_dust(
     await _held_btc(broker)
     result = await make_engine_(broker, sessions, gate).exit(ExitRequest(symbol=BTC, reason="kill"))
     assert (result.status, result.dust) == ("rejected", True)
+    assert result.min_qty == RULES.min_qty
     (row,) = await orders(sessions)
     assert (row.status, row.exit_reason) == ("rejected", "kill")
+
+
+async def test_exit_outcomes_say_whether_the_broker_held_dust_or_nothing(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    nothing = await make_engine_(_sim(), sessions, gate).exit(
+        ExitRequest(symbol=BTC, reason="stop")
+    )
+    assert (nothing.no_position, nothing.dust, nothing.min_qty) == (True, False, None)
+
+    dusty = SimBroker(  # base fee: a 0.0001 buy nets 0.00009975 < min_qty
+        cash=D("1000"),
+        fees=FeeSchedule(maker_bps=D(15), taker_bps=D(25), buy_fee_asset="base"),
+        slippage_bps=D(0),
+        asset_rules={BTC: RULES.model_copy(update={"min_notional": D(0)})},  # 0.01 USD buy
+        timeframe="5m",
+    )
+    dusty.process_bar(five(29))
+    await dusty.submit_order(BrokerOrder(symbol=BTC, side="buy", qty=D("0.0001"), type="market"))
+    dusty.process_bar(five(30))
+    dust = await make_engine_(dusty, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert (dust.no_position, dust.dust, dust.min_qty) == (False, True, RULES.min_qty)
+    assert dust.decision.reasons == ("dust only in BTC/USD",) and dust.order_row_id is None
+
+
+async def test_a_mode_mismatch_is_neither_dust_nor_no_position(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    await _held_btc(sim)
+    sim.broker_mode = "live"
+    result = await make_engine_(sim, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert (result.dust, result.no_position, result.min_qty) == (False, False, None)
 
 
 async def test_an_open_journal_trade_blocks_its_symbol_even_on_broker_dust(

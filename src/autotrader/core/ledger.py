@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 import structlog
@@ -197,10 +197,10 @@ async def _verify(session: AsyncSession, event: DomainEvent) -> bool:
     return any(p.get("unit_id") == event.unit_id for p in payloads)
 
 
-async def _initial_risk(session: AsyncSession, cycle_id: int | None) -> Decimal | None:
-    """The R denominator from the approved entry decision (D16 `adjusted`)."""
+async def _entry_adjusted(session: AsyncSession, cycle_id: int | None) -> dict[str, Any]:
+    """The approved entry decision's `adjusted` (D16 R denominator, ATR at entry)."""
     if cycle_id is None:
-        return None
+        return {}
     adjusted = await session.scalar(
         select(RiskDecision.adjusted)
         .where(
@@ -211,7 +211,10 @@ async def _initial_risk(session: AsyncSession, cycle_id: int | None) -> Decimal 
         .order_by(RiskDecision.id.desc())
         .limit(1)
     )
-    value = None if adjusted is None else adjusted.get("initial_risk")
+    return {} if adjusted is None else dict(adjusted)
+
+
+def _opt_dec(value: object) -> Decimal | None:
     return None if value is None else Decimal(str(value))
 
 
@@ -374,6 +377,7 @@ class Ledger:
         self, session: AsyncSession, order: Order, position: Position | None, fill: Fill
     ) -> Position:
         if position is None:
+            adjusted = await _entry_adjusted(session, order.cycle_id)
             position = Position(
                 cycle_id=order.cycle_id,
                 symbol=order.symbol or fill.symbol,
@@ -384,7 +388,8 @@ class Ledger:
                 tp=order.tp_price,
                 opened_at=fill.ts,
                 fees=_D0,
-                initial_risk=await _initial_risk(session, order.cycle_id),
+                initial_risk=_opt_dec(adjusted.get("initial_risk")),
+                atr_at_entry=_opt_dec(adjusted.get("atr")),
                 dust_consumed=_D0,
             )
             session.add(position)
