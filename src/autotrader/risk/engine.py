@@ -13,8 +13,8 @@ happen with or without a shared lock (fills are broker-side); the ledger books i
 and the Position Manager manages it (WP 1.5c).
 
 `check()` first syncs every unsettled order (`sync_orders`) and books it through the ledger
-(`core/ledger.py`, WP 1.5b); an unreadable order rejects the entry (`state unavailable:
-SyncIncomplete`). Exits never sync.
+(`core/ledger.py`, WP 1.5b); an unreadable order, or a symbol whose booking raised in the
+ledger, rejects every entry (`state unavailable: SyncIncomplete`). Exits never sync.
 
 Each locked section has ONE budget of `io_timeout_s`, measured from taking its lock and
 shared by its network/gate awaits only (gate.status, get_account, get_positions, each
@@ -83,7 +83,7 @@ _LOCAL_FINAL = ("not_submitted", "rejected")
 class Accounting(Protocol):
     """The ledger (`core/ledger.py`, WP 1.5b): books a sync pass. Journal code only."""
 
-    async def apply_all(self, result: SyncResult) -> None: ...
+    async def apply_all(self, result: SyncResult) -> frozenset[str]: ...
 
 
 class RiskMarketView(Protocol):
@@ -216,9 +216,12 @@ class RiskEngine:
         # Book our own orders BEFORE reading positions: a fill the sync observed is then in
         # the journal and in the positions read below (never neither position nor entry).
         synced = await self._sync(deadline)
-        await self._ledger.apply_all(synced)
-        if not synced.complete:  # PLAN 3.2 item 4: an unreadable order fails entries closed
-            raise SyncIncomplete(f"order rows not synced: {list(synced.failed)}")
+        failed = await self._ledger.apply_all(synced)
+        if not synced.complete or failed:  # PLAN 3.2 item 4 / spec 4.1: fail entries closed
+            raise SyncIncomplete(
+                f"order rows not synced: {list(synced.failed)}; "
+                f"symbols the ledger could not book: {sorted(failed)}"
+            )
         # After the booking: a pause this pass set (ledger anomaly) already rejects here.
         control = await self._within(deadline, lambda: self._gate.status(now))
         async with self._sessions() as session:

@@ -13,6 +13,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from autotrader.broker.base import (
@@ -38,6 +39,7 @@ from tests.dbhooks import CommitHook, hooked_sessionmaker
 REPO = Path(__file__).resolve().parents[3]
 PROFILE = load_profile(REPO / "strategies" / "fast_momentum_v1.yaml")
 BTC = "BTC/USD"
+ETH = "ETH/USD"
 T0 = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 RULES = AssetRules(
     min_qty=D("0.0001"), qty_increment=D("0.0001"), min_notional=D("1"), price_increment=D("0.01")
@@ -46,9 +48,9 @@ QUOTE = FeeSchedule(maker_bps=D("15"), taker_bps=D("25"), buy_fee_asset="quote")
 BASE = FeeSchedule(maker_bps=D("15"), taker_bps=D("25"), buy_fee_asset="base")
 
 
-def bar(i: int, price: float = 100.0) -> Bar:
+def bar(i: int, price: float = 100.0, symbol: str = BTC) -> Bar:
     return Bar(
-        symbol=BTC,
+        symbol=symbol,
         timeframe="1m",
         ts=T0 + timedelta(minutes=i),
         open=price,
@@ -60,8 +62,11 @@ def bar(i: int, price: float = 100.0) -> Bar:
 
 
 def make_sim(fees: FeeSchedule = QUOTE, cash: str = "1000") -> SimBroker:
-    sim = SimBroker(cash=D(cash), fees=fees, slippage_bps=D(0), asset_rules={BTC: RULES})
+    sim = SimBroker(
+        cash=D(cash), fees=fees, slippage_bps=D(0), asset_rules={BTC: RULES, ETH: RULES}
+    )
     sim.process_bar(bar(0))
+    sim.process_bar(bar(0, symbol=ETH))
     return sim
 
 
@@ -116,22 +121,23 @@ async def place(
     cycle_id: int | None = None,
     exit_reason: str | None = None,
     limit: str | None = None,
+    symbol: str = BTC,
 ) -> tuple[int, str]:
     """Submit like the Risk Engine does and journal the row. `side`: "buy" (market, or an
     IOC limit with `limit`), "sell" (market) or "close" (close_position). `qty` is what
     the row records. Returns (order row id, broker order id)."""
     if side == "close":
-        ack = await sim.close_position(BTC)
+        ack = await sim.close_position(symbol)
     elif limit is None:
         ack = await sim.submit_order(
             BrokerOrder(
-                symbol=BTC, side="buy" if side == "buy" else "sell", qty=D(qty), type="market"
+                symbol=symbol, side="buy" if side == "buy" else "sell", qty=D(qty), type="market"
             )
         )
     else:
         ack = await sim.submit_order(
             BrokerOrder(
-                symbol=BTC,
+                symbol=symbol,
                 side="buy",
                 qty=D(qty),
                 type="limit",
@@ -145,7 +151,7 @@ async def place(
             s,
             cycle_id=cycle_id,
             client_order_id=None,
-            symbol=BTC,
+            symbol=symbol,
             mode="paper",
             type_="market" if limit is None else "limit",
             side="buy" if buy else "sell",
@@ -1230,3 +1236,33 @@ def test_the_ledger_reproduces_broker_cash_and_holdings(
         url = f"sqlite+aiosqlite:///{tmp}/ledger.db"
         upgrade(url)  # sync: Alembic runs its own event loop
         asyncio.run(_replay(url, trades, fee_asset))
+
+
+class FailingRowLedger(Ledger):
+    def __init__(self, *args: Any, failing: int, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self.failing = failing
+
+    async def apply(self, update: OrderUpdate) -> Any:
+        if update.order_row_id == self.failing:
+            raise IntegrityError("INSERT", None, Exception("boom"))
+        return await super().apply(update)
+
+
+async def test_a_failing_row_holds_back_its_symbol_only(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    sim = make_sim()
+    btc, _ = await place(sessions, sim, "buy", "1")
+    eth, _ = await place(sessions, sim, "buy", "1", symbol=ETH)
+    sim.process_bar(bar(1))
+    sim.process_bar(bar(1, symbol=ETH))
+    btc_exit, _ = await place(sessions, sim, "sell", "1")  # a later BTC row: held back too
+    ledger = FailingRowLedger(bus, sessions, clock=lambda: T0, failing=btc)
+
+    failed = await ledger.apply_all(await sync(sessions, sim))
+
+    assert failed == frozenset({BTC})
+    by_id = {o.id: o for o in await orders(sessions)}
+    assert by_id[eth].settled_at is not None  # the other symbol booked
+    assert by_id[btc].settled_at is None and by_id[btc_exit].settled_at is None

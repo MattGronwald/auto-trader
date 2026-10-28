@@ -241,15 +241,20 @@ class Ledger:
 
     # --- orders ------------------------------------------------------------------------
 
-    async def apply_all(self, result: SyncResult) -> None:
-        """Book one sync pass (spec 4.3): per symbol in order-row id order. An unsettled row
+    async def apply_all(self, result: SyncResult) -> frozenset[str]:
+        """Book one sync pass (spec 4.1): per symbol in order-row id order. An unsettled row
         without an update (failed lookup, or pending/unknown with no broker id), and an
         update that was deferred or anomalous, hold back the later rows of its symbol, so a
-        catch-up never books an exit before its entry."""
+        catch-up never books an exit before its entry.
+
+        A row whose booking raises is logged and holds back its own symbol only; the other
+        symbols still book. Returns the symbols that raised on this pass (the caller fails
+        closed on them). `CancelledError` is never caught."""
         updates = {u.order_row_id: u for u in result.updates}
         async with self._sessions() as session:
             rows = await repo.unsettled_orders(session)
         held: set[str] = set()
+        failed: set[str] = set()
         for row in rows:
             symbol = row.symbol or ""
             update = updates.get(row.id)
@@ -257,8 +262,19 @@ class Ledger:
                 if update is not None:
                     log.info("ledger.update_deferred", order_row=row.id, symbol=symbol)
                 continue
-            if update is None or await self.apply(update) in ("deferred", "anomaly"):
+            if update is None:
                 held.add(symbol)
+                continue
+            try:
+                outcome = await self.apply(update)
+            except Exception:
+                log.exception("ledger.row_failed", order_row=row.id, symbol=symbol)
+                held.add(symbol)
+                failed.add(symbol)
+                continue
+            if outcome in ("deferred", "anomaly"):
+                held.add(symbol)
+        return frozenset(failed)
 
     async def apply(self, update: OrderUpdate) -> Outcome:
         """Book one order's update in one transaction. Never raises for a deferral or an

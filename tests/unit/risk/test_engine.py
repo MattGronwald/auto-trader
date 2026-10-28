@@ -1455,8 +1455,21 @@ async def test_an_unreadable_order_fails_entries_closed_but_the_rest_is_booked(
 
 
 class FailingLedger:
-    async def apply_all(self, result: SyncResult) -> None:
+    async def apply_all(self, result: SyncResult) -> frozenset[str]:
         raise RuntimeError("journal down")
+
+
+class OneSymbolFailed:
+    async def apply_all(self, result: SyncResult) -> frozenset[str]:
+        return frozenset({"ETH/USD"})
+
+
+async def test_a_symbol_the_ledger_could_not_book_fails_every_entry_closed(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    engine = make_engine_(sim, sessions, gate, ledger=OneSymbolFailed())
+    result = await engine.check(intent(cycle_id))  # a BTC entry
+    assert result.decision.reasons == ("state unavailable: SyncIncomplete",)
 
 
 async def test_a_failing_ledger_fails_entries_closed(
