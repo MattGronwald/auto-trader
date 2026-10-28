@@ -1,7 +1,7 @@
 """Journal access. Functions take an `AsyncSession` and commit their own unit of work,
-except the cycle writes (`insert_cycle`, `transition_cycle`) and `append_event(...,
-commit=False)`: those run inside `EventBus.publish_tx`, which commits the row together with
-its event (WP 1.4, D15).
+except the cycle writes (`insert_cycle`, `transition_cycle`), the exit latch (`latch_exit`,
+WP 1.5c) and `append_event(..., commit=False)`: those run inside `EventBus.publish_tx`, which
+commits the row together with its event (WP 1.4, D15).
 
 Phase 0 needs live here (strategies, bars, events, control state), plus the read-only
 queries the Scanner (WP 1.2) runs on cycles and positions; WP 1.3 adds the risk-decision,
@@ -10,7 +10,7 @@ work package that writes them. There is deliberately no
 update/delete for events and no delete anywhere (SPEC §4.8: nothing is deleted).
 """
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -200,6 +200,60 @@ async def open_cycle_symbols(session: AsyncSession) -> list[str]:
 async def open_position_symbols(session: AsyncSession) -> set[str]:
     rows = await session.scalars(select(Position.symbol).where(Position.closed_at.is_(None)))
     return set(rows)
+
+
+# --- positions: exit state (WP 1.5c) -------------------------------------------------
+
+
+async def open_positions(session: AsyncSession) -> list[Position]:
+    rows = await session.scalars(
+        select(Position)
+        .where(Position.closed_at.is_(None))
+        .order_by(Position.id)
+        .execution_options(populate_existing=True)
+    )
+    return list(rows)
+
+
+async def set_time_limit(session: AsyncSession, position_id: int, at: datetime) -> None:
+    """Write the time limit once: an existing value is never overwritten."""
+    await session.execute(
+        update(Position)
+        .where(Position.id == position_id, Position.time_limit_at.is_(None))
+        .values(time_limit_at=at)
+    )
+    await session.commit()
+
+
+async def update_trailing(
+    session: AsyncSession, position_id: int, *, trail_high: Decimal, trail_stop: Decimal
+) -> None:
+    """Persist the trailing state of an open position; touches only these two columns."""
+    await session.execute(
+        update(Position)
+        .where(Position.id == position_id, Position.closed_at.is_(None))
+        .values(trail_high=trail_high, trail_stop=trail_stop)
+    )
+    await session.commit()
+
+
+async def latch_exit(session: AsyncSession, position_id: int, *, reason: str, at: datetime) -> bool:
+    """Latch an exit trigger on an open, unlatched position. Never commits (it runs inside
+    `EventBus.publish_tx` with its `ExitTriggered` event); False when the guard matched
+    nothing."""
+    result = typing_cast(
+        CursorResult[Any],
+        await session.execute(
+            update(Position)
+            .where(
+                Position.id == position_id,
+                Position.exit_trigger.is_(None),
+                Position.closed_at.is_(None),
+            )
+            .values(exit_trigger=reason, exit_triggered_at=at)
+        ),
+    )
+    return result.rowcount == 1
 
 
 # --- cycles (WP 1.4) -----------------------------------------------------------------
@@ -397,6 +451,17 @@ async def unsettled_orders(session: AsyncSession) -> list[Order]:
     rows = await session.scalars(
         select(Order)
         .where(Order.settled_at.is_(None))
+        .order_by(Order.id)
+        .execution_options(populate_existing=True)
+    )
+    return list(rows)
+
+
+async def orders_by_id(session: AsyncSession, ids: Collection[int]) -> list[Order]:
+    """The named order rows, settled or not, in id order (re-read, never cached)."""
+    rows = await session.scalars(
+        select(Order)
+        .where(Order.id.in_(list(ids)))
         .order_by(Order.id)
         .execution_options(populate_existing=True)
     )

@@ -525,3 +525,82 @@ async def test_unsettled_orders_are_every_row_without_settled_at(session: AsyncS
     await session.execute(update(m.Order).where(m.Order.id == done.id).values(settled_at=T0))
     await session.commit()
     assert [o.id for o in await repo.unsettled_orders(session)] == [o.id for o in open_]
+
+
+async def test_orders_by_id_returns_the_named_rows_in_id_order(session: AsyncSession) -> None:
+    rows = [await _order(session, status="new") for _ in range(3)]
+    assert [o.id for o in await repo.orders_by_id(session, {rows[2].id, rows[0].id})] == [
+        rows[0].id,
+        rows[2].id,
+    ]
+    await session.execute(update(m.Order).where(m.Order.id == rows[0].id).values(settled_at=T0))
+    await session.commit()
+    (fresh,) = await repo.orders_by_id(session, [rows[0].id])
+    assert fresh.settled_at == T0
+    assert await repo.orders_by_id(session, []) == []
+
+
+# --- positions (WP 1.5c) -------------------------------------------------------------
+
+
+async def _position(session: AsyncSession, *, closed: bool = False) -> int:
+    row = m.Position(
+        symbol="BTC/USD",
+        side="long",
+        qty=Decimal(1),
+        entry_price=Decimal(100),
+        opened_at=T0,
+        closed_at=T0 if closed else None,
+    )
+    session.add(row)
+    await session.commit()
+    return row.id
+
+
+async def test_open_positions_exclude_closed_rows(session: AsyncSession) -> None:
+    first = await _position(session)
+    await _position(session, closed=True)
+    third = await _position(session)
+    assert [p.id for p in await repo.open_positions(session)] == [first, third]
+
+
+async def test_set_time_limit_never_overwrites_a_value(session: AsyncSession) -> None:
+    pid = await _position(session)
+    await repo.set_time_limit(session, pid, T0 + timedelta(hours=8))
+    await repo.set_time_limit(session, pid, T0 + timedelta(hours=1))
+    (pos,) = await repo.open_positions(session)
+    assert pos.time_limit_at == T0 + timedelta(hours=8)
+
+
+async def test_update_trailing_touches_only_open_positions(session: AsyncSession) -> None:
+    open_ = await _position(session)
+    closed = await _position(session, closed=True)
+    for pid in (open_, closed):
+        await repo.update_trailing(
+            session, pid, trail_high=Decimal("106"), trail_stop=Decimal("103")
+        )
+    rows = {
+        p.id: p
+        for p in await session.scalars(select(m.Position).execution_options(populate_existing=True))
+    }
+    assert (rows[open_].trail_high, rows[open_].trail_stop) == (Decimal("106"), Decimal("103"))
+    assert (rows[closed].trail_high, rows[closed].trail_stop) == (None, None)
+
+
+async def test_latch_exit_latches_an_open_position_once(session: AsyncSession) -> None:
+    pid = await _position(session)
+    closed = await _position(session, closed=True)
+    assert await repo.latch_exit(session, pid, reason="stop", at=T0) is True
+    assert await repo.latch_exit(session, pid, reason="time", at=T0) is False
+    assert await repo.latch_exit(session, closed, reason="stop", at=T0) is False
+    await session.commit()  # latch_exit never commits: the caller's unit does
+    (pos,) = await repo.open_positions(session)
+    assert (pos.exit_trigger, pos.exit_triggered_at) == ("stop", T0)
+
+
+async def test_latch_exit_does_not_commit(session: AsyncSession) -> None:
+    pid = await _position(session)
+    assert await repo.latch_exit(session, pid, reason="stop", at=T0) is True
+    await session.rollback()
+    (pos,) = await repo.open_positions(session)
+    assert pos.exit_trigger is None
