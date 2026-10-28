@@ -12,14 +12,15 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from autotrader.broker.base import Account, BrokerError, FeeSchedule
+from autotrader.broker.base import Account, AssetRules, BrokerError, FeeSchedule, Position
 from autotrader.core.bus import EventBus
 from autotrader.core.config import AppConfig, Settings, load_config, load_profile
 from autotrader.core.feed import Latest, MarketFeed
+from autotrader.core.flatten import request_flatten
 from autotrader.core.kill import ControlStatus
 from autotrader.core.lock import JournalLock, acquire
 from autotrader.core.logging import configure_logging
-from autotrader.core.runtime import ControlPoller, _snapshot_step, run_core
+from autotrader.core.runtime import ControlPoller, _snapshot_step, _sync_step, run_core
 from autotrader.core.shutdown import EXIT_CLEAN, EXIT_FAILED, ShutdownControl
 from autotrader.core.types import Bar, Quote
 from autotrader.journal import models as m
@@ -697,3 +698,223 @@ async def test_stop_lets_a_bar_in_flight_finish_its_journal_writes(
     finally:
         await engine.dispose()
     assert [p["timeframe"] for p in closed].count("1m") == 2
+
+
+# --- WP 1.5c: order-sync and Position Manager loops, shutdown.flatten -------------------
+
+
+async def _insert_unsettled_order(cfg: AppConfig) -> None:
+    """One unsettled buy row with broker id "b-1": the sync loop reads it from the broker."""
+    now = datetime.now(UTC)
+    engine = make_engine(cfg.database.url)
+    try:
+        async with make_sessionmaker(engine)() as s:
+            s.add(
+                m.Order(
+                    broker_order_id="b-1",
+                    symbol="BTC/USD",
+                    mode="paper",
+                    type="limit",
+                    side="buy",
+                    qty=Decimal("0.01"),
+                    limit_price=Decimal(100),
+                    status="new",
+                    submitted_at=now,
+                    updated_at=now,
+                )
+            )
+            await s.commit()
+    finally:
+        await engine.dispose()
+
+
+async def _control_value(cfg: AppConfig, key: str) -> Any:
+    engine = make_engine(cfg.database.url)
+    try:
+        async with make_sessionmaker(engine)() as s:
+            row = await s.get(m.ControlState, key)
+            return None if row is None else row.value
+    finally:
+        await engine.dispose()
+
+
+def _with_shutdown_flatten(cfg: AppConfig) -> AppConfig:
+    return cfg.model_copy(update={"shutdown": cfg.shutdown.model_copy(update={"flatten": True})})
+
+
+class HangingSyncBroker(FakeBroker):
+    """An unsettled order makes the sync loop read it; every read hangs."""
+
+    def __init__(self) -> None:
+        self.can_calls = 0
+        self.order_reads = 0
+
+    def can_place_orders(self) -> bool:
+        self.can_calls += 1
+        return False
+
+    async def get_order(self, order_id: str) -> Any:
+        self.order_reads += 1
+        await asyncio.Event().wait()
+
+
+class HoldingBroker(FakeBroker):
+    """Holds 0.5 BTC, well above `min_qty`, until `release()` is true; then holds nothing."""
+
+    def __init__(self, release: Callable[[], bool] = lambda: False) -> None:
+        self.release = release
+
+    async def get_positions(self) -> list[Any]:
+        if self.release():
+            return []
+        return [Position(symbol="BTC/USD", qty=Decimal("0.5"), avg_entry_price=Decimal(100))]
+
+    async def asset_rules(self, symbol: str) -> AssetRules:
+        return AssetRules(
+            min_qty=Decimal("0.0001"),
+            qty_increment=Decimal("0.0001"),
+            min_notional=Decimal(1),
+            price_increment=Decimal("0.01"),
+        )
+
+
+async def test_a_hung_order_sync_never_delays_the_position_manager(
+    cfg: AppConfig, lock: JournalLock
+) -> None:
+    await _insert_unsettled_order(cfg)
+    broker = HangingSyncBroker()
+
+    async def connect(_: Settings) -> Any:
+        return broker
+
+    control, _ = make_control(timeout_s=0.5)
+    task = start_core(cfg, lock, control, connect_broker=connect, sync_s=0.01, manage_s=0.01)
+    try:
+        await _wait_for(lambda: broker.order_reads >= 1)  # the sync step is hanging now
+        seen = broker.can_calls
+        await _wait_for(lambda: broker.can_calls >= seen + 3)  # manage keeps stepping
+    finally:
+        control.begin("stop")
+        assert await asyncio.wait_for(task, timeout=15) in (EXIT_CLEAN, EXIT_FAILED)
+
+
+async def test_shutdown_flatten_reports_flat_on_a_graceful_stop(
+    cfg: AppConfig, lock: JournalLock
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    flatten_cfg = _with_shutdown_flatten(cfg)
+    control, _ = make_control()
+
+    task = start_core(flatten_cfg, lock, control, sync_s=0.01, manage_s=0.01)
+    await _wait_for(lambda: any(ln["event"] == "core.started" for ln in _log_lines(buf)))
+    control.begin("stop")
+
+    assert await asyncio.wait_for(task, timeout=10) == EXIT_CLEAN
+    flattened = next(ln for ln in _log_lines(buf) if ln["event"] == "core.shutdown_flattened")
+    assert flattened["dust"] == {}
+    result = await _control_value(cfg, "flatten_result")
+    assert result["flat"] is True
+    assert await _control_value(cfg, "flatten_requested") is None
+    assert await _control_value(cfg, "paused") is True  # resuming is the operator's call
+
+
+async def test_shutdown_flatten_times_out_and_teardown_continues(
+    cfg: AppConfig, lock: JournalLock
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+
+    async def connect(_: Settings) -> Any:
+        return HoldingBroker()  # can't place orders: the holding is never sold
+
+    control, _ = make_control(timeout_s=0.5)
+    task = start_core(
+        _with_shutdown_flatten(cfg),
+        lock,
+        control,
+        connect_broker=connect,
+        sync_s=0.01,
+        manage_s=0.01,
+    )
+    await _wait_for(lambda: any(ln["event"] == "core.started" for ln in _log_lines(buf)))
+    control.begin("stop")
+
+    assert await asyncio.wait_for(task, timeout=10) == EXIT_CLEAN
+    events = [ln["event"] for ln in _log_lines(buf)]
+    assert "core.shutdown_flattened" not in events
+    assert events.index("core.shutdown_flatten_incomplete") < events.index("core.stopped")
+    incomplete = next(
+        ln for ln in _log_lines(buf) if ln["event"] == "core.shutdown_flatten_incomplete"
+    )
+    assert incomplete["level"] == "error" and "remaining" in incomplete
+
+
+async def test_shutdown_flatten_keeps_a_pending_cli_request(
+    cfg: AppConfig, lock: JournalLock
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    engine = make_engine(cfg.database.url)
+    try:
+        cli, created = await request_flatten(
+            make_sessionmaker(engine), source="cli", reason="test", now=datetime.now(UTC)
+        )
+    finally:
+        await engine.dispose()
+    assert created
+    control, _ = make_control()
+
+    async def connect(_: Settings) -> Any:
+        return HoldingBroker(release=lambda: control.requested)  # flat only after the stop
+
+    task = start_core(
+        _with_shutdown_flatten(cfg),
+        lock,
+        control,
+        connect_broker=connect,
+        sync_s=0.01,
+        manage_s=0.01,
+    )
+    await _wait_for(lambda: any(ln["event"] == "core.started" for ln in _log_lines(buf)))
+    control.begin("stop")
+
+    assert await asyncio.wait_for(task, timeout=10) == EXIT_CLEAN
+    result = await _control_value(cfg, "flatten_result")
+    assert result["request_ts"] == cli.ts and result["flat"] is True
+    assert "core.shutdown_flattened" in [ln["event"] for ln in _log_lines(buf)]
+
+
+async def test_shutdown_flatten_is_skipped_after_a_startup_failure(
+    cfg: AppConfig, lock: JournalLock
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+
+    async def failing(_: Settings) -> Any:
+        raise BrokerError("auth failed")
+
+    control, _ = make_control()
+    with pytest.raises(BrokerError, match="auth failed"):
+        await start_core(_with_shutdown_flatten(cfg), lock, control, connect_broker=failing)
+    skipped = next(ln for ln in _log_lines(buf) if ln["event"] == "core.shutdown_flatten_skipped")
+    assert skipped["level"] == "warning"
+    assert await _control_value(cfg, "flatten_requested") is None
+
+
+class FailingSync:
+    async def sync_orders(self) -> Any:
+        raise ConnectionError("broker down")
+
+
+class NoLedger:
+    async def apply_all(self, result: Any) -> frozenset[str]:
+        raise AssertionError("nothing to book after a failed read")
+
+
+async def test_sync_step_logs_a_failure_and_never_raises() -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    await _sync_step(FailingSync(), NoLedger())  # type: ignore[arg-type]
+    failed = next(ln for ln in _log_lines(buf) if ln["event"] == "ledger.sync_failed")
+    assert "broker down" in failed["exception"]

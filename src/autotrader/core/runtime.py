@@ -3,8 +3,14 @@
 Connects the broker, backfills and streams bars for the universe, persists 1m bars, runs the
 Signal Scanner on closed bars (WP 1.2) and snapshots equity for the daily-loss/drawdown
 checks. The broker is handed to the `RiskEngine`, its only holder from then on (SPEC §0.1).
-Nothing calls `check()`/`exit()` until WP 1.5c/1.5d wire the Position Manager and the Cycle
-Runner.
+
+WP 1.5c (spec 2026-10-19, 4.7-4.8): `exit()` is called by the Position Manager in the
+supervised `positions.manage` loop (every 1 s), and the `ledger.sync` loop reads every unsettled
+order and books its fills every 2 s through the shared `Ledger`; a hung order read never delays
+the Position Manager. `check()` still waits for the Cycle Runner (WP 1.5d). With
+`shutdown.flatten`, teardown runs a bounded `flatten` step after the startup step: it requests a
+flatten (keeping a pending CLI request) and waits up to half the remaining budget for the
+still-running loops to reach flat, then teardown continues either way.
 
 WP 1.5a (spec 2026-10-14):
 - The caller (the CLI) holds the single-writer journal lock (`core/lock.py`) before the
@@ -30,18 +36,22 @@ WP 1.5a (spec 2026-10-14):
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
 
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from autotrader.core.bus import EventBus
 from autotrader.core.config import AppConfig, Settings, StrategyProfile
 from autotrader.core.feed import BarClosed, BarSource, MarketFeed
+from autotrader.core.flatten import request_flatten, wait_for_result
 from autotrader.core.kill import ControlGate, ControlStatus
 from autotrader.core.ledger import Ledger
 from autotrader.core.lock import JournalLock, canonical_journal
+from autotrader.core.position_manager import PositionManager
 from autotrader.core.scanner import Scanner
 from autotrader.core.shutdown import EXIT_CLEAN, EXIT_FAILED, ShutdownControl
 from autotrader.core.supervise import Freshness, Loop, Supervisor
@@ -58,6 +68,10 @@ SNAPSHOT_S = 60.0
 SUPERVISE_S = 1.0  # stall/freshness checks and stream supervision
 FEED_STALL_S = 30.0
 CONTROL_STALL_S = 10.0
+SYNC_S = 2.0  # order sync: broker reads and ledger bookings
+SYNC_STALL_S = 30.0
+MANAGE_S = 1.0  # Position Manager step
+MANAGE_STALL_S = 30.0
 
 
 class _Snapshotter(Protocol):
@@ -65,7 +79,8 @@ class _Snapshotter(Protocol):
 
 
 class ControlPoller:
-    """Polls the kill/pause gate and logs kill changes; keeps the latest status for WP 1.5c.
+    """Polls the kill/pause gate and logs kill changes; the latest status feeds the Position
+    Manager (`latest`).
 
     `file_step` checks the kill file on its own (sync, DB-free) in a separate loop, so a hung
     journal read in `step` never hides a kill file: the file latch is the fallback for a broken
@@ -125,6 +140,36 @@ async def _snapshot_step(risk: _Snapshotter) -> None:
         log.info("risk.snapshot_written")
 
 
+async def _sync_step(risk: RiskEngine, ledger: Ledger) -> None:
+    """One order sync: read the unsettled orders from the broker, then book them. Failures
+    are logged, never raised (the engine bounds its broker reads, `io_timeout_s`)."""
+    try:
+        await ledger.apply_all(await risk.sync_orders())
+    except Exception:
+        log.exception("ledger.sync_failed")
+
+
+async def _shutdown_flatten(
+    sessions: async_sessionmaker[AsyncSession], control: ShutdownControl
+) -> None:
+    """Teardown's `flatten` step (spec 4.7): request a flatten, keeping a pending request so
+    a waiting CLI still sees its own result, and wait up to half the remaining budget for the
+    still-running loops to report flat. Never drives a pass itself and never raises for "not
+    flat": positions left open are handled at the next start."""
+    request, _ = await request_flatten(
+        sessions, source="shutdown", reason=control.cause, now=datetime.now(UTC)
+    )
+    result = await wait_for_result(sessions, request.ts, wait_s=control.remaining() / 2)
+    if result is not None and result.get("flat"):
+        log.info("core.shutdown_flattened", request_ts=request.ts, dust=result.get("dust"))
+    else:
+        log.error(
+            "core.shutdown_flatten_incomplete",
+            request_ts=request.ts,
+            remaining=None if result is None else result.get("remaining"),
+        )
+
+
 async def run_core(
     cfg: AppConfig,
     settings: Settings,
@@ -138,6 +183,8 @@ async def run_core(
     tick_s: float = TICK_S,
     snapshot_s: float = SNAPSHOT_S,
     supervise_s: float = SUPERVISE_S,
+    sync_s: float = SYNC_S,
+    manage_s: float = MANAGE_S,
 ) -> int:
     """Run until shutdown is requested. Returns EXIT_CLEAN, or EXIT_FAILED when a teardown
     step was forced at the deadline or failed. Startup failures and stream death are logged
@@ -178,6 +225,7 @@ async def run_core(
             timeframe=profile.timeframes.signal,
             rules=[r.id for r in profile.signal_rules],
         )
+        ledger = Ledger(bus, sessions)  # shared by the engine and the sync loop
         risk = RiskEngine(
             broker,
             profile=profile,
@@ -186,19 +234,22 @@ async def run_core(
             gate=gate,
             market=feed,
             sessions=sessions,
-            ledger=Ledger(bus, sessions),
+            ledger=ledger,
             trading_day_tz=cfg.trading_day_tz,
         )
         log.info("risk.engine_ready", mode=cfg.mode)
         if control.requested:  # no await from here on: nothing starts after a stop request
             return None
         poller = ControlPoller(gate, cfg.control.kill_file)
+        pm = PositionManager(risk, feed, sessions, bus, poller, profile=profile, config=cfg)
         supervisor = Supervisor(
             [
                 Loop("feed.tick", feed.tick, tick_s, FEED_STALL_S),
                 Loop("control.poll", poller.step, tick_s, CONTROL_STALL_S, "error"),
                 Loop("control.kill_file", poller.file_step, tick_s, CONTROL_STALL_S, "error"),
                 Loop("risk.snapshot", partial(_snapshot_step, risk), snapshot_s, 2 * snapshot_s),
+                Loop("ledger.sync", partial(_sync_step, risk, ledger), sync_s, SYNC_STALL_S),
+                Loop("positions.manage", pm.step, manage_s, MANAGE_STALL_S, "error"),
             ],
             [Freshness("risk.snapshot", lambda: risk.last_snapshot_at, 2 * snapshot_s)],
         )
@@ -250,8 +301,22 @@ async def run_core(
         failure = e
     if failure is not None:  # logged before teardown, which the watchdog may cut short
         log.error("core.failed", cause=control.cause, exc_info=failure)
+    flatten_step: Callable[[], Awaitable[None]] | None = None
+    if cfg.shutdown.flatten:
+        if supervisor is not None:  # the Position Manager runs: its loop works the request
+            flatten_step = partial(_shutdown_flatten, sessions, control)
+        else:
+            log.warning("core.shutdown_flatten_skipped", reason="startup never completed")
     forced = await _teardown(
-        control, source, startup, supervisor, stream_task, bus, engine, stream_died=stream_died
+        control,
+        source,
+        startup,
+        supervisor,
+        stream_task,
+        bus,
+        engine,
+        stream_died=stream_died,
+        flatten_step=flatten_step,
     )
     if failure is not None:
         raise failure
@@ -268,6 +333,7 @@ async def _teardown(
     engine: Any,
     *,
     stream_died: bool = False,
+    flatten_step: Callable[[], Awaitable[None]] | None = None,
 ) -> list[str]:
     """Ordered, bounded teardown (spec section 4). Each step gets what is left of the
     deadline; a step still running then is cancelled once and left behind (forced). A step
@@ -297,6 +363,9 @@ async def _teardown(
     # It checks the request before starting the stream or any loop, so it built neither.
     if startup is not None and not startup.done():
         await bounded("startup", startup)
+    # shutdown.flatten: the supervised loops still run and work the request (spec 4.7).
+    if flatten_step is not None:
+        await bounded("flatten", flatten_step())
     # 1. Admission: nothing to close in 1.5a (WP 1.5d: close admission, runner.close()).
     await bounded("source.stop", source.stop())
     if supervisor is not None:
