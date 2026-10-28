@@ -24,12 +24,15 @@ a timeout never cancels a DB session mid-statement or mid-commit; SQLite errors 
 locked DB after `busy_timeout` (5 s) instead of hanging. A step whose budget is already
 spent is not called: its timeout outcome applies, and a submit that was never attempted
 is `not_submitted`. `asyncio.CancelledError` is never caught.
+
+`cancel_open_entries()` cancels resting entry (buy) orders under the exit lock with its own
+budget, and `sellable_positions()` reads the non-dust broker holdings lock-free with its own.
 """
 
 import asyncio
 import math
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -59,6 +62,7 @@ from autotrader.journal.models import Order
 from autotrader.risk.checks import check_entry, check_exit
 from autotrader.risk.types import (
     FINAL,
+    CancelResult,
     EntryIntent,
     ExitRequest,
     HeldPosition,
@@ -514,6 +518,43 @@ class RiskEngine:
             return await self._submit(
                 row.id, decision, deadline, lambda: self._broker.close_position(request.symbol)
             )
+
+    async def cancel_open_entries(self, exclude: Collection[int] = ()) -> CancelResult:
+        """Cancel unsettled, non-final entry (buy) orders at the broker, under the exit lock
+        with its own budget. `exclude` skips rows whose cancel was already accepted. Rows
+        without a broker id are `unresolved`. Never touches sells or order rows."""
+        async with self._exit_lock:
+            deadline = self._monotonic() + self._io_timeout
+            async with self._sessions() as session:
+                rows = await repo.open_entry_orders(session)
+            requested: list[int] = []
+            failed: list[int] = []
+            unresolved: list[int] = []
+            for row in rows:
+                if row.id in exclude or row.status in FINAL:
+                    continue
+                if row.broker_order_id is None:
+                    unresolved.append(row.id)
+                    continue
+                try:
+                    await self._within(
+                        deadline, partial(self._broker.cancel_order, row.broker_order_id)
+                    )
+                except Exception:
+                    log.exception("risk.cancel_failed", order_id=row.id, symbol=row.symbol)
+                    failed.append(row.id)
+                else:
+                    log.info("risk.entry_cancel_requested", order_id=row.id, symbol=row.symbol)
+                    requested.append(row.id)
+            return CancelResult(
+                requested=tuple(requested), failed=tuple(failed), unresolved=tuple(unresolved)
+            )
+
+    async def sellable_positions(self) -> tuple[HeldPosition, ...]:
+        """Non-dust broker holdings (unpriced) with their own budget; lock-free; raises on
+        failure."""
+        deadline = self._monotonic() + self._io_timeout
+        return tuple(p for p in await self._broker_positions(deadline) if not p.is_dust)
 
     # --- equity snapshots ------------------------------------------------------------
 

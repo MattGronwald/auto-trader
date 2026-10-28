@@ -117,6 +117,15 @@ class SyncResult(_Frozen):
         return not self.failed
 
 
+class CancelResult(_Frozen):
+    """One `cancel_open_entries` pass. `requested`: rows whose cancel the broker accepted;
+    `failed`: rows whose cancel raised; `unresolved`: non-final buys with no broker id."""
+
+    requested: tuple[int, ...] = ()
+    failed: tuple[int, ...] = ()
+    unresolved: tuple[int, ...] = ()
+
+
 class SyncIncomplete(RuntimeError):
     """An unsettled order's broker state could not be read: entries fail closed (PLAN 3.2
     item 4) until it is resolved."""

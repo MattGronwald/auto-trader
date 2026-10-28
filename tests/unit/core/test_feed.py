@@ -1060,3 +1060,22 @@ async def test_zero_volume_bar_is_accepted(
     assert rejections(logs) == []
     assert await bar_count(sessions) == 1
     assert feed.last_price(BTC) == 100
+
+
+async def test_price_age_is_seconds_since_the_newest_valid_quote_or_bar(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    clock = Clock(T0 + M)
+    feed = make_feed(FakeSource(), sessions, bus, clock)
+    assert feed.price_age_s(BTC) is None
+
+    await feed.on_quote(Quote(symbol=BTC, ts=T0 + M, bid=90.0, ask=90.1))
+    assert feed.price_age_s(BTC) == 0.0
+    clock.now = T0 + M + 5 * S
+    assert feed.price_age_s(BTC) == 5.0
+
+    await feed.on_quote(Quote(symbol=BTC, ts=T0 + M + 4 * S, bid=95.0, ask=94.0))  # crossed
+    assert feed.price_age_s(BTC) == 5.0
+
+    await feed.on_bar(bar(2, 100))  # a newer bar end moves the observation forward
+    assert feed.price_age_s(BTC) == (clock.now - (bar(2, 100).ts + M)).total_seconds()
