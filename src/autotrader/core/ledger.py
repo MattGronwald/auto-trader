@@ -141,12 +141,11 @@ class CashGuard:
 
 
 async def _guard(session: AsyncSession) -> CashGuard:
-    last_order = await session.scalar(select(func.max(Order.id)))
-    last_fill = await session.scalar(select(func.max(FillRow.id)))
+    generation = await repo.order_fill_generation(session)
     open_orders = await session.scalar(
         select(func.count()).select_from(Order).where(Order.settled_at.is_(None))
     )
-    return CashGuard((last_order or 0, last_fill or 0), bool(open_orders))
+    return CashGuard(generation, bool(open_orders))
 
 
 class _Deferred(Exception):

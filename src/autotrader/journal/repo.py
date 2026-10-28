@@ -30,10 +30,12 @@ from autotrader.journal.models import (
     Cycle,
     EquitySnapshot,
     Event,
+    Fill,
     Order,
     Position,
     RiskDecision,
     Strategy,
+    SymbolDust,
 )
 
 # SPEC §4.3: a cycle in any other state is still open.
@@ -466,6 +468,71 @@ async def orders_by_id(session: AsyncSession, ids: Collection[int]) -> list[Orde
         .execution_options(populate_existing=True)
     )
     return list(rows)
+
+
+# --- flatten / external sales (WP 1.5c) ----------------------------------------------
+
+
+async def order_fill_generation(session: AsyncSession) -> tuple[int, int]:
+    """`(max(orders.id), max(fills.id))`, 0 for none: any new order or booked fill changes
+    it (the one definition of "generation", spec 4.6 cash guard and 4.7 flat check)."""
+    last_order = await session.scalar(select(func.max(Order.id)))
+    last_fill = await session.scalar(select(func.max(Fill.id)))
+    return (last_order or 0, last_fill or 0)
+
+
+async def symbol_dust_balances(session: AsyncSession) -> dict[str, Decimal]:
+    """The written-off dust per symbol, balances > 0 only (compared in Python: money
+    columns are text on SQLite)."""
+    rows = await session.scalars(select(SymbolDust).order_by(SymbolDust.symbol))
+    return {row.symbol: row.qty for row in rows if row.qty > 0}
+
+
+async def external_sales_since(session: AsyncSession, since: datetime) -> list[dict[str, Any]]:
+    """Settled `external` orders with `settled_at >= since`, in id order, each with the
+    figures of its `ExternalHoldingSold` event (a zero-fill external order has none and is
+    left out). Decimal values are strings, as in the event payload."""
+    orders = list(
+        await session.scalars(
+            select(Order.id)
+            .where(Order.external.is_(True), Order.settled_at.is_not(None))
+            .where(Order.settled_at >= since)
+            .order_by(Order.id)
+        )
+    )
+    if not orders:
+        return []
+    payloads = {
+        p["order_row_id"]: p
+        for p in await session.scalars(
+            select(Event.payload).where(Event.type == "ExternalHoldingSold").order_by(Event.id)
+        )
+    }
+    return [
+        {
+            "order_row_id": order_id,
+            "symbol": payloads[order_id]["symbol"],
+            "external_qty": str(payloads[order_id]["external_qty"]),
+            "dust_consumed": str(payloads[order_id]["dust_consumed"]),
+            "proceeds_usd": str(payloads[order_id]["proceeds_usd"]),
+        }
+        for order_id in orders
+        if order_id in payloads
+    ]
+
+
+async def last_anomaly_kinds(session: AsyncSession, order_ids: Collection[int]) -> dict[int, str]:
+    """The latest `LedgerAnomaly.kind` per named order row (rows without one are absent)."""
+    wanted = set(order_ids)
+    if not wanted:
+        return {}
+    kinds: dict[int, str] = {}
+    for payload in await session.scalars(
+        select(Event.payload).where(Event.type == "LedgerAnomaly").order_by(Event.id)
+    ):
+        if payload.get("order_row_id") in wanted:
+            kinds[payload["order_row_id"]] = payload["kind"]
+    return kinds
 
 
 async def count_entry_orders(session: AsyncSession, since: datetime, *, inclusive: bool) -> int:

@@ -604,3 +604,104 @@ async def test_latch_exit_does_not_commit(session: AsyncSession) -> None:
     await session.rollback()
     (pos,) = await repo.open_positions(session)
     assert pos.exit_trigger is None
+
+
+# --- flatten / external sales (WP 1.5c) ----------------------------------------------
+
+
+async def test_order_fill_generation_is_the_max_ids(session: AsyncSession) -> None:
+    assert await repo.order_fill_generation(session) == (0, 0)
+    first = await _order(session, status="filled")
+    second = await _order(session, status="new")
+    session.add(
+        m.Fill(
+            order_id=first.id,
+            broker_fill_id="f1",
+            side="buy",
+            fee_asset="quote",
+            qty=Decimal(1),
+            price=Decimal(100),
+            fee=Decimal(0),
+            ts=T0,
+        )
+    )
+    await session.commit()
+    (fill_id,) = await session.scalars(select(m.Fill.id))
+    assert await repo.order_fill_generation(session) == (second.id, fill_id)
+
+
+async def test_symbol_dust_balances_drop_zero_rows(session: AsyncSession) -> None:
+    session.add_all(
+        [
+            m.SymbolDust(symbol="BTC/USD", qty=Decimal("0.00005"), updated_at=T0),
+            m.SymbolDust(symbol="ETH/USD", qty=Decimal(0), updated_at=T0),
+        ]
+    )
+    await session.commit()
+    assert await repo.symbol_dust_balances(session) == {"BTC/USD": Decimal("0.00005")}
+
+
+async def _external_sale(session: AsyncSession, *, settled_at: datetime | None) -> int:
+    row = await repo.insert_order(
+        session,
+        cycle_id=None,
+        client_order_id=None,
+        symbol="ETH/USD",
+        mode="paper",
+        type_="market",
+        side="sell",
+        qty=Decimal(1),
+        limit_price=None,
+        stop_price=None,
+        tp_price=None,
+        status="filled",
+        now=T0,
+        exit_reason="flatten",
+        external=True,
+    )
+    await session.execute(update(m.Order).where(m.Order.id == row.id).values(settled_at=settled_at))
+    await repo.append_event(
+        session,
+        "ExternalHoldingSold",
+        {
+            "order_row_id": row.id,
+            "symbol": "ETH/USD",
+            "qty": "1",
+            "dust_consumed": "0.1",
+            "external_qty": "0.9",
+            "proceeds_usd": "100",
+            "fees_usd": "0.25",
+        },
+        ts=T0,
+    )
+    return row.id
+
+
+async def test_external_sales_since_filter_by_settled_at_and_external(
+    session: AsyncSession,
+) -> None:
+    assert await repo.external_sales_since(session, T0) == []
+    await _external_sale(session, settled_at=T0 - timedelta(seconds=1))  # before the request
+    await _external_sale(session, settled_at=None)  # unsettled
+    kept = await _external_sale(session, settled_at=T0)
+    normal = await _order(session, status="filled", side="sell")
+    await session.execute(update(m.Order).where(m.Order.id == normal.id).values(settled_at=T0))
+    await session.commit()
+    assert await repo.external_sales_since(session, T0) == [
+        {
+            "order_row_id": kept,
+            "symbol": "ETH/USD",
+            "external_qty": "0.9",
+            "dust_consumed": "0.1",
+            "proceeds_usd": "100",
+        }
+    ]
+
+
+async def test_last_anomaly_kinds_keep_the_latest_per_row(session: AsyncSession) -> None:
+    for order_row_id, kind in ((1, "oversell"), (2, "fill_mismatch"), (1, "sell_without_position")):
+        await repo.append_event(
+            session, "LedgerAnomaly", {"order_row_id": order_row_id, "kind": kind, "detail": ""}
+        )
+    assert await repo.last_anomaly_kinds(session, [1, 3]) == {1: "sell_without_position"}
+    assert await repo.last_anomaly_kinds(session, []) == {}
