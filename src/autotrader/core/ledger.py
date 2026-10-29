@@ -299,7 +299,8 @@ class Ledger:
 
     async def apply(self, update: OrderUpdate) -> Outcome:
         """Book one order's update in one transaction. Never raises for a deferral or an
-        anomaly; journal errors propagate (the caller fails closed)."""
+        anomaly; journal errors propagate to the caller (`apply_all` catches them per row
+        and holds back that row's symbol)."""
         unit = _Unit()
 
         async def build(session: AsyncSession) -> tuple[DomainEvent, ...] | None:
@@ -598,7 +599,7 @@ class Ledger:
             )
         )
         if any(o.settled_at is None for o in linked):
-            return None  # a late fill can still arrive: stay open (1.5c protects it)
+            return None  # a late fill can still arrive: stay open (the Position Manager exits it)
         rows = list(
             await session.scalars(
                 select(FillRow).where(FillRow.order_id.in_([o.id for o in linked]))

@@ -1,4 +1,4 @@
-"""`autotrader run core` (SPEC §12 Phase 0 DoD; WP 1.5a runtime safety).
+"""`autotrader run core` (SPEC §12 Phase 0 DoD; WP 1.5a runtime safety; WP 1.5c exits).
 
 Connects the broker, backfills and streams bars for the universe, persists 1m bars, runs the
 Signal Scanner on closed bars (WP 1.2) and snapshots equity for the daily-loss/drawdown
