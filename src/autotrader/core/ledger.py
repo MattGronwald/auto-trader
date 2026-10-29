@@ -637,37 +637,46 @@ class Ledger:
         """Pause entries for an operator in a unit of its own: the update rolled back.
 
         The row stays unsettled, so the sync loop books it again every pass. A repeat (the
-        row's latest `LedgerAnomaly` has the same kind and detail) writes no new event and
-        logs at debug level, but still re-asserts the pause: an operator who resumed while
-        the anomaly persists is paused again (`ledger.anomaly_repaused`, warning)."""
-        async with self._sessions() as session:
+        row's latest `LedgerAnomaly` has the same kind and detail) while entries are still
+        paused writes nothing and logs `ledger.anomaly_persists` at debug level. A repeat
+        after an operator resumed re-pauses: it writes a new `LedgerAnomaly` (same kind,
+        detail and row) with the pause in one unit and logs `ledger.anomaly_repaused`
+        (warning). The repeat check runs inside the bus unit, under the bus lock, so two
+        passes cannot both write a re-pause for one resume."""
+        outcome: list[Literal["new", "repaused", "persists"]] = []
+
+        async def build(session: AsyncSession) -> DomainEvent | None:
             last = (await repo.last_anomalies(session, [order_row_id])).get(order_row_id)
-            if last is not None and (last["kind"], last["detail"]) == (error.kind, error.detail):
-                if await repo.get_control(session, PAUSED_KEY) is True:
-                    log.debug("ledger.anomaly_persists", kind=error.kind, order_row=order_row_id)
-                    return
-                await repo.set_control(session, PAUSED_KEY, True)
-                log.warning(
-                    "ledger.anomaly_repaused",
-                    kind=error.kind,
-                    order_row=order_row_id,
-                    detail=error.detail,
-                )
-                return
-        log.error("ledger.anomaly", kind=error.kind, order_row=order_row_id, detail=error.detail)
-        event = LedgerAnomaly(
-            ts=self._clock(),
-            cycle_id=cycle_id,
-            kind=error.kind,
-            order_row_id=order_row_id,
-            detail=error.detail,
-        )
-
-        async def build(session: AsyncSession) -> DomainEvent:
+            repeat = last is not None and (last["kind"], last["detail"]) == (
+                error.kind,
+                error.detail,
+            )
+            if repeat and await repo.get_control(session, PAUSED_KEY) is True:
+                outcome.append("persists")
+                return None
+            outcome.append("repaused" if repeat else "new")
             await session.merge(ControlState(key=PAUSED_KEY, value=True))
-            return event
+            return LedgerAnomaly(
+                ts=self._clock(),
+                cycle_id=cycle_id,
+                kind=error.kind,
+                order_row_id=order_row_id,
+                detail=error.detail,
+            )
 
-        await self._bus.publish_tx(build, verify_unit)
+        fields = {"kind": error.kind, "order_row": order_row_id, "detail": error.detail}
+        try:
+            await self._bus.publish_tx(build, verify_unit)
+        finally:
+            # Logged even when the commit raises (CommitUncertain or a journal error; it
+            # propagates as before): the anomaly was seen either way. Nothing is logged if
+            # `build` raised before deciding.
+            if outcome == ["persists"]:
+                log.debug("ledger.anomaly_persists", kind=error.kind, order_row=order_row_id)
+            elif outcome == ["repaused"]:
+                log.warning("ledger.anomaly_repaused", **fields)
+            elif outcome == ["new"]:
+                log.error("ledger.anomaly", **fields)
 
     # --- cash (D17) ----------------------------------------------------------------------
 

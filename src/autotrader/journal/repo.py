@@ -526,7 +526,8 @@ async def last_anomalies(
 ) -> dict[int, dict[str, Any]]:
     """The latest `LedgerAnomaly` payload per named order row (rows without one are absent).
     Bounded in SQL by type and the payload's `order_row_id`, so it reads only the named
-    rows' anomalies, which the ledger writes once per distinct kind and detail."""
+    rows' anomalies, which the ledger writes once per distinct kind and detail, plus once
+    per re-pause after an operator resumed while one persists."""
     wanted = set(order_ids)
     if not wanted:
         return {}

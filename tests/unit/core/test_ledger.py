@@ -994,8 +994,9 @@ async def test_a_sell_without_any_position_is_an_anomaly(
 async def test_a_persisting_anomaly_writes_one_event_and_keeps_re_pausing(
     sessions: async_sessionmaker[AsyncSession], ledger: Ledger
 ) -> None:
-    """The sync loop re-books the unsettled row every pass: the same anomaly writes no new
-    event, but a resumed operator is paused again while it persists (fail-closed)."""
+    """The sync loop re-books the unsettled row every pass: while entries stay paused the
+    same anomaly writes no new event; a resumed operator is paused again while it persists
+    (fail-closed), and that re-pause writes one `LedgerAnomaly` row of its own."""
     row = await _sell_row(sessions)
     lone = OrderUpdate(
         order_row_id=row,
@@ -1004,18 +1005,38 @@ async def test_a_persisting_anomaly_writes_one_event_and_keeps_re_pausing(
         fills=(_sell_fill("x:1"),),
         min_qty=RULES.min_qty,
     )
-    assert await ledger.apply(lone) == "anomaly"
-    async with sessions() as s:
-        await repo.set_control(s, PAUSED_KEY, None)  # the operator resumes
+
+    def anomalies(rows: list[m.Event]) -> list[tuple[Any, Any, Any]]:
+        return [
+            (e.payload["kind"], e.payload["detail"], e.payload["order_row_id"])
+            for e in rows
+            if e.type == "LedgerAnomaly"
+        ]
 
     with capture_logs() as logs:
         assert await ledger.apply(lone) == "anomaly"
-        assert await ledger.apply(lone) == "anomaly"
+        assert await ledger.apply(lone) == "anomaly"  # still paused: silent
+    first = anomalies(await event_rows(sessions))
+    assert first == [("sell_without_position", f"sell fill x:1: no open {BTC}", row)]
+    # The repeat logs only at debug level, which another test's logging setup may filter.
+    assert [e["event"] for e in logs if e["log_level"] in ("error", "warning")] == [
+        "ledger.anomaly"
+    ]
 
-    assert (await event_types(sessions)).count("LedgerAnomaly") == 1
+    async with sessions() as s:
+        await repo.set_control(s, PAUSED_KEY, False)  # the operator resumes
+
+    with capture_logs() as logs:
+        assert await ledger.apply(lone) == "anomaly"
     assert await paused(sessions)
+    assert anomalies(await event_rows(sessions)) == first * 2
     assert [e["event"] for e in logs if e["log_level"] == "error"] == []
     assert [e["event"] for e in logs if e["log_level"] == "warning"] == ["ledger.anomaly_repaused"]
+
+    with capture_logs() as logs:
+        assert await ledger.apply(lone) == "anomaly"  # paused again: silent again
+    assert anomalies(await event_rows(sessions)) == first * 2
+    assert [e["event"] for e in logs if e["log_level"] in ("error", "warning")] == []
 
 
 async def test_a_changed_anomaly_on_the_same_row_writes_a_new_event(

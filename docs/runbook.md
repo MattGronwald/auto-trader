@@ -30,8 +30,9 @@ The examples assume the default `config.yaml` (journal `data/autotrader.db`, SQL
 
 These set the manual pause (`control_state.paused = true`):
 - flatten (`autotrader flatten`, `shutdown.flatten`);
-- a ledger anomaly (`ledger.anomaly`), re-asserted on every sync pass while it persists
-  (`ledger.anomaly_repaused`), so fix the journal first;
+- a ledger anomaly (`ledger.anomaly`), re-asserted on the next sync pass after a resume while it
+  persists (another `LedgerAnomaly` event, `ledger.anomaly_repaused` warning), so fix the journal
+  first;
 - an unexplained cash change (`CashDiscrepancy`);
 - the Risk Engine on the max-drawdown check (`risk.paused_manual_resume`).
 
@@ -206,8 +207,9 @@ SELECT ts, payload FROM events WHERE type = 'ExternalHoldingSold' ORDER BY id;
 A normal exit closes the whole broker-reported position, so it also sells manual coins in that
 symbol. The ledger then sees a sell beyond the position's open qty: the `oversell` anomaly rolls
 the booking back, sets the manual pause (one `LedgerAnomaly` event, `ledger.anomaly` error log) and
-re-asserts the pause on every sync pass. Resuming alone does not recover: the next pass pauses again
-(`ledger.anomaly_repaused`), and the row keeps blocking flat.
+re-checks the row on every sync pass; while the pause stays set, the repeats write nothing. Resuming
+alone does not recover: the next pass pauses again and writes another `LedgerAnomaly` event with the
+same kind and detail (`ledger.anomaly_repaused` warning), and the row keeps blocking flat.
 
 WP 1.5c ships no repair for this. The journal-repair tooling is WP 1.5d's (PLAN 1.5 row, 1.5b
 follow-up b). Until then, leave the pause set, keep the core's other symbols running, and record
