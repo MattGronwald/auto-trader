@@ -828,7 +828,7 @@ async def test_shutdown_flatten_times_out_and_teardown_continues(
     async def connect(_: Settings) -> Any:
         return HoldingBroker()  # can't place orders: the holding is never sold
 
-    control, _ = make_control(timeout_s=0.5)
+    control, _ = make_control(timeout_s=2.0)  # flatten waits ~1 s, teardown keeps ~1 s
     task = start_core(
         _with_shutdown_flatten(cfg),
         lock,
@@ -847,7 +847,9 @@ async def test_shutdown_flatten_times_out_and_teardown_continues(
     incomplete = next(
         ln for ln in _log_lines(buf) if ln["event"] == "core.shutdown_flatten_incomplete"
     )
-    assert incomplete["level"] == "error" and "remaining" in incomplete
+    assert incomplete["level"] == "error"
+    # The Position Manager's first non-flat refresh runs at once (clarification 14).
+    assert incomplete["remaining"]["holdings"] == [{"symbol": "BTC/USD", "qty": "0.5"}]
 
 
 async def test_shutdown_flatten_keeps_a_pending_cli_request(
