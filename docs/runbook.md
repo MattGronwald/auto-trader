@@ -141,37 +141,46 @@ operator decides.
      ```sql
      UPDATE orders SET broker_order_id = '<broker id>' WHERE id = <row>;
      ```
-   - **Not at the broker** (it never arrived): mark it unsent. This mark is final: the sync loop
-     settles the row at once with zero fill (`settled_at` set), and settled rows are never read
-     again, even if a broker id is added later. It cannot be undone without the 1.5d journal-repair
-     tooling. Most of these rows are `unknown`, which the engine records after a timeout or a
-     network error, exactly the case where the order may have reached the broker and is not
-     visible yet. Use this branch only when **all** of these hold:
-     - at least 15 minutes have passed since `submitted_at`, so a delayed acceptance has had
-       time to show;
-     - the order is absent from the broker's full order history, open and closed (entries looked
-       up by `client_order_id`; exits by symbol, side, qty and time);
-     - there are no fills or activities for the symbol from `submitted_at` on that could belong to
-       it;
-     - the broker position qty for the symbol still matches the journal (the open journal
-       position's qty, plus any `symbol_dust`): it has not changed by the row's qty.
+   - **Not found at the broker:** leave the row unresolved (`pending` / `unknown`, no
+     `broker_order_id`) and escalate it as an operator incident. Absence is not proof: most of
+     these rows are `unknown`, which the engine records after a timeout or a network error,
+     exactly the case where the order may have reached the broker and is not visible yet. Waiting
+     alone does not change that. Wait at least 15 minutes after `submitted_at` before concluding
+     anything (an investigation delay, nothing more), then record what you checked, each with
+     the time you checked it: the broker's full order history, open and closed (entries by
+     `client_order_id`, exits by symbol, side, qty and time); fills and activities for the symbol
+     from `submitted_at` on; the broker position qty against the journal (the open journal
+     position's qty plus any `symbol_dust`). If the broker position changed by the row's qty,
+     the order executed: find its broker id and use the **Found** branch.
 
-     If the broker position changed by the row's qty, the order did execute: use the **Found**
-     branch with its broker id instead, never this one. If you are unsure, leave the row
-     unresolved. That blocks flat, retries for that position and later bookings on that symbol, but
-     it books nothing wrong.
-
-     A wrong mark books permanently wrong. An exit that actually filled leaves the journal
-     position open against a flat broker: retries fail with no position, `positions.exit_failing`
-     repeats and flat never completes. An entry that actually filled makes its coins look like
-     an external holding, and the next flatten sells them with no P&L.
+     The row may be marked `not_submitted` only with what PLAN.md section 3.2 item 4 requires:
+     the original worker is quiescent (the core is stopped, step 1) **and** authoritative broker
+     evidence rules out that the order was or will ever be accepted or become visible, such as a
+     broker-confirmed final rejection or non-acceptance status for that request. A grace window
+     plus a zero-match lookup does not qualify, and neither does an HTTP timeout. A
+     broker-confirmed final status normally comes with a broker order id, which is the
+     **Found** branch, not this one. The mark is final and irreversible: the sync loop settles
+     the row at once with zero fill (`settled_at` set) and never reads it again, even if a broker
+     id is added later; undoing it needs the 1.5d journal-repair tooling. A wrong mark books
+     permanently wrong (an exit that filled leaves the journal position open against a flat
+     broker, so `positions.exit_failing` repeats and flat never completes; an entry that filled
+     makes its coins look like an external holding that the next flatten sells with no P&L).
+     Only with that authoritative evidence in hand:
      ```sql
+     -- ONLY with authoritative broker evidence of non-acceptance (PLAN.md 3.2 item 4)
      UPDATE orders SET status = 'not_submitted' WHERE id = <row>;
      ```
-5. Start the core again and confirm the row settles (`settled_at` set) and the alert stops.
 
-With `AlpacaBroker` before WP 1.6 such rows do not arise from the core (nothing is sent), and the
-sync loop cannot read Alpaca orders yet either.
+     The cost of leaving the row unresolved, stated plainly: until the 1.5d resolver exists it
+     blocks flat, retries for that position and later bookings on that symbol. It books nothing
+     wrong, and reservations stay in place.
+5. Start the core again. After a **Found** update (or the fenced mark), confirm the row settles
+   (`settled_at` set) and the alert stops. A row left unresolved keeps alerting every 60 s until
+   the incident is resolved; that is expected.
+
+With `AlpacaBroker` in 1.5c this cannot arise in production: every order call raises
+`OrderMethodsUnavailable`, which the engine records as `not_submitted`, never `unknown` (nothing
+is sent). The sync loop cannot read Alpaca orders yet either.
 
 ## Accounting for an external sale
 
