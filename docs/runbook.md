@@ -119,8 +119,30 @@ operator decides.
      ```sql
      UPDATE orders SET broker_order_id = '<broker id>' WHERE id = <row>;
      ```
-   - **Not at the broker** (it never arrived): mark it unsent; the sync loop settles it with no
-     fill and the Position Manager retries a latched exit.
+   - **Not at the broker** (it never arrived): mark it unsent. This mark is final: the sync loop
+     settles the row at once with zero fill (`settled_at` set), and settled rows are never read
+     again, even if a broker id is added later. It cannot be undone without the 1.5d journal-repair
+     tooling. Most of these rows are `unknown`, which the engine records after a timeout or a
+     network error, exactly the case where the order may have reached the broker and is not
+     visible yet. Use this branch only when **all** of these hold:
+     - at least 15 minutes have passed since `submitted_at`, so a delayed acceptance has had
+       time to show;
+     - the order is absent from the broker's full order history, open and closed (entries looked
+       up by `client_order_id`; exits by symbol, side, qty and time);
+     - there are no fills or activities for the symbol from `submitted_at` on that could belong to
+       it;
+     - the broker position qty for the symbol still matches the journal (the open journal
+       position's qty, plus any `symbol_dust`): it has not changed by the row's qty.
+
+     If the broker position changed by the row's qty, the order did execute: use the **Found**
+     branch with its broker id instead, never this one. If you are unsure, leave the row
+     unresolved. That blocks flat, retries for that position and later bookings on that symbol, but
+     it books nothing wrong.
+
+     A wrong mark books permanently wrong. An exit that actually filled leaves the journal
+     position open against a flat broker: retries fail with no position, `positions.exit_failing`
+     repeats and flat never completes. An entry that actually filled makes its coins look like
+     an external holding, and the next flatten sells them with no P&L.
      ```sql
      UPDATE orders SET status = 'not_submitted' WHERE id = <row>;
      ```
