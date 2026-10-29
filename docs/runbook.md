@@ -20,6 +20,9 @@ The examples assume the default `config.yaml` (journal `data/autotrader.db`, SQL
 - Recovering from an `oversell` anomaly needs journal-repair tooling that WP 1.5d owns (see below).
 - An external sale that failed is retried only after the order-sync loop has settled the failed
   row, so external retries run every max(backoff, about 2 s).
+- An entry on a symbol whose external sale is partly filled and still unsettled would merge that
+  sale into the new trade's P&L, with no `ExternalHoldingSold`. It cannot happen in 1.5c (no
+  entries are placed); WP 1.5d must block or defer such an entry before the Cycle Runner is wired.
 - The flatten-state guards rely on SQLite's write lock. Postgres needs `SELECT ... FOR UPDATE`
   (WP 3.5 ownership work).
 
