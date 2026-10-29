@@ -173,8 +173,9 @@ SELECT ts, payload FROM events WHERE type = 'ExternalHoldingSold' ORDER BY id;
 
 A normal exit closes the whole broker-reported position, so it also sells manual coins in that
 symbol. The ledger then sees a sell beyond the position's open qty: the `oversell` anomaly rolls
-the booking back, sets the manual pause and re-fires on every sync pass. Resuming alone does not
-recover, and the row keeps blocking flat.
+the booking back, sets the manual pause (one `LedgerAnomaly` event, `ledger.anomaly` error log) and
+re-asserts the pause on every sync pass. Resuming alone does not recover: the next pass pauses again
+(`ledger.anomaly_repaused`), and the row keeps blocking flat.
 
 WP 1.5c ships no repair for this. The journal-repair tooling is WP 1.5d's (PLAN 1.5 row, 1.5b
 follow-up b). Until then, leave the pause set, keep the core's other symbols running, and record

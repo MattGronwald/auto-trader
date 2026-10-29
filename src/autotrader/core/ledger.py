@@ -634,7 +634,26 @@ class Ledger:
         )
 
     async def _anomaly(self, order_row_id: int, cycle_id: int | None, error: _Anomaly) -> None:
-        """Pause entries for an operator in a unit of its own: the update rolled back."""
+        """Pause entries for an operator in a unit of its own: the update rolled back.
+
+        The row stays unsettled, so the sync loop books it again every pass. A repeat (the
+        row's latest `LedgerAnomaly` has the same kind and detail) writes no new event and
+        logs at debug level, but still re-asserts the pause: an operator who resumed while
+        the anomaly persists is paused again (`ledger.anomaly_repaused`, warning)."""
+        async with self._sessions() as session:
+            last = (await repo.last_anomalies(session, [order_row_id])).get(order_row_id)
+            if last is not None and (last["kind"], last["detail"]) == (error.kind, error.detail):
+                if await repo.get_control(session, PAUSED_KEY) is True:
+                    log.debug("ledger.anomaly_persists", kind=error.kind, order_row=order_row_id)
+                    return
+                await repo.set_control(session, PAUSED_KEY, True)
+                log.warning(
+                    "ledger.anomaly_repaused",
+                    kind=error.kind,
+                    order_row=order_row_id,
+                    detail=error.detail,
+                )
+                return
         log.error("ledger.anomaly", kind=error.kind, order_row=order_row_id, detail=error.detail)
         event = LedgerAnomaly(
             ts=self._clock(),

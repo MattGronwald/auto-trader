@@ -521,18 +521,31 @@ async def external_sales_since(session: AsyncSession, since: datetime) -> list[d
     ]
 
 
-async def last_anomaly_kinds(session: AsyncSession, order_ids: Collection[int]) -> dict[int, str]:
-    """The latest `LedgerAnomaly.kind` per named order row (rows without one are absent)."""
+async def last_anomalies(
+    session: AsyncSession, order_ids: Collection[int]
+) -> dict[int, dict[str, Any]]:
+    """The latest `LedgerAnomaly` payload per named order row (rows without one are absent).
+    Bounded in SQL by type and the payload's `order_row_id`, so it reads only the named
+    rows' anomalies, which the ledger writes once per distinct kind and detail."""
     wanted = set(order_ids)
     if not wanted:
         return {}
-    kinds: dict[int, str] = {}
+    latest: dict[int, dict[str, Any]] = {}
     for payload in await session.scalars(
-        select(Event.payload).where(Event.type == "LedgerAnomaly").order_by(Event.id)
+        select(Event.payload)
+        .where(
+            Event.type == "LedgerAnomaly",
+            Event.payload["order_row_id"].as_integer().in_(wanted),
+        )
+        .order_by(Event.id)
     ):
-        if payload.get("order_row_id") in wanted:
-            kinds[payload["order_row_id"]] = payload["kind"]
-    return kinds
+        latest[payload["order_row_id"]] = payload
+    return latest
+
+
+async def last_anomaly_kinds(session: AsyncSession, order_ids: Collection[int]) -> dict[int, str]:
+    """The latest `LedgerAnomaly.kind` per named order row (rows without one are absent)."""
+    return {row: p["kind"] for row, p in (await last_anomalies(session, order_ids)).items()}
 
 
 async def count_entry_orders(session: AsyncSession, since: datetime, *, inclusive: bool) -> int:

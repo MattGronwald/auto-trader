@@ -15,6 +15,7 @@ from hypothesis import strategies as st
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from structlog.testing import capture_logs
 
 from autotrader.broker.base import (
     Account,
@@ -988,6 +989,51 @@ async def test_a_sell_without_any_position_is_an_anomaly(
     )
     assert await ledger.apply(lone) == "anomaly"
     assert anomaly_kind(await event_rows(sessions)) == "sell_without_position"
+
+
+async def test_a_persisting_anomaly_writes_one_event_and_keeps_re_pausing(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    """The sync loop re-books the unsettled row every pass: the same anomaly writes no new
+    event, but a resumed operator is paused again while it persists (fail-closed)."""
+    row = await _sell_row(sessions)
+    lone = OrderUpdate(
+        order_row_id=row,
+        status="filled",
+        filled_qty=D("1"),
+        fills=(_sell_fill("x:1"),),
+        min_qty=RULES.min_qty,
+    )
+    assert await ledger.apply(lone) == "anomaly"
+    async with sessions() as s:
+        await repo.set_control(s, PAUSED_KEY, None)  # the operator resumes
+
+    with capture_logs() as logs:
+        assert await ledger.apply(lone) == "anomaly"
+        assert await ledger.apply(lone) == "anomaly"
+
+    assert (await event_types(sessions)).count("LedgerAnomaly") == 1
+    assert await paused(sessions)
+    assert [e["event"] for e in logs if e["log_level"] == "error"] == []
+    assert [e["event"] for e in logs if e["log_level"] == "warning"] == ["ledger.anomaly_repaused"]
+
+
+async def test_a_changed_anomaly_on_the_same_row_writes_a_new_event(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    row = await _sell_row(sessions)
+    lone = OrderUpdate(
+        order_row_id=row,
+        status="filled",
+        filled_qty=D("1"),
+        fills=(_sell_fill("x:1"),),
+        min_qty=RULES.min_qty,
+    )
+    assert await ledger.apply(lone) == "anomaly"
+    other = lone.model_copy(update={"fills": (_sell_fill("x:2"),)})
+    assert await ledger.apply(other) == "anomaly"
+    details = [e.payload["detail"] for e in await event_rows(sessions) if e.type == "LedgerAnomaly"]
+    assert details == [f"sell fill x:1: no open {BTC}", f"sell fill x:2: no open {BTC}"]
 
 
 async def test_a_sell_without_a_position_waits_for_an_earlier_unsettled_order(

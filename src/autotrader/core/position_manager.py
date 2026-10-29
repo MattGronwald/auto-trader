@@ -327,12 +327,13 @@ class PositionManager:
         async with self._sessions() as session:
             positions = await repo.open_positions(session)
             unsettled = await repo.unsettled_orders(session)
-            anomalies = await repo.last_anomaly_kinds(session, [o.id for o in unsettled])
         if holdings == () and not positions and not unsettled:
             await self._complete(request, g1, now)
             return
         if not self._due_pending(request, now):
             return
+        async with self._sessions() as session:
+            anomalies = await repo.last_anomaly_kinds(session, [o.id for o in unsettled])
         remaining: dict[str, Any] = {
             "positions": [
                 {"position_id": p.id, "symbol": p.symbol, "qty": str(p.qty)} for p in positions
