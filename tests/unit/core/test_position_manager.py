@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, MutableMapping
 from datetime import timedelta
 from decimal import Decimal as D
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from sqlalchemy import func, select, update
@@ -36,6 +36,7 @@ from tests.pm_harness import (
     PROFILE,
     RULES,
     T0,
+    Clock,
     Harness,
     app_config,
     event_payloads,
@@ -107,6 +108,14 @@ class BtcExitRaises(RiskEngine):
     async def exit(self, request: ExitRequest) -> OrderResult:
         if request.symbol == BTC:
             raise RuntimeError("journal down")
+        return await super().exit(request)
+
+
+class SlowExit(RiskEngine):
+    """Every exit call takes 2 s on the injected clock."""
+
+    async def exit(self, request: ExitRequest) -> OrderResult:
+        cast(Clock, self._clock).advance(2)
         return await super().exit(request)
 
 
@@ -221,6 +230,43 @@ async def test_an_old_quote_on_a_fresh_symbol_triggers_nothing(
     h.quote(BTC, 95.0, age_s=60)
     await h.pm.step()
     assert (await h.position(pid)).exit_trigger == "stop"
+
+
+async def test_quote_freshness_is_judged_at_the_decision_time_not_the_step_start(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    """D18: a quote older than stale_alert_s never triggers, even if it was fresh when the
+    step started and earlier awaited work (here BTC's exit) aged it."""
+    h = Harness(sessions, bus, engine_cls=SlowExit)
+    btc = await h.open_position(BTC)
+    eth = await h.open_position(ETH)
+    h.quote(BTC, 95.0, age_s=59)  # stale_alert_s is 60
+    h.quote(ETH, 95.0, age_s=59)
+    with capture_logs() as logs:
+        await h.pm.step()  # BTC's exit takes 2 s: ETH's quote is 61 s old when judged
+    pos = await h.position(btc)
+    assert (pos.exit_trigger, pos.exit_triggered_at) == ("stop", T0)
+    assert (await h.position(eth)).exit_trigger is None
+    assert [line["symbol"] for line in named(logs, "positions.exit_triggered")] == [BTC]
+    assert await h.sells(ETH) == []
+
+
+async def test_a_time_exit_fires_at_the_decision_time(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    """Without a trusted price the time exit still applies, judged and stamped at the
+    decision time: ETH's limit passes while BTC's exit runs."""
+    h = Harness(sessions, bus, engine_cls=SlowExit)
+    await h.open_position(BTC)
+    eth = await h.open_position(ETH)
+    async with sessions() as s:
+        await repo.set_time_limit(s, eth, T0 + timedelta(seconds=1))
+    h.quote(BTC, 95.0)
+    await h.pm.step()
+    pos = await h.position(eth)
+    assert (pos.exit_trigger, pos.exit_triggered_at) == ("time", T0 + timedelta(seconds=2))
+    (_, triggered) = await event_payloads(sessions, "ExitTriggered")
+    assert (triggered["symbol"], triggered["bid"]) == (ETH, None)
 
 
 # --- the exit path ---------------------------------------------------------------------

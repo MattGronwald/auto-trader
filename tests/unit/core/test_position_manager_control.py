@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import timedelta
 from decimal import Decimal as D
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from sqlalchemy import select, update
@@ -38,6 +38,7 @@ from tests.pm_harness import (
     QUOTE_FEES,
     RULES,
     T0,
+    Clock,
     Harness,
     View,
     app_config,
@@ -174,6 +175,14 @@ class HoldingsDown(RiskEngine):
         raise RuntimeError("broker down")
 
 
+class SlowCancel(RiskEngine):
+    """Cancelling open entries takes 2 s on the injected clock."""
+
+    async def cancel_open_entries(self, exclude: Any = ()) -> CancelResult:
+        cast(Clock, self._clock).advance(2)
+        return await super().cancel_open_entries(exclude)
+
+
 class CancelDown(RiskEngine):
     async def cancel_open_entries(self, exclude: Any = ()) -> CancelResult:
         raise RuntimeError("broker down")
@@ -291,6 +300,24 @@ async def test_kill_flatten_exits_every_position_with_reason_kill(
     for pid in (btc, eth):
         pos = await h.position(pid)
         assert (pos.closed_at is not None, pos.exit_reason) == (True, "kill")
+
+
+async def test_a_kill_latch_judges_the_quote_and_stamps_at_the_decision_time(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    """The cancel pass ages BTC's 59 s quote past stale_alert_s (60) before the latch: the
+    event carries no bid and the latch and event carry the decision time."""
+    h = Harness(sessions, bus, config=app_config(kill_flatten=True), engine_cls=SlowCancel)
+    btc = await h.open_position(BTC)
+    h.quote(BTC, 100.0, age_s=59)
+    h.controls.latest = KILLED
+    await h.pm.step()
+    decided = T0 + timedelta(seconds=2)
+    pos = await h.position(btc)
+    assert (pos.exit_trigger, pos.exit_triggered_at) == ("kill", decided)
+    async with sessions() as s:
+        (event,) = await s.scalars(select(m.Event).where(m.Event.type == "ExitTriggered"))
+    assert (event.payload["bid"], event.ts) == (None, decided)
 
 
 async def test_kill_flatten_exits_a_late_entry_fill(

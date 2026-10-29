@@ -17,6 +17,12 @@ whose outcome is still to be judged (clarification 5: each settled row counts on
 an accepted order never resets the backoff, a settled fill does), the dust hold-back and
 the alert throttles. A restart therefore re-attempts a due exit at once (D7).
 
+Clocks. Throttles, backoff, alerts and the flat check use the step-start reading. Every exit
+decision takes its own fresh reading at the decision point and uses it for quote trust, the
+price age, the exit rules (incl. the time exit) and the latch timestamp and event: awaited
+work earlier in the step (the control phase, journal writes, another position's exit) must
+not let a quote older than `stale_alert_s` count as trusted (D18).
+
 Control phase (start of each step; spec 4.4 kill handling, 4.4.1, 4.7 steps 1-3). While
 killed or a flatten request is pending, and the broker can trade, open entries are cancelled
 through `risk.cancel_open_entries()`, skipping rows whose cancel the broker already accepted;
@@ -210,7 +216,7 @@ class PositionManager:
             elif request is not None:
                 reason = "flatten"
             if reason is not None:
-                await self._latch_all(reason, now)
+                await self._latch_all(reason)
                 if can_trade:
                     await self._sell_external(reason, now)
         except Exception:
@@ -229,15 +235,16 @@ class PositionManager:
                 self._entry_unresolved.add(row_id)
                 log.error("positions.entry_unresolved", order_row=row_id)
 
-    async def _latch_all(self, reason: ExitReason, now: datetime) -> None:
+    async def _latch_all(self, reason: ExitReason) -> None:
         """Latch `reason` on every open position without a trigger, also when the broker
-        cannot trade (decision 10)."""
+        cannot trade (decision 10). Each latch reads the clock at its decision point."""
         async with self._sessions() as session:
             positions = await repo.open_positions(session)
         for pos in positions:
             if pos.exit_trigger is None:
                 with bind_cycle(pos.cycle_id):
                     try:  # a failure on one position never stops the others (spec 4.3)
+                        now = self._clock()
                         await self._latch(pos, reason, self._trusted_bid(pos.symbol, now), now)
                     except Exception:
                         log.exception(
@@ -430,15 +437,16 @@ class PositionManager:
             self._unprotected.add(pos.id)
         trigger = pos.exit_trigger
         if trigger is None:
-            trigger = await self._evaluate(pos, time_limit, now)
+            trigger = await self._evaluate(pos, time_limit)
             if trigger is None:
                 return
         if can_trade:
             sells = [o for o in unsettled if o.symbol == pos.symbol and o.side == "sell"]
             await self._exit_path(pos, trigger, sells, now)
 
-    async def _evaluate(self, pos: Position, time_limit: datetime, now: datetime) -> str | None:
-        """The fired and latched reason, or None (nothing fired, or the latch failed)."""
+    async def _evaluate(self, pos: Position, time_limit: datetime) -> str | None:
+        """The fired and latched reason, or None (nothing fired, or the latch failed). Judged
+        at a fresh clock reading, not the step start (D18: see the module docstring)."""
         state = ExitState(
             entry_price=pos.entry_price,
             stop=pos.stop,
@@ -448,6 +456,7 @@ class PositionManager:
             trail_high=pos.trail_high,
             trail_stop=pos.trail_stop,
         )
+        now = self._clock()
         bid = self._trusted_bid(pos.symbol, now)
         reason, trail = evaluate(state, bid, self._price_age(pos.symbol, now), now, self._rules)
         if trail is not None:
