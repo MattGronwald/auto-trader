@@ -28,9 +28,19 @@ The examples assume the default `config.yaml` (journal `data/autotrader.db`, SQL
 
 ## Resuming after a pause
 
-Flatten, ledger anomalies and an unexplained cash change set the manual pause
-(`control_state.paused = true`). There is no resume command until the Phase 3 API. Resume only
-after the cause is fixed:
+These set the manual pause (`control_state.paused = true`):
+- flatten (`autotrader flatten`, `shutdown.flatten`);
+- a ledger anomaly (`ledger.anomaly`), re-asserted on every sync pass while it persists
+  (`ledger.anomaly_repaused`), so fix the journal first;
+- an unexplained cash change (`CashDiscrepancy`);
+- the Risk Engine on the max-drawdown check (`risk.paused_manual_resume`).
+
+The daily-loss check sets `control_state.paused_until` instead (`risk.paused_until`): it blocks
+entries until the start of the next trading day and then expires on its own, with no operator
+action.
+
+There is no resume command until the Phase 3 API. Resume the manual pause only after the cause is
+fixed:
 
 ```sql
 UPDATE control_state SET value = 'false' WHERE key = 'paused';
@@ -54,6 +64,7 @@ Then it probes the core's journal lock:
 | No core running | `no core is running: the request is queued until the next run core` | 0 |
 | Core reports flat within 60 s | `flat (dust: {...})` | 0 |
 | Still pending after 60 s | `still pending after 60 s: {remaining}` | 1 |
+| No result for this request within 60 s (the core has not written one yet) | `still pending after 60 s: no result yet` | 1 |
 | Cancelled by someone else while waiting | `flatten cancelled` | 1 |
 | Invalid config | `invalid config: ...` on stderr | 1 |
 | Journal or other error | `flatten failed (...)` on stderr | 1 |
@@ -70,8 +81,16 @@ What the core does while a request is pending (every Position Manager step, 1 s)
    order row of either side remain. An unsettled row on any symbol, however old, blocks flat.
 
 While not flat it logs `positions.flatten_pending` and refreshes `flatten_result` every 10 s with
-what remains (`positions`, `holdings`, `orders`: id, symbol, side, status, age, `unresolved`, last
-anomaly). Read it with:
+`{request_ts, flat: false, remaining, ts}` (plus `reason: "broker cannot place orders"` when the
+broker cannot trade). `remaining` holds:
+- `positions`: `[{position_id, symbol, qty}]`, the open journal positions;
+- `holdings`: `[{symbol, qty}]`, the non-dust broker holdings, or `"unavailable"` when the broker
+  read failed;
+- `orders`: `[{order_row_id, symbol, side, status, age_s, unresolved, anomaly}]`, every unsettled
+  order row. `unresolved` is true for a `pending`/`unknown` row without a broker id; `anomaly` is
+  the row's latest ledger anomaly kind, or null.
+
+Read it with:
 
 ```sql
 SELECT value FROM control_state WHERE key IN ('flatten_requested', 'flatten_result');
