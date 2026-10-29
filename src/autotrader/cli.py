@@ -1,10 +1,11 @@
 """`autotrader` command line (SPEC §11).
 
 Commands that are stubs until their work package lands exit with code 2, so an operator
-never mistakes an unimplemented `kill` or `flatten` for a successful one.
+never mistakes an unimplemented command for a successful one.
 """
 
 import asyncio
+import json
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -16,6 +17,7 @@ import typer
 
 from autotrader.broker.alpaca import AlpacaBroker
 from autotrader.broker.alpaca_data import AlpacaBarSource
+from autotrader.core import flatten as flatten_ops
 from autotrader.core import lock as journal_lock
 from autotrader.core import runtime as core_runtime
 from autotrader.core import shutdown
@@ -163,9 +165,67 @@ def backtest_signals() -> None:
 
 
 @app.command("flatten")
-def flatten() -> None:
-    """Close all open positions via reduce-only exits."""
-    _not_implemented("flatten", "1.5")
+def flatten_command(
+    config: ConfigOption = Path("config.yaml"),
+    reason: Annotated[str | None, typer.Option(help="Recorded with the request.")] = None,
+    cancel: Annotated[
+        bool, typer.Option("--cancel", help="Cancel a pending request; entries stay paused.")
+    ] = False,
+    wait_s: Annotated[float, typer.Option(hidden=True)] = 60.0,
+) -> None:
+    """Pause entries and close all open positions via reduce-only exits."""
+    cfg = _load_config(config)
+    url = cfg.database.url
+
+    async def run() -> tuple[str, str | None, dict[str, Any] | None]:
+        engine = db.make_engine(url)
+        sessions = db.make_sessionmaker(engine)
+        try:
+            now = datetime.now(UTC)
+            if cancel:
+                cancelled = await flatten_ops.cancel_flatten(sessions, now=now)
+                if cancelled is None:
+                    return "none", None, None
+                return "cancelled", cancelled.ts, None
+            request, created = await flatten_ops.request_flatten(
+                sessions, source="cli", reason=reason, now=now
+            )
+            note = "created" if created else "pending"
+            if not journal_lock.core_running(url):
+                return note + ",queued", request.ts, None
+            result = await flatten_ops.wait_for_result(sessions, request.ts, wait_s=wait_s)
+            return note, request.ts, result
+        finally:
+            await engine.dispose()
+
+    try:
+        state, ts, result = asyncio.run(run())
+    except Exception as e:
+        typer.echo(f"flatten failed ({type(e).__name__}: {e})", err=True)
+        raise typer.Exit(code=1) from None
+
+    if state == "none":
+        typer.echo("no flatten request pending")
+        return
+    if state == "cancelled":
+        typer.echo(f"flatten request cancelled ({ts}); entries stay paused")
+        return
+    if state.startswith("created"):
+        typer.echo(f"flatten requested ({ts}); entries paused")
+    else:
+        typer.echo(f"a flatten request is already pending ({ts})")
+    if state.endswith("queued"):
+        typer.echo("no core is running: the request is queued until the next run core")
+        return
+    if result is not None and result.get("flat"):
+        typer.echo(f"flat (dust: {json.dumps(result.get('dust'))})")
+        return
+    if result is not None and result.get("cancelled"):
+        typer.echo("flatten cancelled")
+        raise typer.Exit(code=1)
+    remaining = json.dumps(result.get("remaining")) if result is not None else "no result yet"
+    typer.echo(f"still pending after {wait_s:g} s: {remaining}")
+    raise typer.Exit(code=1)
 
 
 _KILL_FALLBACK = (

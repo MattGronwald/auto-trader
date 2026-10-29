@@ -8,7 +8,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import JSON, CheckConstraint, ForeignKey, MetaData, String, Text
+from sqlalchemy import JSON, CheckConstraint, ForeignKey, MetaData, String, Text, false
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from autotrader.journal.types import Money, UTCDateTime
@@ -138,6 +138,8 @@ class Order(Base):
     settled_at: Mapped[datetime | None]
     position_id: Mapped[int | None] = mapped_column(ForeignKey("positions.id"))
     exit_reason: Mapped[str | None] = mapped_column(String(16))
+    # WP 1.5c: a sell of a broker holding with no journal position (decision 13).
+    external: Mapped[bool] = mapped_column(default=False, server_default=false())
 
 
 class Fill(Base):
@@ -189,6 +191,13 @@ class Position(Base):
     initial_risk: Mapped[Decimal | None]
     dust_qty: Mapped[Decimal | None]
     dust_consumed: Mapped[Decimal] = mapped_column(default=Decimal(0), server_default="0")
+    # WP 1.5c: durable exit state. The ATR at entry (trailing distance), the trailing high
+    # and stop, and the latched exit trigger with the time it fired.
+    atr_at_entry: Mapped[Decimal | None]
+    trail_high: Mapped[Decimal | None]
+    trail_stop: Mapped[Decimal | None]
+    exit_trigger: Mapped[str | None] = mapped_column(String(16))
+    exit_triggered_at: Mapped[datetime | None]
 
 
 class SymbolDust(Base):
@@ -275,7 +284,7 @@ class Hypothesis(Base):
 
 
 class ControlState(Base):
-    """Keys: paused, paused_until, kill, mode."""
+    """Keys: paused, paused_until, kill, mode, cash_check, flatten_requested, flatten_result."""
 
     __tablename__ = "control_state"
 

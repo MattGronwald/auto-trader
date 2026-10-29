@@ -14,6 +14,14 @@ equals the applied qty (spec 4.3). Only a contradiction against an authoritative
 an anomaly: the update is rolled back and entries are paused until an operator resumes
 them (spec 4.5).
 
+A sell marked `external` (1.5c decision 13, spec 4.4.1) of a broker holding the journal
+doesn't know is booked without a position: its fills (and so its cash effect) and its
+settlement, but no position and no P&L, since there is no buy cost to set against it. On
+settlement, once, from the order's booked fills, the sold qty first consumes the symbol's
+written-off dust (`symbol_dust`); the remainder is external and reported in
+`ExternalHoldingSold`. A marked sell that finds an open position books through the normal
+sell path, `oversell` included.
+
 Money columns are text on SQLite, so Decimal values are compared in Python, never in SQL.
 """
 
@@ -21,7 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 import structlog
@@ -60,8 +68,9 @@ Outcome = Literal["applied", "noop", "deferred", "anomaly"]
 
 class LedgerEvent(DomainEvent):
     """Every ledger event carries the identity of the unit that wrote it: after a commit
-    error, `_verify` looks for this exact event in the journal (a shared flag such as
-    `paused`, or a timestamp, cannot prove that this unit committed)."""
+    error, `verify_unit` looks for this exact event in the journal (a shared flag such as
+    `paused`, or a timestamp, cannot prove that this unit committed). The Position
+    Manager's events use the same pattern."""
 
     unit_id: str = Field(default_factory=lambda: uuid4().hex)
 
@@ -96,6 +105,18 @@ class LedgerAnomaly(LedgerEvent):
     detail: str
 
 
+class ExternalHoldingSold(LedgerEvent):
+    """A settled external sale (spec 4.4.1): no position, no P&L; accounted for by hand."""
+
+    order_row_id: int
+    symbol: str
+    qty: Decimal
+    dust_consumed: Decimal
+    external_qty: Decimal
+    proceeds_usd: Decimal
+    fees_usd: Decimal
+
+
 class CashChecked(LedgerEvent):
     result: Literal["baseline", "ok"]
     expected: Decimal | None
@@ -120,12 +141,11 @@ class CashGuard:
 
 
 async def _guard(session: AsyncSession) -> CashGuard:
-    last_order = await session.scalar(select(func.max(Order.id)))
-    last_fill = await session.scalar(select(func.max(FillRow.id)))
+    generation = await repo.order_fill_generation(session)
     open_orders = await session.scalar(
         select(func.count()).select_from(Order).where(Order.settled_at.is_(None))
     )
-    return CashGuard((last_order or 0, last_fill or 0), bool(open_orders))
+    return CashGuard(generation, bool(open_orders))
 
 
 class _Deferred(Exception):
@@ -146,6 +166,7 @@ class _Unit:
     error: _Deferred | _Anomaly | None = None
     cycle_id: int | None = None
     result: CashResult = "skipped"
+    external: ExternalHoldingSold | None = None
 
 
 def _rank(status: str) -> int:
@@ -184,7 +205,7 @@ def _same(row: FillRow, fill: Fill) -> bool:
     )
 
 
-async def _verify(session: AsyncSession, event: DomainEvent) -> bool:
+async def verify_unit(session: AsyncSession, event: DomainEvent) -> bool:
     """Read-back after a commit error (D15): is this unit's own head event in the journal?
     It commits atomically with the unit's rows, so finding it proves the whole unit."""
     if not isinstance(event, LedgerEvent):
@@ -197,10 +218,10 @@ async def _verify(session: AsyncSession, event: DomainEvent) -> bool:
     return any(p.get("unit_id") == event.unit_id for p in payloads)
 
 
-async def _initial_risk(session: AsyncSession, cycle_id: int | None) -> Decimal | None:
-    """The R denominator from the approved entry decision (D16 `adjusted`)."""
+async def _entry_adjusted(session: AsyncSession, cycle_id: int | None) -> dict[str, Any]:
+    """The approved entry decision's `adjusted` (D16 R denominator, ATR at entry)."""
     if cycle_id is None:
-        return None
+        return {}
     adjusted = await session.scalar(
         select(RiskDecision.adjusted)
         .where(
@@ -211,7 +232,10 @@ async def _initial_risk(session: AsyncSession, cycle_id: int | None) -> Decimal 
         .order_by(RiskDecision.id.desc())
         .limit(1)
     )
-    value = None if adjusted is None else adjusted.get("initial_risk")
+    return {} if adjusted is None else dict(adjusted)
+
+
+def _opt_dec(value: object) -> Decimal | None:
     return None if value is None else Decimal(str(value))
 
 
@@ -238,15 +262,20 @@ class Ledger:
 
     # --- orders ------------------------------------------------------------------------
 
-    async def apply_all(self, result: SyncResult) -> None:
-        """Book one sync pass (spec 4.3): per symbol in order-row id order. An unsettled row
+    async def apply_all(self, result: SyncResult) -> frozenset[str]:
+        """Book one sync pass (spec 4.1): per symbol in order-row id order. An unsettled row
         without an update (failed lookup, or pending/unknown with no broker id), and an
         update that was deferred or anomalous, hold back the later rows of its symbol, so a
-        catch-up never books an exit before its entry."""
+        catch-up never books an exit before its entry.
+
+        A row whose booking raises is logged and holds back its own symbol only; the other
+        symbols still book. Returns the symbols that raised on this pass (the caller fails
+        closed on them). `CancelledError` is never caught."""
         updates = {u.order_row_id: u for u in result.updates}
         async with self._sessions() as session:
             rows = await repo.unsettled_orders(session)
         held: set[str] = set()
+        failed: set[str] = set()
         for row in rows:
             symbol = row.symbol or ""
             update = updates.get(row.id)
@@ -254,12 +283,24 @@ class Ledger:
                 if update is not None:
                     log.info("ledger.update_deferred", order_row=row.id, symbol=symbol)
                 continue
-            if update is None or await self.apply(update) in ("deferred", "anomaly"):
+            if update is None:
                 held.add(symbol)
+                continue
+            try:
+                outcome = await self.apply(update)
+            except Exception:
+                log.exception("ledger.row_failed", order_row=row.id, symbol=symbol)
+                held.add(symbol)
+                failed.add(symbol)
+                continue
+            if outcome in ("deferred", "anomaly"):
+                held.add(symbol)
+        return frozenset(failed)
 
     async def apply(self, update: OrderUpdate) -> Outcome:
         """Book one order's update in one transaction. Never raises for a deferral or an
-        anomaly; journal errors propagate (the caller fails closed)."""
+        anomaly; journal errors propagate to the caller (`apply_all` catches them per row
+        and holds back that row's symbol)."""
         unit = _Unit()
 
         async def build(session: AsyncSession) -> tuple[DomainEvent, ...] | None:
@@ -269,7 +310,16 @@ class Ledger:
                 unit.error = e
                 return None
 
-        event = await self._bus.publish_tx(build, _verify)
+        event = await self._bus.publish_tx(build, verify_unit)
+        if unit.external is not None:
+            sold = unit.external
+            log.warning(
+                "positions.external_sold",
+                order_row=sold.order_row_id,
+                symbol=sold.symbol,
+                external_qty=str(sold.external_qty),
+                dust_consumed=str(sold.dust_consumed),
+            )
         if isinstance(unit.error, _Anomaly):
             await self._anomaly(update.order_row_id, unit.cycle_id, unit.error)
             return "anomaly"
@@ -355,6 +405,10 @@ class Ledger:
                 dust = await self._maybe_close(session, position, u.min_qty, now)
                 if dust is not None:
                     extra.append(dust)
+            if order.side == "sell" and order.external and order.position_id is None:
+                unit.external = await self._external_sale(session, order, now)
+                if unit.external is not None:
+                    extra.append(unit.external)
         if not changed:
             return None
         order.updated_at = now
@@ -374,6 +428,7 @@ class Ledger:
         self, session: AsyncSession, order: Order, position: Position | None, fill: Fill
     ) -> Position:
         if position is None:
+            adjusted = await _entry_adjusted(session, order.cycle_id)
             position = Position(
                 cycle_id=order.cycle_id,
                 symbol=order.symbol or fill.symbol,
@@ -384,7 +439,8 @@ class Ledger:
                 tp=order.tp_price,
                 opened_at=fill.ts,
                 fees=_D0,
-                initial_risk=await _initial_risk(session, order.cycle_id),
+                initial_risk=_opt_dec(adjusted.get("initial_risk")),
+                atr_at_entry=_opt_dec(adjusted.get("atr")),
                 dust_consumed=_D0,
             )
             session.add(position)
@@ -403,10 +459,11 @@ class Ledger:
         position: Position | None,
         fill: Fill,
         now: datetime,
-    ) -> Position:
+    ) -> Position | None:
         """Reduce the symbol's open position. A sell beyond the open qty is carried dust of
         earlier trades, resolved only once every earlier order on the symbol is settled
-        (spec 4.3): until then the whole update is deferred, never an anomaly."""
+        (spec 4.3): until then the whole update is deferred, never an anomaly. A marked
+        external sell with no open position books no position (None, spec 4.4.1)."""
         if position is None:
             # Never "the oldest open one": check() keeps one open journal trade per symbol,
             # so more than one is a contradiction, not a choice (PR #25 review).
@@ -425,6 +482,8 @@ class Ledger:
             if position is None:
                 if await _earlier_unsettled(session, order):
                     raise _Deferred("no open position yet; an earlier order is unsettled")
+                if order.external:
+                    return None  # decision 13: booked as an external sale at settlement
                 raise _Anomaly(
                     "sell_without_position", f"sell fill {fill.fill_id}: no open {order.symbol}"
                 )
@@ -449,6 +508,38 @@ class Ledger:
         position.dust_consumed = _norm(position.dust_consumed + excess)
         position.qty = _D0
         return position
+
+    async def _external_sale(
+        self, session: AsyncSession, order: Order, now: datetime
+    ) -> ExternalHoldingSold | None:
+        """Allocate a settled external sale once, from its booked fills (never from memory,
+        so partial fills and restarts can't consume the dust twice). A zero-fill order
+        settles silently."""
+        await session.flush()
+        rows = list(await session.scalars(select(FillRow).where(FillRow.order_id == order.id)))
+        sold = sum((r.qty for r in rows), _D0)
+        if sold == 0:
+            return None
+        symbol = order.symbol or ""
+        dust = await session.get(SymbolDust, symbol)
+        balance = _D0 if dust is None else dust.qty
+        consumed = min(sold, balance)
+        if dust is not None and consumed > 0:
+            dust.qty = _norm(balance - consumed)
+            dust.updated_at = now
+        if balance > sold:
+            log.warning("ledger.dust_residual", symbol=symbol, residual=str(balance - sold))
+        return ExternalHoldingSold(
+            ts=now,
+            cycle_id=order.cycle_id,
+            order_row_id=order.id,
+            symbol=symbol,
+            qty=_norm(sold),
+            dust_consumed=_norm(consumed),
+            external_qty=_norm(sold - consumed),
+            proceeds_usd=_norm(sum((r.qty * r.price for r in rows), _D0)),
+            fees_usd=_norm(sum((r.fee for r in rows), _D0)),
+        )
 
     async def _reprice(self, session: AsyncSession, order: Order, position: Position) -> None:
         """`entry_price` = gross VWAP of the entry's buy fills (Alpaca's convention)."""
@@ -508,7 +599,7 @@ class Ledger:
             )
         )
         if any(o.settled_at is None for o in linked):
-            return None  # a late fill can still arrive: stay open (1.5c protects it)
+            return None  # a late fill can still arrive: stay open (the Position Manager exits it)
         rows = list(
             await session.scalars(
                 select(FillRow).where(FillRow.order_id.in_([o.id for o in linked]))
@@ -543,21 +634,49 @@ class Ledger:
         )
 
     async def _anomaly(self, order_row_id: int, cycle_id: int | None, error: _Anomaly) -> None:
-        """Pause entries for an operator in a unit of its own: the update rolled back."""
-        log.error("ledger.anomaly", kind=error.kind, order_row=order_row_id, detail=error.detail)
-        event = LedgerAnomaly(
-            ts=self._clock(),
-            cycle_id=cycle_id,
-            kind=error.kind,
-            order_row_id=order_row_id,
-            detail=error.detail,
-        )
+        """Pause entries for an operator in a unit of its own: the update rolled back.
 
-        async def build(session: AsyncSession) -> DomainEvent:
+        The row stays unsettled, so the sync loop books it again every pass. A repeat (the
+        row's latest `LedgerAnomaly` has the same kind and detail) while entries are still
+        paused writes nothing and logs `ledger.anomaly_persists` at debug level. A repeat
+        after an operator resumed re-pauses: it writes a new `LedgerAnomaly` (same kind,
+        detail and row) with the pause in one unit and logs `ledger.anomaly_repaused`
+        (warning). The repeat check runs inside the bus unit, under the bus lock, so two
+        passes cannot both write a re-pause for one resume."""
+        outcome: list[Literal["new", "repaused", "persists"]] = []
+
+        async def build(session: AsyncSession) -> DomainEvent | None:
+            last = (await repo.last_anomalies(session, [order_row_id])).get(order_row_id)
+            repeat = last is not None and (last["kind"], last["detail"]) == (
+                error.kind,
+                error.detail,
+            )
+            if repeat and await repo.get_control(session, PAUSED_KEY) is True:
+                outcome.append("persists")
+                return None
+            outcome.append("repaused" if repeat else "new")
             await session.merge(ControlState(key=PAUSED_KEY, value=True))
-            return event
+            return LedgerAnomaly(
+                ts=self._clock(),
+                cycle_id=cycle_id,
+                kind=error.kind,
+                order_row_id=order_row_id,
+                detail=error.detail,
+            )
 
-        await self._bus.publish_tx(build, _verify)
+        fields = {"kind": error.kind, "order_row": order_row_id, "detail": error.detail}
+        try:
+            await self._bus.publish_tx(build, verify_unit)
+        finally:
+            # Logged even when the commit raises (CommitUncertain or a journal error; it
+            # propagates as before): the anomaly was seen either way. Nothing is logged if
+            # `build` raised before deciding.
+            if outcome == ["persists"]:
+                log.debug("ledger.anomaly_persists", kind=error.kind, order_row=order_row_id)
+            elif outcome == ["repaused"]:
+                log.warning("ledger.anomaly_repaused", **fields)
+            elif outcome == ["new"]:
+                log.error("ledger.anomaly", **fields)
 
     # --- cash (D17) ----------------------------------------------------------------------
 
@@ -625,5 +744,5 @@ class Ledger:
                 baseline_ts=str(baseline["ts"]),
             )
 
-        await self._bus.publish_tx(build, _verify)
+        await self._bus.publish_tx(build, verify_unit)
         return unit.result
