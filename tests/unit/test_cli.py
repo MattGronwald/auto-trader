@@ -11,6 +11,7 @@ import pytest
 from typer.testing import CliRunner
 
 from autotrader.cli import _run_core_process, app
+from autotrader.core import flatten as flatten_ops
 from autotrader.core import lock as journal_lock
 from autotrader.core.config import Settings, load_config, load_profile
 from autotrader.core.logging import configure_logging
@@ -576,3 +577,40 @@ def test_flatten_twice_keeps_the_first_request(tmp_path: Path) -> None:
     assert second.exit_code == 0 and "already pending" in second.output
     kept, _, _ = _read_flatten_state(config)
     assert kept == first
+
+
+def _flatten_with_a_core_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: dict[str, Any]
+) -> Any:
+    """Run `flatten` against a core that looks running; the core's result is `outcome`
+    plus the request's own ts."""
+    config = _tmp_config(tmp_path)
+    runner.invoke(app, ["db", "upgrade", "-c", str(config)])
+
+    async def result(_sessions: Any, request_ts: str, *, wait_s: float) -> dict[str, Any]:
+        return {"request_ts": request_ts, **outcome}
+
+    monkeypatch.setattr(journal_lock, "core_running", lambda _url: True)
+    monkeypatch.setattr(flatten_ops, "wait_for_result", result)
+    return runner.invoke(app, ["flatten", "-c", str(config)])
+
+
+def test_flatten_reports_flat_with_the_dust_and_exits_0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _flatten_with_a_core_result(
+        tmp_path, monkeypatch, {"flat": True, "dust": {"BTC/USD": "0.00005"}}
+    )
+
+    assert result.exit_code == 0, result.output
+    assert 'flat (dust: {"BTC/USD": "0.00005"})' in result.output
+
+
+def test_flatten_cancelled_while_waiting_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _flatten_with_a_core_result(tmp_path, monkeypatch, {"flat": False, "cancelled": True})
+
+    assert result.exit_code == 1
+    assert "flatten cancelled" in result.output
+    assert "still pending" not in result.output
