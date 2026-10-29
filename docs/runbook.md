@@ -178,9 +178,10 @@ operator decides.
    (`settled_at` set) and the alert stops. A row left unresolved keeps alerting every 60 s until
    the incident is resolved; that is expected.
 
-With `AlpacaBroker` in 1.5c this cannot arise in production: every order call raises
-`OrderMethodsUnavailable`, which the engine records as `not_submitted`, never `unknown` (nothing
-is sent). The sync loop cannot read Alpaca orders yet either.
+With `AlpacaBroker` in 1.5c this cannot arise in production: `can_place_orders()` is false, so
+the Position Manager attempts no exits or cancels, and nothing places entries before 1.5d. A
+direct engine call would still fail with `OrderMethodsUnavailable` before anything is sent and be
+recorded `not_submitted`. The sync loop cannot read Alpaca orders yet either.
 
 ## Accounting for an external sale
 
