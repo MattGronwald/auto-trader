@@ -217,6 +217,11 @@ class MarketFeed:
             return True
         return symbol in self._stale
 
+    def price_age_s(self, symbol: str) -> float | None:
+        """Seconds since the newest valid quote or bar end; None if never observed."""
+        seen = self._observed.get(symbol)
+        return None if seen is None else (self._clock() - seen).total_seconds()
+
     # --- startup ---------------------------------------------------------------------
 
     async def backfill(self) -> None:

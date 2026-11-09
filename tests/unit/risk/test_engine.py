@@ -22,6 +22,7 @@ from autotrader.broker.base import (
     FeeSchedule,
     Fill,
     OrderAck,
+    OrderMethodsUnavailable,
     OrderRejected,
     OrderStatus,
     Position,
@@ -44,6 +45,7 @@ from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
 from autotrader.risk.checks import check_entry
 from autotrader.risk.engine import Accounting, Gate, RiskEngine
 from autotrader.risk.types import (
+    CancelResult,
     EntryIntent,
     ExitRequest,
     MarketSnapshot,
@@ -1454,8 +1456,21 @@ async def test_an_unreadable_order_fails_entries_closed_but_the_rest_is_booked(
 
 
 class FailingLedger:
-    async def apply_all(self, result: SyncResult) -> None:
+    async def apply_all(self, result: SyncResult) -> frozenset[str]:
         raise RuntimeError("journal down")
+
+
+class OneSymbolFailed:
+    async def apply_all(self, result: SyncResult) -> frozenset[str]:
+        return frozenset({"ETH/USD"})
+
+
+async def test_a_symbol_the_ledger_could_not_book_fails_every_entry_closed(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    engine = make_engine_(sim, sessions, gate, ledger=OneSymbolFailed())
+    result = await engine.check(intent(cycle_id))  # a BTC entry
+    assert result.decision.reasons == ("state unavailable: SyncIncomplete",)
 
 
 async def test_a_failing_ledger_fails_entries_closed(
@@ -1590,8 +1605,42 @@ async def test_a_dust_close_is_reported_as_dust(
     await _held_btc(broker)
     result = await make_engine_(broker, sessions, gate).exit(ExitRequest(symbol=BTC, reason="kill"))
     assert (result.status, result.dust) == ("rejected", True)
+    assert result.min_qty == RULES.min_qty
     (row,) = await orders(sessions)
     assert (row.status, row.exit_reason) == ("rejected", "kill")
+
+
+async def test_exit_outcomes_say_whether_the_broker_held_dust_or_nothing(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    nothing = await make_engine_(_sim(), sessions, gate).exit(
+        ExitRequest(symbol=BTC, reason="stop")
+    )
+    assert (nothing.no_position, nothing.dust, nothing.min_qty) == (True, False, None)
+
+    dusty = SimBroker(  # base fee: a 0.0001 buy nets 0.00009975 < min_qty
+        cash=D("1000"),
+        fees=FeeSchedule(maker_bps=D(15), taker_bps=D(25), buy_fee_asset="base"),
+        slippage_bps=D(0),
+        asset_rules={BTC: RULES.model_copy(update={"min_notional": D(0)})},  # 0.01 USD buy
+        timeframe="5m",
+    )
+    dusty.process_bar(five(29))
+    await dusty.submit_order(BrokerOrder(symbol=BTC, side="buy", qty=D("0.0001"), type="market"))
+    dusty.process_bar(five(30))
+    dust = await make_engine_(dusty, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert (dust.no_position, dust.dust, dust.min_qty) == (False, True, RULES.min_qty)
+    assert dust.decision.reasons == ("dust only in BTC/USD",) and dust.order_row_id is None
+    assert await make_engine_(dusty, sessions, gate).sellable_positions() == ()
+
+
+async def test_a_mode_mismatch_is_neither_dust_nor_no_position(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    await _held_btc(sim)
+    sim.broker_mode = "live"
+    result = await make_engine_(sim, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert (result.dust, result.no_position, result.min_qty) == (False, False, None)
 
 
 async def test_an_open_journal_trade_blocks_its_symbol_even_on_broker_dust(
@@ -1621,3 +1670,124 @@ async def test_snapshot_equity_returns_the_account_it_read(
 ) -> None:
     account = await make_engine_(sim, sessions, gate).snapshot_equity()
     assert account.cash == D("1000")
+
+
+class UnavailableBroker(SimBroker):
+    async def close_position(self, symbol: str) -> OrderAck:
+        raise OrderMethodsUnavailable("AlpacaBroker.close_position is not implemented until WP 1.6")
+
+    def can_place_orders(self) -> bool:
+        return False
+
+
+async def test_an_exit_on_a_broker_that_cannot_trade_is_not_submitted(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    broker = _sim(UnavailableBroker)
+    await _held_btc(broker)
+    engine = make_engine_(broker, sessions, gate)
+    assert engine.can_place_orders() is False
+    result = await engine.exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert (result.status, result.broker_order_id) == ("not_submitted", None)
+    (row,) = await orders(sessions)
+    assert row.status == "not_submitted"  # never "unknown": nothing left the process
+
+
+async def test_an_external_exit_marks_its_order_row(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    await _held_btc(sim)
+    result = await make_engine_(sim, sessions, gate).exit(
+        ExitRequest(symbol=BTC, reason="flatten", external=True)
+    )
+    assert result.status == "new"
+    (row,) = await orders(sessions)
+    assert (row.external, row.exit_reason, row.cycle_id) == (True, "flatten", None)
+
+
+class CancelSpy(SimBroker):
+    def __init__(self, *args: Any, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self.cancelled: list[str] = []
+        self.fail: set[str] = set()
+
+    async def cancel_order(self, order_id: str) -> None:
+        if order_id in self.fail:
+            raise OrderRejected("cannot cancel")
+        self.cancelled.append(order_id)
+        await super().cancel_order(order_id)
+
+
+async def _entry_row(
+    sessions: async_sessionmaker[AsyncSession],
+    status: str,
+    broker_id: str | None,
+    side: str = "buy",
+) -> int:
+    async with sessions() as s:
+        row = await repo.insert_order(
+            s,
+            cycle_id=None,
+            client_order_id=None,
+            symbol=BTC,
+            mode="paper",
+            type_="limit",
+            side=side,
+            qty=D("1"),
+            limit_price=D("50"),
+            stop_price=None,
+            tp_price=None,
+            status="pending",
+            now=NOW,
+        )
+        await repo.update_order(s, row.id, status=status, now=NOW, broker_order_id=broker_id)
+        return row.id
+
+
+async def test_cancel_open_entries_cancels_open_buys_only(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    broker = _sim(CancelSpy)
+    assert isinstance(broker, CancelSpy)
+    await _held_btc(broker)
+    resting = await broker.submit_order(
+        BrokerOrder(symbol=BTC, side="buy", qty=D("1"), type="limit", limit_price=D("50"))
+    )
+    failing = await broker.submit_order(
+        BrokerOrder(symbol=BTC, side="buy", qty=D("1"), type="limit", limit_price=D("51"))
+    )
+    broker.fail.add(failing.order_id)
+    sell = await broker.close_position(BTC)
+    open_row = await _entry_row(sessions, "new", resting.order_id)
+    failed_row = await _entry_row(sessions, "new", failing.order_id)
+    unacked = await _entry_row(sessions, "unknown", None)
+    await _entry_row(sessions, "not_submitted", None)  # final: skipped
+    await _entry_row(sessions, "new", sell.order_id, side="sell")  # never a sell
+    skipped = await _entry_row(sessions, "new", "sim-999")
+    engine = make_engine_(broker, sessions, gate)
+
+    result = await engine.cancel_open_entries(exclude={skipped})
+
+    assert result == CancelResult(
+        requested=(open_row,), failed=(failed_row,), unresolved=(unacked,)
+    )
+    assert broker.cancelled == [resting.order_id]
+    assert (await broker.get_order(sell.order_id)).status == "new"
+
+
+async def test_cancel_open_entries_with_a_spent_budget_fails_the_row(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    row = await _entry_row(sessions, "new", "sim-1")
+    engine = make_engine_(sim, sessions, gate, io_timeout_s=0.0)
+    assert await engine.cancel_open_entries() == CancelResult(failed=(row,))
+
+
+async def test_sellable_positions_leave_out_dust(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    engine = make_engine_(sim, sessions, gate)
+    assert await engine.sellable_positions() == ()
+    await _held_btc(sim)
+    (held,) = await engine.sellable_positions()
+    assert (held.symbol, held.qty, held.market_value) == (BTC, D("1"), None)

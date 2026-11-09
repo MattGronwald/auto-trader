@@ -1164,3 +1164,7 @@ async def test_dust_close_raises_the_typed_dust_signal() -> None:
         D("0.0001"),
     )
     assert isinstance(caught.value, OrderRejected)  # existing handlers stay correct
+
+
+def test_sim_can_place_orders() -> None:
+    assert make_sim().can_place_orders() is True

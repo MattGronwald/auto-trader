@@ -26,11 +26,13 @@ ExitReason = Literal["stop", "take_profit", "time", "trailing", "kill", "flatten
 
 
 class ExitRequest(_Frozen):
-    """Reduce-only, full exit (G1)."""
+    """Reduce-only, full exit (G1). `external`: a sell of a broker holding with no journal
+    position (flatten / kill-flatten only)."""
 
     symbol: str
     reason: ExitReason
     cycle_id: int | None = None
+    external: bool = False
 
 
 class HeldPosition(_Frozen):
@@ -113,6 +115,15 @@ class SyncResult(_Frozen):
     @property
     def complete(self) -> bool:
         return not self.failed
+
+
+class CancelResult(_Frozen):
+    """One `cancel_open_entries` pass. `requested`: rows whose cancel the broker accepted;
+    `failed`: rows whose cancel raised; `unresolved`: non-final buys with no broker id."""
+
+    requested: tuple[int, ...] = ()
+    failed: tuple[int, ...] = ()
+    unresolved: tuple[int, ...] = ()
 
 
 class SyncIncomplete(RuntimeError):

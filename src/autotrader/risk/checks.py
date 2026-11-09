@@ -202,6 +202,7 @@ def _size_and_finish(
             "expected_value": str(ev),
             # R stays the price distance; the D16 estimate is reported next to it.
             "initial_risk": str(qty * distance),
+            "atr": str(market.atr),
             "est_net_stop_loss": str(qty * unit_loss),
         },
         qty=qty,
@@ -215,6 +216,8 @@ def check_exit(
     if not mode_matches:
         return _reject("mode mismatch between config and broker")
     position = next((p for p in positions if p.symbol == request.symbol), None)
-    if position is None or position.is_dust:
+    if position is None:
         return _reject(f"no position to exit in {request.symbol}")
+    if position.is_dust:
+        return _reject(f"dust only in {request.symbol}")
     return RiskDecision(approved=True, reasons=(f"exit: {request.reason}",), qty=position.qty)

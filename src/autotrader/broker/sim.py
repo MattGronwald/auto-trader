@@ -271,6 +271,9 @@ class SimBroker:
         raise KeyError."""
         self._fills.put_nowait(self._fill_log[fill_id])
 
+    def can_place_orders(self) -> bool:
+        return True
+
     def mode(self) -> Mode:
         return self.broker_mode
 

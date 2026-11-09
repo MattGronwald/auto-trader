@@ -9,8 +9,9 @@ It blocks on a kill, on `paused`, and on `paused_until` in the future, and fails
 unreadable control state or a malformed `paused_until` also block.
 
 Kill and pause block **entries only**. Reduce-only exits (Risk Engine `exit()`, G1) stay
-allowed so a kill can still flatten. Acting on a kill (cancel orders, optional flatten)
-is the core's job once the broker exists (WP 0.6/1.5).
+allowed so a kill can still flatten. Acting on a kill is the Position Manager's job in
+`run core` (WP 1.5c): it cancels outstanding entry orders and, with `kill.flatten`, exits
+every position through the Risk Engine.
 """
 
 import fcntl

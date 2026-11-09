@@ -13,8 +13,8 @@ happen with or without a shared lock (fills are broker-side); the ledger books i
 and the Position Manager manages it (WP 1.5c).
 
 `check()` first syncs every unsettled order (`sync_orders`) and books it through the ledger
-(`core/ledger.py`, WP 1.5b); an unreadable order rejects the entry (`state unavailable:
-SyncIncomplete`). Exits never sync.
+(`core/ledger.py`, WP 1.5b); an unreadable order, or a symbol whose booking raised in the
+ledger, rejects every entry (`state unavailable: SyncIncomplete`). Exits never sync.
 
 Each locked section has ONE budget of `io_timeout_s`, measured from taking its lock and
 shared by its network/gate awaits only (gate.status, get_account, get_positions, each
@@ -24,12 +24,15 @@ a timeout never cancels a DB session mid-statement or mid-commit; SQLite errors 
 locked DB after `busy_timeout` (5 s) instead of hanging. A step whose budget is already
 spent is not called: its timeout outcome applies, and a submit that was never attempted
 is `not_submitted`. `asyncio.CancelledError` is never caught.
+
+`cancel_open_entries()` cancels resting entry (buy) orders under the exit lock with its own
+budget, and `sellable_positions()` reads the non-dust broker holdings lock-free with its own.
 """
 
 import asyncio
 import math
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -46,6 +49,7 @@ from autotrader.broker.base import (
     Fill,
     Mode,
     OrderAck,
+    OrderMethodsUnavailable,
     OrderRejected,
 )
 from autotrader.core.config import StrategyProfile
@@ -58,6 +62,7 @@ from autotrader.journal.models import Order
 from autotrader.risk.checks import check_entry, check_exit
 from autotrader.risk.types import (
     FINAL,
+    CancelResult,
     EntryIntent,
     ExitRequest,
     HeldPosition,
@@ -82,7 +87,7 @@ _LOCAL_FINAL = ("not_submitted", "rejected")
 class Accounting(Protocol):
     """The ledger (`core/ledger.py`, WP 1.5b): books a sync pass. Journal code only."""
 
-    async def apply_all(self, result: SyncResult) -> None: ...
+    async def apply_all(self, result: SyncResult) -> frozenset[str]: ...
 
 
 class RiskMarketView(Protocol):
@@ -103,6 +108,8 @@ class OrderResult:
     status: str | None = None
     broker_order_id: str | None = None
     dust: bool = False
+    min_qty: Decimal | None = None  # the asset's min_qty when the holding is dust
+    no_position: bool = False  # the broker holds nothing in the symbol
 
 
 def _dec(value: float | None) -> Decimal | None:
@@ -145,6 +152,9 @@ class RiskEngine:
         self._exit_lock = asyncio.Lock()  # exit(): never waits for an entry
 
     # --- entries ---------------------------------------------------------------------
+
+    def can_place_orders(self) -> bool:
+        return self._broker.can_place_orders()
 
     async def check(self, intent: EntryIntent) -> OrderResult:
         async with self._entry_lock:
@@ -210,9 +220,12 @@ class RiskEngine:
         # Book our own orders BEFORE reading positions: a fill the sync observed is then in
         # the journal and in the positions read below (never neither position nor entry).
         synced = await self._sync(deadline)
-        await self._ledger.apply_all(synced)
-        if not synced.complete:  # PLAN 3.2 item 4: an unreadable order fails entries closed
-            raise SyncIncomplete(f"order rows not synced: {list(synced.failed)}")
+        failed = await self._ledger.apply_all(synced)
+        if not synced.complete or failed:  # PLAN 3.2 item 4 / spec 4.1: fail entries closed
+            raise SyncIncomplete(
+                f"order rows not synced: {list(synced.failed)}; "
+                f"symbols the ledger could not book: {sorted(failed)}"
+            )
         # After the booking: a pause this pass set (ledger anomaly) already rejects here.
         control = await self._within(deadline, lambda: self._gate.status(now))
         async with self._sessions() as session:
@@ -402,11 +415,17 @@ class RiskEngine:
         except DustRemainder as e:  # close_position only: report dust as a type (1.5c)
             log.warning("risk.exit_dust", order_row=row_id, qty=str(e.qty), min_qty=str(e.min_qty))
             await self._set_status(row_id, "rejected")
-            return OrderResult(decision, row_id, "rejected", dust=True)
+            return OrderResult(decision, row_id, "rejected", dust=True, min_qty=e.min_qty)
         except OrderRejected as e:
             log.warning("risk.order_rejected", order_row=row_id, reason=str(e))
             await self._set_status(row_id, "rejected")
             return OrderResult(decision, row_id, "rejected")
+        except OrderMethodsUnavailable:  # nothing left the process
+            log.warning(
+                "risk.order_not_submitted", order_row=row_id, reason="broker cannot place orders"
+            )
+            await self._set_status(row_id, "not_submitted")
+            return OrderResult(decision, row_id, "not_submitted")
         except Exception:  # timeout / network: may or may not exist at the broker
             log.exception("risk.order_unknown", order_row=row_id)
             await self._set_status(row_id, "unknown")
@@ -466,11 +485,18 @@ class RiskEngine:
                 )
                 await self._persist(request.cycle_id, "exit", decision, now)
                 return OrderResult(decision)
-            decision = check_exit(request, held, mode_matches=self._mode == self._broker.mode())
+            mode_matches = self._mode == self._broker.mode()
+            decision = check_exit(request, held, mode_matches=mode_matches)
             await self._persist(request.cycle_id, "exit", decision, now)
             if decision.qty is None:
                 log.warning("risk.exit_rejected", symbol=request.symbol, reason=decision.reasons[0])
-                return OrderResult(decision)
+                # A mode mismatch is a failure, not dust: say nothing about the holding then.
+                position = next((p for p in held if p.symbol == request.symbol), None)
+                if not mode_matches:
+                    return OrderResult(decision)
+                if position is None:
+                    return OrderResult(decision, no_position=True)
+                return OrderResult(decision, dust=True, min_qty=position.min_qty)
             async with self._sessions() as session:
                 row = await repo.insert_order(
                     session,
@@ -487,10 +513,48 @@ class RiskEngine:
                     status="pending",
                     now=now,
                     exit_reason=request.reason,
+                    external=request.external,
                 )
             return await self._submit(
                 row.id, decision, deadline, lambda: self._broker.close_position(request.symbol)
             )
+
+    async def cancel_open_entries(self, exclude: Collection[int] = ()) -> CancelResult:
+        """Cancel unsettled, non-final entry (buy) orders at the broker, under the exit lock
+        with its own budget. `exclude` skips rows whose cancel was already accepted. Rows
+        without a broker id are `unresolved`. Never touches sells or order rows."""
+        async with self._exit_lock:
+            deadline = self._monotonic() + self._io_timeout
+            async with self._sessions() as session:
+                rows = await repo.open_entry_orders(session)
+            requested: list[int] = []
+            failed: list[int] = []
+            unresolved: list[int] = []
+            for row in rows:
+                if row.id in exclude or row.status in FINAL:
+                    continue
+                if row.broker_order_id is None:
+                    unresolved.append(row.id)
+                    continue
+                try:
+                    await self._within(
+                        deadline, partial(self._broker.cancel_order, row.broker_order_id)
+                    )
+                except Exception:
+                    log.exception("risk.cancel_failed", order_id=row.id, symbol=row.symbol)
+                    failed.append(row.id)
+                else:
+                    log.info("risk.entry_cancel_requested", order_id=row.id, symbol=row.symbol)
+                    requested.append(row.id)
+            return CancelResult(
+                requested=tuple(requested), failed=tuple(failed), unresolved=tuple(unresolved)
+            )
+
+    async def sellable_positions(self) -> tuple[HeldPosition, ...]:
+        """Non-dust broker holdings (unpriced) with their own budget; lock-free; raises on
+        failure."""
+        deadline = self._monotonic() + self._io_timeout
+        return tuple(p for p in await self._broker_positions(deadline) if not p.is_dust)
 
     # --- equity snapshots ------------------------------------------------------------
 

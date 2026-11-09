@@ -344,3 +344,19 @@ async def test_broker_fill_id_is_unique(session: AsyncSession) -> None:
         )
     with pytest.raises(IntegrityError):
         await session.commit()
+
+
+def test_0005_marks_existing_orders_not_external(db_url: str) -> None:
+    downgrade(db_url, "0004")
+    _run_sql(db_url, _ORDER_0003.format(id=1, broker="'b-1'", status="filled"))
+    upgrade(db_url)
+
+    async def external() -> list[bool]:
+        engine = make_engine(db_url)
+        try:
+            async with make_sessionmaker(engine)() as s:
+                return [o.external for o in await s.scalars(select(m.Order))]
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(external()) == [False]

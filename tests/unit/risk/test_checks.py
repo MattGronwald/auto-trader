@@ -236,12 +236,17 @@ def test_exit_approved_for_held_position_with_broker_qty() -> None:
         ([held(BTC)], False, "mode"),
         ([], True, "no position"),
         ([held(ETH)], True, "no position"),
-        ([held(BTC, qty="0.0005")], True, "no position"),  # dust
+        ([held(BTC, qty="0.0005")], True, "dust only in BTC/USD"),
     ],
 )
 def test_exit_rejections(positions: list[HeldPosition], mode_matches: bool, reason: str) -> None:
     d = check_exit(ExitRequest(symbol=BTC, reason="kill"), positions, mode_matches=mode_matches)
     assert not d.approved and reason in d.reasons[0]
+
+
+def test_an_approved_entry_records_the_atr_it_was_sized_with() -> None:
+    d = run()
+    assert d.approved and d.adjusted["atr"] == "2"
 
 
 # --- checks 7-11 -----------------------------------------------------------------------

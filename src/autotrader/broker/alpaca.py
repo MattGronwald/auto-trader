@@ -29,6 +29,7 @@ from autotrader.broker.base import (
     Fill,
     Mode,
     OrderAck,
+    OrderMethodsUnavailable,
     OrderStatus,
     Position,
 )
@@ -132,6 +133,9 @@ class AlpacaBroker:
     def fee_schedule(self) -> FeeSchedule:
         return self._fees
 
+    def can_place_orders(self) -> bool:
+        return False  # becomes True with the WP 1.6 order methods
+
     def mode(self) -> Mode:
         return "paper" if self._paper else "live"
 
@@ -179,7 +183,7 @@ def _parsing(what: str) -> Iterator[None]:
 
 
 def _not_yet(method: str) -> NoReturn:
-    raise BrokerError(f"AlpacaBroker.{method} is not implemented until WP 1.6")
+    raise OrderMethodsUnavailable(f"AlpacaBroker.{method} is not implemented until WP 1.6")
 
 
 def _make_client(settings: Settings, paper: bool) -> RawTradingClient:

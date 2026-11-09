@@ -129,6 +129,8 @@ Each of these logs an error, rolls back the update, leaves the order unsettled, 
 - `sell_without_position`: a sell fill with no open journal position for its symbol, when no earlier unsettled order on that symbol exists (otherwise the update is deferred, section 4.3);
 - `oversell`: a sell beyond the open qty plus the available `symbol_dust`, established only once every earlier order on the symbol is settled (otherwise deferred, section 4.3).
 
+**2026-10-29 (WP 1.5c final review):** since 1.5c the `ledger.sync` loop re-books every unsettled row every 2 s, so a persisting anomaly would write a `LedgerAnomaly` and an error log per pass. Now only the first occurrence per order row, kind and detail logs `ledger.anomaly` (error) and publishes the event. A repeat re-asserts `paused = true` without an event: `ledger.anomaly_repaused` (warning) when the pause had been lifted, otherwise `ledger.anomaly_persists` (debug). A different kind or detail on the same row is a new anomaly.
+
 ### 4.6 Cash check: `Ledger.cash_guard()` and `Ledger.check_cash(account, guard)` (decision 1)
 
 - Baseline in `control_state["cash_check"] = {cash, fill_watermark, ts}` (`fill_watermark` = max `fills.id` at the baseline).

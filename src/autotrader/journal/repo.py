@@ -1,7 +1,7 @@
 """Journal access. Functions take an `AsyncSession` and commit their own unit of work,
-except the cycle writes (`insert_cycle`, `transition_cycle`) and `append_event(...,
-commit=False)`: those run inside `EventBus.publish_tx`, which commits the row together with
-its event (WP 1.4, D15).
+except the cycle writes (`insert_cycle`, `transition_cycle`), the exit latch (`latch_exit`,
+WP 1.5c) and `append_event(..., commit=False)`: those run inside `EventBus.publish_tx`, which
+commits the row together with its event (WP 1.4, D15).
 
 Phase 0 needs live here (strategies, bars, events, control state), plus the read-only
 queries the Scanner (WP 1.2) runs on cycles and positions; WP 1.3 adds the risk-decision,
@@ -10,7 +10,7 @@ work package that writes them. There is deliberately no
 update/delete for events and no delete anywhere (SPEC §4.8: nothing is deleted).
 """
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -30,10 +30,12 @@ from autotrader.journal.models import (
     Cycle,
     EquitySnapshot,
     Event,
+    Fill,
     Order,
     Position,
     RiskDecision,
     Strategy,
+    SymbolDust,
 )
 
 # SPEC §4.3: a cycle in any other state is still open.
@@ -202,6 +204,60 @@ async def open_position_symbols(session: AsyncSession) -> set[str]:
     return set(rows)
 
 
+# --- positions: exit state (WP 1.5c) -------------------------------------------------
+
+
+async def open_positions(session: AsyncSession) -> list[Position]:
+    rows = await session.scalars(
+        select(Position)
+        .where(Position.closed_at.is_(None))
+        .order_by(Position.id)
+        .execution_options(populate_existing=True)
+    )
+    return list(rows)
+
+
+async def set_time_limit(session: AsyncSession, position_id: int, at: datetime) -> None:
+    """Write the time limit once: an existing value is never overwritten."""
+    await session.execute(
+        update(Position)
+        .where(Position.id == position_id, Position.time_limit_at.is_(None))
+        .values(time_limit_at=at)
+    )
+    await session.commit()
+
+
+async def update_trailing(
+    session: AsyncSession, position_id: int, *, trail_high: Decimal, trail_stop: Decimal
+) -> None:
+    """Persist the trailing state of an open position; touches only these two columns."""
+    await session.execute(
+        update(Position)
+        .where(Position.id == position_id, Position.closed_at.is_(None))
+        .values(trail_high=trail_high, trail_stop=trail_stop)
+    )
+    await session.commit()
+
+
+async def latch_exit(session: AsyncSession, position_id: int, *, reason: str, at: datetime) -> bool:
+    """Latch an exit trigger on an open, unlatched position. Never commits (it runs inside
+    `EventBus.publish_tx` with its `ExitTriggered` event); False when the guard matched
+    nothing."""
+    result = typing_cast(
+        CursorResult[Any],
+        await session.execute(
+            update(Position)
+            .where(
+                Position.id == position_id,
+                Position.exit_trigger.is_(None),
+                Position.closed_at.is_(None),
+            )
+            .values(exit_trigger=reason, exit_triggered_at=at)
+        ),
+    )
+    return result.rowcount == 1
+
+
 # --- cycles (WP 1.4) -----------------------------------------------------------------
 # The two writes below never commit: they run inside `EventBus.publish_tx`, which
 # commits the cycle row together with its `CycleTransitioned` event (D15).
@@ -338,6 +394,7 @@ async def insert_order(
     status: str,
     now: datetime,
     exit_reason: str | None = None,
+    external: bool = False,
 ) -> Order:
     row = Order(
         cycle_id=cycle_id,
@@ -354,6 +411,7 @@ async def insert_order(
         submitted_at=now,
         updated_at=now,
         exit_reason=exit_reason,
+        external=external,
     )
     session.add(row)
     await session.commit()
@@ -399,6 +457,96 @@ async def unsettled_orders(session: AsyncSession) -> list[Order]:
         .execution_options(populate_existing=True)
     )
     return list(rows)
+
+
+async def orders_by_id(session: AsyncSession, ids: Collection[int]) -> list[Order]:
+    """The named order rows, settled or not, in id order (re-read, never cached)."""
+    rows = await session.scalars(
+        select(Order)
+        .where(Order.id.in_(list(ids)))
+        .order_by(Order.id)
+        .execution_options(populate_existing=True)
+    )
+    return list(rows)
+
+
+# --- flatten / external sales (WP 1.5c) ----------------------------------------------
+
+
+async def order_fill_generation(session: AsyncSession) -> tuple[int, int]:
+    """`(max(orders.id), max(fills.id))`, 0 for none: any new order or booked fill changes
+    it (the one definition of "generation", spec 4.6 cash guard and 4.7 flat check)."""
+    last_order = await session.scalar(select(func.max(Order.id)))
+    last_fill = await session.scalar(select(func.max(Fill.id)))
+    return (last_order or 0, last_fill or 0)
+
+
+async def symbol_dust_balances(session: AsyncSession) -> dict[str, Decimal]:
+    """The written-off dust per symbol, balances > 0 only (compared in Python: money
+    columns are text on SQLite)."""
+    rows = await session.scalars(select(SymbolDust).order_by(SymbolDust.symbol))
+    return {row.symbol: row.qty for row in rows if row.qty > 0}
+
+
+async def external_sales_since(session: AsyncSession, since: datetime) -> list[dict[str, Any]]:
+    """Settled `external` orders with `settled_at >= since`, in id order, each with the
+    figures of its `ExternalHoldingSold` event (a zero-fill external order has none and is
+    left out). Decimal values are strings, as in the event payload."""
+    orders = list(
+        await session.scalars(
+            select(Order.id)
+            .where(Order.external.is_(True), Order.settled_at.is_not(None))
+            .where(Order.settled_at >= since)
+            .order_by(Order.id)
+        )
+    )
+    if not orders:
+        return []
+    payloads = {
+        p["order_row_id"]: p
+        for p in await session.scalars(
+            select(Event.payload).where(Event.type == "ExternalHoldingSold").order_by(Event.id)
+        )
+    }
+    return [
+        {
+            "order_row_id": order_id,
+            "symbol": payloads[order_id]["symbol"],
+            "external_qty": str(payloads[order_id]["external_qty"]),
+            "dust_consumed": str(payloads[order_id]["dust_consumed"]),
+            "proceeds_usd": str(payloads[order_id]["proceeds_usd"]),
+        }
+        for order_id in orders
+        if order_id in payloads
+    ]
+
+
+async def last_anomalies(
+    session: AsyncSession, order_ids: Collection[int]
+) -> dict[int, dict[str, Any]]:
+    """The latest `LedgerAnomaly` payload per named order row (rows without one are absent).
+    Bounded in SQL by type and the payload's `order_row_id`, so it reads only the named
+    rows' anomalies, which the ledger writes once per distinct kind and detail, plus once
+    per re-pause after an operator resumed while one persists."""
+    wanted = set(order_ids)
+    if not wanted:
+        return {}
+    latest: dict[int, dict[str, Any]] = {}
+    for payload in await session.scalars(
+        select(Event.payload)
+        .where(
+            Event.type == "LedgerAnomaly",
+            Event.payload["order_row_id"].as_integer().in_(wanted),
+        )
+        .order_by(Event.id)
+    ):
+        latest[payload["order_row_id"]] = payload
+    return latest
+
+
+async def last_anomaly_kinds(session: AsyncSession, order_ids: Collection[int]) -> dict[int, str]:
+    """The latest `LedgerAnomaly.kind` per named order row (rows without one are absent)."""
+    return {row: p["kind"] for row, p in (await last_anomalies(session, order_ids)).items()}
 
 
 async def count_entry_orders(session: AsyncSession, since: datetime, *, inclusive: bool) -> int:

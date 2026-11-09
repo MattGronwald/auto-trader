@@ -1,7 +1,7 @@
 """AlpacaBroker against a fake client returning recorded raw API payloads (no network)."""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from typing import Any
 
@@ -10,7 +10,14 @@ import requests
 from alpaca.common.exceptions import APIError
 
 from autotrader.broker.alpaca import FEE_TIERS, AlpacaBroker
-from autotrader.broker.base import AssetRules, Broker, BrokerError, BrokerOrder, FeeSchedule
+from autotrader.broker.base import (
+    AssetRules,
+    Broker,
+    BrokerError,
+    BrokerOrder,
+    FeeSchedule,
+    OrderMethodsUnavailable,
+)
 from autotrader.core.config import Settings
 
 # Shapes recorded from the paper API on 2026-10-11 (raw_data=True: decimals are strings).
@@ -298,3 +305,16 @@ async def test_order_fills_is_not_implemented_until_wp_1_6() -> None:
     broker = await connect(FakeClient())
     with pytest.raises(BrokerError, match=r"order_fills is not implemented until WP 1\.6"):
         await broker.order_fills("any")
+
+
+async def test_order_methods_raise_the_typed_unavailable_error() -> None:
+    broker = await connect(FakeClient())
+    assert broker.can_place_orders() is False
+    calls: list[Callable[[], Awaitable[object]]] = [  # lazy: no un-awaited coroutine on failure
+        lambda: broker.close_position("BTC/USD"),
+        lambda: broker.cancel_order("x"),
+        lambda: broker.get_order("x"),
+    ]
+    for call in calls:
+        with pytest.raises(OrderMethodsUnavailable, match=r"is not implemented until WP 1\.6"):
+            await call()

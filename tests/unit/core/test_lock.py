@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from autotrader.core.lock import JournalLockError, acquire, canonical_journal
+from autotrader.core.lock import JournalLockError, acquire, canonical_journal, core_running
 
 HOLD = """
 import sys
@@ -111,3 +111,17 @@ def test_symlinked_journal_contends_with_the_real_path(tmp_path: Path, kind: str
 def test_non_file_journals_are_refused(url: str) -> None:
     with pytest.raises(JournalLockError, match="needs a file journal"):
         canonical_journal(url)
+
+
+def test_core_running_probes_without_writing(tmp_path: Path) -> None:
+    url = f"sqlite+aiosqlite:///{tmp_path / 'j.db'}"
+    assert core_running(url) is False
+    held = acquire(url, wait_s=0)
+    try:
+        before = held.lock_path.read_text()
+        assert core_running(url) is True
+        assert held.lock_path.read_text() == before
+    finally:
+        held.release()
+    assert core_running(url) is False
+    assert core_running("sqlite+aiosqlite:///:memory:") is False
