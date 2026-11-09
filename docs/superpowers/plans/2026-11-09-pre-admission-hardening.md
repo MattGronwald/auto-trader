@@ -177,7 +177,7 @@ Engine changes:
 
 **Interfaces:**
 - Consumes: Task 2 `check_entry(..., faults=...)`; Task 3 `snapshot_interval_s`.
-- Produces: `RiskEngine.cash_fault: str | None` (initialised `"not yet reconciled"`), `RiskEngine.set_cash_fault(self, reason: str, *, sticky: bool = False) -> None`, `RiskEngine.cash_reconciled(self) -> None` (no-op while sticky), `RiskEngine.health_faults(self) -> tuple[str, ...]` (order: `"equity snapshot overdue"`, `"cash reconciliation failed"`; overdue when `last_snapshot_at is None` or `self._monotonic() - last_snapshot_at > 2 * snapshot_interval_s`).
+- Produces: `RiskEngine.cash_fault: str | None` (initialised `"not yet reconciled"`), `RiskEngine.set_cash_fault(self, reason: str, *, sticky: bool = False) -> None`, `RiskEngine.cash_reconciled(self) -> None` (no-op while sticky; stickiness only ever goes from false to true, so a later plain `set_cash_fault` never downgrades a sticky fault), `RiskEngine.health_faults(self) -> tuple[str, ...]` (order: `"equity snapshot overdue"`, `"cash reconciliation failed"`; overdue when `last_snapshot_at is None` or `self._monotonic() - last_snapshot_at > 2 * snapshot_interval_s`).
 - Produces (tests): `make_engine_(..., healthy: bool = True)`: when true, sets `engine.last_snapshot_at` to the engine's monotonic reading at construction (`monotonic()` if given, else `time.monotonic()`) and calls `engine.cash_reconciled()`. Pass `monotonic=time.monotonic if monotonic is None else monotonic` explicitly (the old `**({} if ...)` splat fails mypy `arg-type` once the constructor has a `float` keyword). Tests about `last_snapshot_at` itself (`test_last_snapshot_at_tracks_committed_writes`, Task 3's `test_peak_snapshot_in_check_does_not_refresh_last_snapshot_at`) pass `healthy=False`.
 
 `_gather_entry` returns the faults with its state (computed at the start of the gather, before the
@@ -190,6 +190,7 @@ order sync); `check()` passes them as `faults=`. Logging on transitions only: `r
   - `test_loop_snapshot_older_than_two_intervals_rejects`: `Mono`; `snapshot_equity()` at t=0; t=120 -> approved after `cash_reconciled()`; t=121 -> rejected `equity snapshot overdue`.
   - `test_startup_cash_fault_rejects_until_reconciled`: loop snapshot fresh, fault untouched -> `cash reconciliation failed`; `cash_reconciled()` -> approved.
   - `test_sticky_cash_fault_survives_reconciliation`: `set_cash_fault("CommitUncertain", sticky=True)`; `cash_reconciled()` -> still rejected; a plain `set_cash_fault("x")` then `cash_reconciled()` on a new engine -> approved.
+  - `test_plain_fault_never_downgrades_a_sticky_one`: `set_cash_fault("a", sticky=True)`, then `set_cash_fault("b")`, then `cash_reconciled()` -> still rejected `cash reconciliation failed`.
   - `test_restart_with_fresh_journal_baseline_still_waits_for_loop_and_cash` (Review Focus 3): seeded baseline, new engine -> rejected `equity snapshot overdue`; after `snapshot_equity()` -> `cash reconciliation failed`; after `cash_reconciled()` -> approved.
   - `test_fault_transitions_are_logged_once`: two `set_cash_fault` calls -> one `risk.cash_fault_set`; `cash_reconciled()` twice -> one `risk.cash_fault_cleared`.
 - [ ] **Step 2:** Run them. Expected: FAIL (`unexpected keyword 'healthy'` / attribute errors).
@@ -235,9 +236,11 @@ If non-empty: `await self._set_status(row.id, "not_submitted")`, `log.warning("r
   - `_CashChecker`: `async def cash_guard(self) -> CashGuard`, `async def check_cash(self, account: Account, guard: CashGuard) -> CashResult`
 
 Step order and outcomes (spec 5.1-5.2):
-1. `guard = await ledger.cash_guard()`; on `Exception`: log `ledger.cash_check_failed` (`stage="guard"`, exc_info), `set_cash_fault("guard: <ExcType>")`, `guard = None`, continue.
-2. `account = await risk.snapshot_equity()`; `TimeoutError` -> `risk.snapshot_failed` `timeout=True`; other `Exception` -> `risk.snapshot_failed` with exc_info; both `set_cash_fault("snapshot: <ExcType>")` and return. Success -> `risk.snapshot_written`.
-3. If `guard is None`: return. `result = await ledger.check_cash(account, guard)`; `CommitUncertain` -> `ledger.cash_check_failed` (`stage="check"`), `set_cash_fault("check: CommitUncertain", sticky=True)`; other `Exception` -> same log, `set_cash_fault("check: <ExcType>")`; result in `("baseline", "ok", "discrepancy")` -> `cash_reconciled()`; `"skipped"` -> nothing.
+Every stage classifies its exception the same way (spec 5.2, any stage):
+`set_cash_fault(f"<stage>: {type(e).__name__}", sticky=isinstance(e, CommitUncertain))`.
+1. `guard = await ledger.cash_guard()`; on `Exception`: log `ledger.cash_check_failed` (`stage="guard"`, exc_info), set the fault as above, `guard = None`, continue (the snapshot is still taken).
+2. `account = await risk.snapshot_equity()`; `TimeoutError` -> `risk.snapshot_failed` `timeout=True`; other `Exception` -> `risk.snapshot_failed` with exc_info; both set the fault as above (stage `snapshot`) and return. Success -> `risk.snapshot_written`.
+3. If `guard is None`: return. `result = await ledger.check_cash(account, guard)`; on `Exception` -> `ledger.cash_check_failed` (`stage="check"`) and the fault as above; result in `("baseline", "ok", "discrepancy")` -> `cash_reconciled()`; `"skipped"` -> nothing.
 No exception leaves the step (`CancelledError` is not caught). `run_core` passes `snapshot_interval_s=snapshot_s` to `RiskEngine` and `partial(_snapshot_step, risk, ledger)` to the loop.
 
 - [ ] **Step 1: Failing tests** with fakes for both protocols (record calls; no DB), each asserting fault calls and log events:
@@ -245,8 +248,8 @@ No exception leaves the step (`CancelledError` is not caught). `run_core` passes
   - `test_skipped_cash_check_leaves_the_fault_unchanged`.
   - `test_failed_guard_still_takes_the_snapshot_and_skips_the_check`.
   - `test_snapshot_failure_after_commit_sets_the_fault_and_skips_the_check` (fake raises `ConnectionError` from `snapshot_equity`).
-  - `test_commit_uncertain_in_check_cash_sets_a_sticky_fault`.
-  - `test_plain_check_cash_error_sets_a_fault`.
+  - `test_commit_uncertain_in_any_stage_sets_a_sticky_fault`, parametrized over `guard`, `snapshot`, `check` (the fake raises `CommitUncertain` in that stage): the fault is sticky; a following step whose stages all succeed and whose check returns `ok` leaves the fault set (the fake engine records `cash_reconciled()` as a no-op while sticky, or use a real `RiskEngine` with fake broker/ledger); only a new engine starts clear of it.
+  - `test_plain_error_in_any_stage_sets_a_recoverable_fault`, parametrized over the three stages: a plain `ConnectionError` sets a non-sticky fault; a following `ok` step clears it.
   - Replace `test_snapshot_step_logs_failures_and_successes` with a version over the new signature (same three log outcomes).
   - Fixtures for the two integration tests: a sync fixture that runs `upgrade(url)` (it calls `asyncio.run` and cannot run inside an async test) and yields the URL; reuse the engine builders by `import tests.unit.risk.test_engine as te` (`te.make_engine_`, `te.FakeView`, `te.PROFILE`, `te.five`, `te.RULES`, `te.FEES`) rather than copying them.
   - `test_failed_discrepancy_commit_keeps_entries_closed` (real `RiskEngine` + `Ledger` + SimBroker over `hooked_sessionmaker` from `tests/dbhooks.py`; spec 11 cases 10 and 14): step 1 -> `baseline`, fault cleared; change SimBroker cash by -19.84; arm `hook.fail_before = 1` only after the snapshot committed (wrap the ledger's `check_cash` in the test so it arms the hook before delegating; arming earlier fails the snapshot's own commit and yields a plain fault); advance the engine and ledger clocks by 60 s before each step (`equity_snapshots.ts` is unique); step 2 -> `check_cash` raises `CommitUncertain` (verify finds nothing) -> `paused` unset in the journal, `engine.cash_fault` set and sticky, `check()` rejects `cash reconciliation failed`; step 3 (hook clear) -> `discrepancy` commits the pause, the fault stays (sticky). Separate test `test_discrepancy_clears_a_plain_fault_and_the_pause_rejects`: plain fault set, step -> `discrepancy` -> fault cleared, `check()` rejected by the control gate (pause).
