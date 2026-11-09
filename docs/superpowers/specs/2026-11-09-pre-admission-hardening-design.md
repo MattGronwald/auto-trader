@@ -4,6 +4,14 @@ Date: 2026-11-09. Status: decisions approved by the owner as PLAN D19 (PR #29, r
 Codex review). This written spec is in review. Choices made here that D19 does not fix are marked
 **(builder call)**.
 
+Revised 2026-11-09 after the first Codex review (PR #30), owner go:
+- every snapshot that can become a baseline is stamped with the time the account read returned,
+  never the time before the request, so a read crossing 00:00 cannot be backdated into the
+  pre-boundary window (3.1);
+- the health conditions are re-checked right before the broker submit, next to the existing
+  control-gate re-check; a late fault marks the order row `not_submitted` and no broker call
+  happens (6.1).
+
 ## 1. Scope
 
 1.5d is split into three PRs (PLAN 1.5 row, 2026-11-09). 1.5d-1 makes `check()` safe to call from
@@ -24,7 +32,9 @@ calls no `check()` after this WP; everything here is exercised by tests and beco
 ## 2. Entry gate overview
 
 After this WP, `check()` rejects an entry (persisted `RiskDecision`, no order row) when any of these
-hold, in addition to today's checks:
+hold at the gather, in addition to today's checks. A health condition that turns bad after the
+gather is caught by the pre-submit re-check (6.1), which leaves an order row marked
+`not_submitted` instead:
 
 | Reason text | Condition | Cleared by |
 |---|---|---|
@@ -55,6 +65,25 @@ day_start_equity` becomes `Dec | None`. `check_entry` check 3: if it is `None`, 
 Consequences the owner accepted (PR #29): the first day of operation has no entries; a UTC day
 whose boundary the process did not observe (down, asleep, or two failed snapshots right before
 00:00) has no entries. Later snapshots never clear it.
+
+### 3.1 Snapshot timestamps
+
+A window on timestamps only proves a pre-boundary observation if the timestamp describes the
+observation. Today `snapshot_equity()` and `check()` read the clock *before* awaiting
+`get_account()` and stamp the row with that earlier value, so a read started at 23:59:59 that
+returns at 00:00:01 is stored as 23:59:59 and would pass the window (reproduced in the PR #30
+review).
+
+Contract after this WP: every `equity_snapshots` row is stamped with the engine clock read
+**after `get_account()` returned** (receipt time), for every writer: the loop's
+`snapshot_equity()`, its position-read error path, and the peak snapshot `check()` writes. The
+broker's account response has no observation time to use instead. Receipt time is never earlier
+than the observation, so a row in the window was observed before the boundary; a slow read near
+00:00 simply doesn't qualify (conservative). The peak snapshot is still written right after the
+account read, before anything else in the gather can fail (D14 PR #13 round 2 (a)). Other uses of
+the gather's `now` (entry counts, the day start, the decision timestamp) are unchanged.
+
+### 3.2 Informational `daily_pnl`
 
 The existing `repo.day_start_equity` (with its first-snapshot-after fallback) stays only for the
 informational `equity_snapshots.daily_pnl` column, which no limit reads; its docstring says so
@@ -172,6 +201,31 @@ The baseline (section 3) stays in check 3 via `day_start_equity is None`, and th
 and booking are useful either way); a gather that raises keeps today's `state unavailable`
 rejection.
 
+### 6.1 Pre-submit re-check
+
+The faults tuple and the baseline are read during the gather; the cash step runs concurrently
+without the entry lock, and `check()` then awaits the decision write, the order-row insert and the
+control-gate re-check before it submits. A fault can appear in that window: the cash step sets
+`cash_fault` (sticky after a `CommitUncertain` that may have left no pause), or a snapshot 119 s
+old at the gather is 121 s old at the submit.
+
+Right after the existing pre-submit `gate.status()` re-check and before the broker call, `check()`
+re-evaluates, with the clocks read at that moment:
+1. snapshot freshness (section 4);
+2. `cash_fault` (section 5.2);
+3. **(builder call)** the trading day: if `day_start(now)` differs from the gather's, the daily-loss
+   check ran against the previous day's baseline, so the entry is not sent.
+
+If any fails, the order row is set to `not_submitted`, `risk.entry_not_submitted` is logged with
+the reasons (the same reason strings as section 2, and `trading day changed`), and `check()`
+returns `OrderResult(decision, row.id, "not_submitted")`: the same outcome and audit trail as
+today's late gate refusal (the approved decision stays persisted, the row records that nothing
+was sent). No broker call happens. Nothing here recalls a request already in flight. Exits are not
+affected.
+
+The re-check is synchronous engine state plus a clock read, so it adds no await between it and the
+submit.
+
 ## 7. Unsettled-sell guard (D19 item 3)
 
 New repo function `unsettled_sell_symbols(session) -> set[str]`: symbols of order rows with
@@ -281,6 +335,11 @@ Baseline:
 4. Day N rejected for the baseline; day N+1 with a fresh pre-start snapshot: allowed.
 5. Exits and cancels still work on a baseline-unavailable day.
 
+Baseline timestamps:
+5a. Injected clock: the only snapshot read starts at 23:59:59 and `get_account()` returns at
+    00:00:01 (loop path, and again for the peak snapshot in `check()`): the row is stamped 00:00:01
+    and the new day is baseline-unavailable.
+
 Snapshot freshness:
 6. No loop snapshot yet in the process: rejects `equity snapshot overdue`.
 7. Last loop snapshot 121 s old (fake monotonic): rejects; a peak snapshot written by `check()`
@@ -299,6 +358,15 @@ Cash fault:
 12. A later fresh snapshot with a `skipped` cash check does not clear the fault.
 13. Fault set by a plain exception, then an `ok` check: entries allowed again.
 14. `discrepancy`: fault cleared, manual pause set, entries rejected by the pause.
+
+Pre-submit re-check:
+14a. A barrier after a healthy gather and decision sets the cash fault (plain and sticky) before
+     the submit: row `not_submitted`, no broker call, reason `cash reconciliation failed`.
+14b. The fake monotonic clock crosses the 120 s snapshot limit during the gather: row
+     `not_submitted`, no broker call.
+14c. The engine clock crosses 00:00 between the gather and the submit: row `not_submitted`
+     (`trading day changed`), no broker call.
+14d. In each of 14a-14c an `exit()` issued meanwhile still goes through.
 
 Unsettled sell:
 15. External sell on BTC unsettled: BTC entry rejected `unsettled sell on BTC/USD`; an ETH entry
