@@ -1,6 +1,7 @@
 """RiskEngine on SimBroker, a migrated SQLite journal and the real ControlGate."""
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Any, NoReturn, TypeVar
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import autotrader.risk.engine as engine_module
@@ -38,6 +39,7 @@ from autotrader.core.kill import (
     write_kill_file,
 )
 from autotrader.core.ledger import Ledger
+from autotrader.core.tradingday import day_start, next_day_start
 from autotrader.core.types import Bar, Quote
 from autotrader.journal import models as m
 from autotrader.journal import repo
@@ -54,6 +56,7 @@ from autotrader.risk.types import (
     RiskDecision,
     SyncResult,
 )
+from tests.health import seed_baseline
 
 REPO = Path(__file__).resolve().parents[3]
 T = TypeVar("T")
@@ -140,6 +143,16 @@ async def sessions(db_url: str) -> AsyncIterator[async_sessionmaker[AsyncSession
     await engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+async def _baseline(
+    request: pytest.FixtureRequest, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """A trusted day-start baseline (1000, 60 s before NOW's UTC day start) unless the test
+    builds its own equity snapshots (`no_baseline`)."""
+    if request.node.get_closest_marker("no_baseline") is None:
+        await seed_baseline(sessions, NOW)
+
+
 @pytest.fixture
 def sim() -> SimBroker:
     s = SimBroker(
@@ -190,7 +203,7 @@ def make_engine_(
         trading_day_tz=tz,
         clock=clock or Clock(NOW),
         io_timeout_s=io_timeout_s,
-        **({} if monotonic is None else {"monotonic": monotonic}),
+        monotonic=time.monotonic if monotonic is None else monotonic,
     )
 
 
@@ -248,10 +261,13 @@ async def test_approved_entry_is_persisted_and_submitted(
     )
 
 
+@pytest.mark.no_baseline
 async def test_first_check_snapshots_equity_as_baseline(
     sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
 ) -> None:
-    await make_engine_(sim, sessions, gate).check(intent(cycle_id))
+    """The first-ever snapshot is written, but a post-start row is no daily-loss baseline."""
+    result = await make_engine_(sim, sessions, gate).check(intent(cycle_id))
+    assert result.decision.reasons == ("daily-loss baseline unavailable",)
     async with sessions() as s:
         snap = await repo.latest_snapshot(s)
     assert snap is not None and (snap.equity, snap.hwm, snap.daily_pnl) == (
@@ -353,8 +369,8 @@ async def test_equity_peak_seen_by_a_rejected_check_still_bounds_drawdown(
         assert spiked.decision.reasons == ("state unavailable: ConnectionError",)
         broker.positions_down = False
     rows = await snapshots(sessions)
-    assert [s.hwm for s in rows] == [D("1000"), D("1200")]
-    assert rows[1].exposure is None  # an account observation: exposure unknown
+    assert [s.hwm for s in rows] == [D("1000"), D("1000"), D("1200")]  # seed, loop, peak
+    assert rows[2].exposure is None  # an account observation: exposure unknown
     broker.equity = D("1000")  # back down before the next periodic snapshot
     clock.now = NOW + timedelta(seconds=20)
     if restart:
@@ -410,6 +426,7 @@ async def test_peak_committed_by_a_concurrent_snapshot_bounds_the_parked_check(
     assert await orders(sessions) == []
 
 
+@pytest.mark.no_baseline
 async def test_snapshot_records_the_peak_even_when_positions_fail(
     sessions: async_sessionmaker[AsyncSession], gate: ControlGate
 ) -> None:
@@ -780,6 +797,7 @@ async def test_exit_does_not_depend_on_unrelated_positions(
     assert (row.symbol, row.side) == (BTC, "sell")
 
 
+@pytest.mark.no_baseline
 async def test_snapshot_tracks_hwm_and_daily_pnl(
     sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
 ) -> None:
@@ -1791,3 +1809,198 @@ async def test_sellable_positions_leave_out_dust(
     await _held_btc(sim)
     (held,) = await engine.sellable_positions()
     assert (held.symbol, held.qty, held.market_value) == (BTC, D("1"), None)
+
+
+# --- trusted daily-loss baseline, unsettled sells, receipt-time stamps (WP 1.5d-1) ------
+
+DAY_START = day_start(NOW, "UTC")
+BASELINE_UNAVAILABLE = ("daily-loss baseline unavailable",)
+
+
+async def _snapshot(
+    sessions: async_sessionmaker[AsyncSession], ts: datetime, equity: str = "1000"
+) -> None:
+    async with sessions() as s:
+        await repo.insert_equity_snapshot(
+            s,
+            ts=ts,
+            equity=D(equity),
+            cash=D(equity),
+            exposure=D(0),
+            hwm=D(equity),
+            daily_pnl=D(0),
+        )
+
+
+@pytest.mark.no_baseline
+async def test_gapped_day_boundary_rejects_baseline_unavailable(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    await _snapshot(sessions, DAY_START - timedelta(hours=3), "1000")  # stale pre-start
+    await _snapshot(sessions, DAY_START + timedelta(hours=1), "1100")  # first post-start
+    broker = _sim(EquityBroker)
+    assert isinstance(broker, EquityBroker)
+    broker.equity = D("1080")
+    result = await make_engine_(broker, sessions, gate).check(intent(cycle_id))
+    assert result.decision.reasons == BASELINE_UNAVAILABLE
+    assert await orders(sessions) == []
+
+
+@pytest.mark.no_baseline
+async def test_no_pre_start_snapshot_rejects_even_with_later_snapshots(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    for minutes in range(1, 6):
+        await _snapshot(sessions, DAY_START + timedelta(minutes=minutes))
+    result = await make_engine_(sim, sessions, gate).check(intent(cycle_id))
+    assert result.decision.reasons == BASELINE_UNAVAILABLE
+    assert await orders(sessions) == []
+
+
+@pytest.mark.no_baseline
+@pytest.mark.parametrize(("minute", "approved"), [(59, True), (57, False)])
+async def test_berlin_baseline_window_is_relative_to_the_local_day_start(
+    minute: int,
+    approved: bool,
+    sim: SimBroker,
+    sessions: async_sessionmaker[AsyncSession],
+    gate: ControlGate,
+    cycle_id: int,
+) -> None:
+    assert day_start(NOW, "Europe/Berlin") == datetime(2026, 10, 8, 22, 0, tzinfo=UTC)
+    await _snapshot(sessions, datetime(2026, 10, 8, 21, minute, tzinfo=UTC))
+    engine = make_engine_(sim, sessions, gate, tz="Europe/Berlin")
+    result = await engine.check(intent(cycle_id))
+    assert result.decision.approved is approved
+    if not approved:
+        assert result.decision.reasons == BASELINE_UNAVAILABLE
+
+
+@pytest.mark.no_baseline
+async def test_next_day_with_fresh_snapshot_allows_entries(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    clock = Clock(NOW)
+    engine = make_engine_(sim, sessions, gate, clock=clock)
+    day_n = await engine.check(intent(cycle_id))
+    assert day_n.decision.reasons == BASELINE_UNAVAILABLE
+    next_start = next_day_start(NOW, "UTC")
+    await _snapshot(sessions, next_start - timedelta(seconds=30))
+    clock.now = next_start + timedelta(hours=12)
+    day_n1 = await engine.check(intent(await new_cycle(sessions)))
+    assert day_n1.decision.approved and day_n1.status == "new"
+
+
+@pytest.mark.no_baseline
+async def test_decision_never_uses_the_untrusted_day_start_equity(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    await _snapshot(sessions, DAY_START + timedelta(minutes=1), "1000")  # == current equity
+    async with sessions() as s:
+        assert await repo.day_start_equity(s, DAY_START) == D("1000")
+        assert await repo.trusted_day_start_equity(s, DAY_START, timedelta(seconds=120)) is None
+    result = await make_engine_(sim, sessions, gate).check(intent(cycle_id))
+    assert result.decision.reasons == BASELINE_UNAVAILABLE
+    assert await orders(sessions) == []
+
+
+async def test_unsettled_external_sell_blocks_its_symbol(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    # Id-less and pending: the gather's own sync skips it (a final row would be settled).
+    async with sessions() as s:
+        sell = await repo.insert_order(
+            s,
+            cycle_id=None,
+            client_order_id=None,
+            symbol=BTC,
+            mode="paper",
+            type_="market",
+            side="sell",
+            qty=D("1"),
+            limit_price=None,
+            stop_price=None,
+            tp_price=None,
+            status="pending",
+            now=NOW,
+            external=True,
+        )
+    engine = make_engine_(sim, sessions, gate)
+    blocked = await engine.check(intent(cycle_id))
+    assert blocked.decision.reasons == ("unsettled sell on BTC/USD",)
+    async with sessions() as s:
+        await s.execute(update(m.Order).where(m.Order.id == sell.id).values(settled_at=NOW))
+        await s.commit()
+    allowed = await engine.check(intent(await new_cycle(sessions)))
+    assert allowed.decision.approved and allowed.status == "new"
+
+
+class CrossingBroker(SimBroker):
+    """`get_account` moves the engine clock to `to` before it returns (a slow read that
+    crosses the day boundary)."""
+
+    clock: Clock | None = None
+    to: datetime | None = None
+
+    async def get_account(self) -> Account:
+        account = await super().get_account()
+        if self.clock is not None and self.to is not None:
+            self.clock.now = self.to
+        return account
+
+
+@pytest.mark.no_baseline
+@pytest.mark.parametrize("writer", ["loop", "check"])
+async def test_account_read_crossing_midnight_is_stamped_at_receipt(
+    writer: str, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    boundary = next_day_start(NOW, "UTC")
+    broker = _sim(CrossingBroker)
+    assert isinstance(broker, CrossingBroker)
+    clock = Clock(boundary - timedelta(seconds=1))
+    broker.clock, broker.to = clock, boundary + timedelta(seconds=1)
+    engine = make_engine_(broker, sessions, gate, clock=clock)
+    if writer == "loop":
+        await engine.snapshot_equity()
+        clock.now = boundary + timedelta(seconds=1)
+        result = await engine.check(intent(cycle_id))
+    else:  # empty journal: the first check writes the peak snapshot
+        result = await engine.check(intent(cycle_id))
+    ((row),) = await snapshots(sessions)
+    assert row.ts == boundary + timedelta(seconds=1)
+    assert result.decision.reasons == BASELINE_UNAVAILABLE
+
+
+@pytest.mark.no_baseline
+async def test_exits_and_cancels_work_on_a_baseline_unavailable_day(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    broker = _sim(CancelSpy)
+    assert isinstance(broker, CancelSpy)
+    await _held_btc(broker)
+    resting = await broker.submit_order(
+        BrokerOrder(symbol=BTC, side="buy", qty=D("1"), type="limit", limit_price=D("50"))
+    )
+    row_id = await _entry_row(sessions, "new", resting.order_id)
+    engine = make_engine_(broker, sessions, gate)
+    assert (await engine.check(intent(cycle_id))).decision.reasons == BASELINE_UNAVAILABLE
+
+    cancelled = await engine.cancel_open_entries()
+    assert cancelled.requested == (row_id,) and broker.cancelled == [resting.order_id]
+
+    result = await engine.exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert result.decision.approved and result.status == "new"
+
+
+async def test_peak_snapshot_in_check_does_not_refresh_last_snapshot_at(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    broker = _sim(EquityBroker)
+    assert isinstance(broker, EquityBroker)
+    broker.equity = D("1100")  # above the seeded HWM 1000: check() writes a peak row
+    mono = Mono()
+    mono.t = 3.0
+    engine = make_engine_(broker, sessions, gate, monotonic=mono)
+    await engine.check(intent(cycle_id))
+    assert [r.equity for r in await snapshots(sessions)] == [D("1000"), D("1100")]
+    assert engine.last_snapshot_at is None

@@ -19,7 +19,8 @@ WP 1.5a (spec 2026-10-14):
 - Feed ticks, kill/control polling, a DB-free kill-file check and equity snapshots run as
   independent supervised loops (`core/supervise.py`): a hung await in one never delays the
   others (they still share the event loop and the journal). Stalls are logged;
-  `risk.snapshot_overdue` follows the last *committed* snapshot.
+  `risk.snapshot_overdue` follows the last snapshot the loop *committed* (never the peak
+  snapshot a `check()` writes, spec 2026-11-09 section 4).
 - Every exit cause (signal, programmatic stop, startup failure, stream death) goes through
   `ShutdownControl` (`core/shutdown.py`), whose deadline and watchdog are set before any
   async work. Startup races the stop request, so a signal during the broker connect or the
