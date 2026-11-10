@@ -35,11 +35,13 @@ WP 1.5a (spec 2026-10-14):
   backfill is bounded too. Teardown is ordered and bounded: a step still running at the
   deadline is cancelled once and left behind (`core.shutdown_forced`), and abandoned work
   stays in the journal for startup recovery (WP 1.5d). A startup failure or stream death is
-  logged as `core.failed` (with the traceback) before teardown: here once shutdown began, by
-  the CLI for one raised before it (preconditions, journal engine). The stopped stream gets
-  the remaining budget to end on its own, so a bar in flight finishes its journal writes; a
-  stream error, including one that lands as the stop is requested, fails the `stream` step
-  (`core.shutdown_failed`, exit 1).
+  logged as `core.failed` (with the traceback) exactly once, before teardown: here once
+  shutdown began, by the CLI for one raised before it (preconditions, journal engine);
+  whoever logs it sets `ShutdownControl.failure_logged`. A startup that raises only after
+  teardown began fails the `startup` step instead (`core.shutdown_failed`). The stopped
+  stream gets the remaining budget to end on its own, so a bar in flight finishes its journal
+  writes; a stream error, including one that lands as the stop is requested, fails the
+  `stream` step (`core.shutdown_failed`, exit 1).
 """
 
 import asyncio
@@ -241,8 +243,9 @@ async def run_core(
 ) -> int:
     """Run until shutdown is requested. Returns EXIT_CLEAN, or EXIT_FAILED when a teardown
     step was forced at the deadline or failed. Startup failures and stream death are logged
-    (`core.failed`) and re-raised after teardown. The precondition `ValueError`s and a failing
-    journal engine are raised before shutdown begins, unlogged: the CLI logs those."""
+    (`core.failed`, setting `control.failure_logged`) and re-raised after teardown. The
+    precondition `ValueError`s and a failing journal engine are raised before shutdown
+    begins, unlogged: the CLI logs those."""
     if not lock.held:
         raise ValueError("run_core needs the held single-writer journal lock")
     if lock.url != canonical_journal(cfg.database.url)[0]:
@@ -360,6 +363,7 @@ async def run_core(
         failure = e
     if failure is not None:  # logged before teardown, which the watchdog may cut short
         log.error("core.failed", cause=control.cause, exc_info=failure)
+        control.failure_logged = True  # the CLI must not log it again
     flatten_step: Callable[[], Awaitable[None]] | None = None
     if cfg.shutdown.flatten:
         if supervisor is not None:  # the Position Manager runs: its loop works the request

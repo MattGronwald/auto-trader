@@ -18,6 +18,7 @@ from structlog.testing import capture_logs
 import tests.unit.risk.test_engine as te
 from autotrader.broker.base import Account, AssetRules, BrokerError, FeeSchedule, Position
 from autotrader.broker.sim import SimBroker
+from autotrader.core import runtime
 from autotrader.core.bus import CommitUncertain, EventBus
 from autotrader.core.config import AppConfig, Settings, load_config, load_profile
 from autotrader.core.feed import Latest, MarketFeed
@@ -264,6 +265,65 @@ async def test_broker_connect_failure_aborts_startup(cfg: AppConfig, lock: Journ
     with pytest.raises(BrokerError, match="auth failed"):
         await start_core(cfg, lock, control, connect_broker=failing)
     assert control.cause == "startup_failure" and dog.armed
+
+
+@pytest.mark.parametrize("order", ["before_run_core_saw_the_stop", "after_teardown_began"])
+async def test_startup_raising_after_the_stop_won_the_race(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch, order: str
+) -> None:
+    control, _ = make_control()
+    teardown_began = asyncio.Event()
+    real_teardown = runtime._teardown
+
+    async def teardown(*args: Any, **kwargs: Any) -> list[str]:
+        teardown_began.set()
+        return await real_teardown(*args, **kwargs)
+
+    async def backfill(self: Any) -> None:
+        control.begin("signal")  # the stop request wins the race against the startup
+        if order == "after_teardown_began":
+            await teardown_began.wait()
+        raise RuntimeError("backfill broke")
+
+    monkeypatch.setattr("autotrader.core.runtime._teardown", teardown)
+    monkeypatch.setattr("autotrader.core.runtime.MarketFeed.backfill", backfill)
+    with capture_logs() as logs:
+        if order == "before_run_core_saw_the_stop":
+            # The startup task is done (raised) by the time run_core looks: a startup failure.
+            with pytest.raises(RuntimeError, match="backfill broke"):
+                await asyncio.wait_for(start_core(cfg, lock, control), timeout=5)
+        else:
+            # Teardown awaits the unfinished startup as its first step: that step failed.
+            assert await asyncio.wait_for(start_core(cfg, lock, control), timeout=5) == (
+                EXIT_FAILED
+            )
+    events = [e["event"] for e in logs]
+    assert teardown_began.is_set() and control.cause == "signal"
+    if order == "before_run_core_saw_the_stop":
+        (failed,) = [e for e in logs if e["event"] == "core.failed"]
+        assert failed["cause"] == "signal" and str(failed["exc_info"]) == "backfill broke"
+        assert control.failure_logged  # so the CLI (exit 1) does not log it again
+        assert "core.shutdown_step_failed" not in events
+    else:
+        (step,) = [e for e in logs if e["event"] == "core.shutdown_step_failed"]
+        assert step["step"] == "startup" and "backfill broke" in step["error"]
+        assert "core.failed" not in events and not control.failure_logged
+        (shutdown_failed,) = [e for e in logs if e["event"] == "core.shutdown_failed"]
+        assert shutdown_failed["steps"] == ["startup"]
+
+
+async def test_stream_death_does_not_also_log_shutdown_failed(
+    cfg: AppConfig, lock: JournalLock
+) -> None:
+    control, _ = make_control()
+    with capture_logs() as logs, pytest.raises(ConnectionError, match="stream died"):
+        await asyncio.wait_for(
+            start_core(cfg, lock, control, source=StreamingSource(fail_stream=True)), timeout=5
+        )
+    events = [e["event"] for e in logs]
+    assert events.count("core.failed") == 1 and control.failure_logged
+    assert "core.shutdown_failed" not in events and "core.shutdown_step_failed" not in events
+    assert "core.stopped" in events  # the rest of the teardown was clean
 
 
 Stage = Literal["guard", "snapshot", "check"]

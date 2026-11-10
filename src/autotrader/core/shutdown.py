@@ -165,6 +165,8 @@ class ShutdownControl:
         self._monotonic = monotonic
         self.cause: str | None = None
         self.deadline: float | None = None
+        # Set by whoever logs `core.failed` (run_core, or the CLI): it is logged exactly once.
+        self.failure_logged: bool = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wakeup: asyncio.Event | None = None
 

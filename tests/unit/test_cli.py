@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import structlog
 from typer.testing import CliRunner
 
 from autotrader.cli import _run_core_process, app
@@ -491,8 +492,14 @@ def test_failure_run_core_already_logged_is_not_logged_twice(
     locks = Locks()
 
     async def run_core(*args: Any, control: ShutdownControl, **kwargs: Any) -> int:
-        control.begin("stream_death")  # run_core logs core.failed itself, then re-raises
-        raise ConnectionError("stream died")
+        control.begin("stream_death")
+        error = ConnectionError("stream died")
+        # As the real run_core does: it logs core.failed itself, marks it, then re-raises.
+        structlog.get_logger("autotrader.core.runtime").error(
+            "core.failed", cause=control.cause, exc_info=error
+        )
+        control.failure_logged = True
+        raise error
 
     monkeypatch.setattr("autotrader.core.runtime.run_core", run_core)
     code = _run_core_process(
@@ -508,7 +515,42 @@ def test_failure_run_core_already_logged_is_not_logged_twice(
     locks.release()
 
     assert code == 1
-    assert _core_failed(buf) == []
+    (failed,) = _core_failed(buf)  # run_core's line only: the CLI adds no second one
+    assert failed["cause"] == "stream_death"
+
+
+def test_failure_after_an_earlier_stop_request_is_logged_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
+    locks = Locks()
+    handlers: list[Any] = []
+    run = Spy(0)
+
+    def upgrade(url: str) -> None:
+        handlers[0](2, None)  # SIGINT arrives during the migration ...
+        raise RuntimeError("migration broke")  # ... which then fails
+
+    code = _run_core_process(
+        cfg,
+        Settings(_env_file=None),
+        load_profile(cfg.strategy),
+        watchdog=Watchdog(thread_factory=Threads(), exit=Spy(), stderr=io.StringIO()),
+        install=handlers.append,
+        upgrade=upgrade,
+        make_source=Spy(),
+        run=run,
+        acquire=locks,
+    )
+    locks.release()
+
+    assert code == 1 and run.calls == []
+    (failed,) = _core_failed(buf)
+    assert failed["cause"] == "signal"  # the first cause stands; the failure is still logged
+    assert "migration broke" in failed["exception"] and "Traceback" in failed["exception"]
+    assert capsys.readouterr().err == "run core failed: RuntimeError: migration broke\n"
 
 
 def test_engine_failure_inside_run_core_exits_1_with_a_one_line_summary(
