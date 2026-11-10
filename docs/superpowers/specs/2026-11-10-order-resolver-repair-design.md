@@ -220,6 +220,13 @@ unsettled, keeps its reservation and keeps blocking entries on the symbol and fl
 retried. The resolver does not look it up again: automatic investigation is bounded; the operator
 takes over (5.2, 5.3).
 
+**Note 2026-11-10 (plan dry run, owner decision pending):** because an incident row is never read
+again, `Ledger.apply_all` holds back every later row on its symbol until the operator repairs it,
+a later exit's fills included (the broker sold, the journal position stays open, the cash check
+stays `skipped`). The hold-back predates 1.5d-2 (id-less rows); incidents make it indefinite.
+The implementation plan keeps it (booking a later exit before an unresolved earlier entry gives
+anomalies or a wrong P&L), pins it with a test and documents it in the runbook.
+
 ### 3.7 Link
 
 Linking a type (a) row writes `broker_order_id` and publishes `OrderResolved` (`order_row_id`,
