@@ -1,7 +1,10 @@
 # Order resolver and journal repair design (WP 1.5d-2)
 
 Date: 2026-11-10. Status: owner decisions in chat 2026-11-10, recorded as PLAN D20; this written
-spec is in review. Choices made here that D20 does not fix are marked **(builder call)**. A cold
+spec is in review. Choices made here that D20 does not fix are marked **(builder call)**.
+Revised 2026-11-10 after the first Codex review (PR #33), owner go: total vs free qty (2.4),
+journal-namespaced client ids as the ownership proof (2.3), the type (b) clock survives client-id
+hits (3.7), one per-fill oversell allocation (5.4). A cold
 builder check against the code ran before review; its findings are folded in (3.1, 3.2, 3.6, 3.8,
 5.4).
 
@@ -50,18 +53,18 @@ item 4 rule: absence is never proof of non-submission, so nothing is ever auto-e
 ### 2.1 Engine
 
 `RiskEngine.exit()` inserts the order row as today, then sets
-`client_order_id = f"at-o{row.id}"` in the same transaction (flush to get the id) **(builder
-call: the format; it only has to be unique per journal and fit 64 chars)**, and submits
+`client_order_id = f"at-{jid}-o{row.id}"` (2.3) in the same transaction (flush to get the id),
+and submits
 
 ```
 submit_order(BrokerOrder(symbol, side="sell", qty=decision.qty, type="market",
                          time_in_force="gtc", client_order_id=row.client_order_id))
 ```
 
-instead of `close_position(symbol)`. `decision.qty` stays `check_exit`'s broker position qty. The
-1.5c behaviour around it is unchanged: dust is still rejected by `check_exit` before any row is
-written, an `OrderRejected` (for example "qty exceeds free qty" because an earlier sell still
-reserves it) still records `rejected`, and the Position Manager's retry rules still apply.
+instead of `close_position(symbol)`. `decision.qty` is the position's **free** qty (2.4), not its
+total. The 1.5c behaviour around it is unchanged: dust is still rejected by `check_exit` before
+any row is written, a broker `OrderRejected` still records `rejected`, and the Position Manager's
+retry rules still apply.
 
 `close_position` is no longer called by the engine **(builder call: no fallback; I said "fallback
 only" in chat, but `check_exit` already rejects dust before the call and the paper probe accepted
@@ -73,10 +76,10 @@ Rationale and its limit: the Risk Engine spec (2026-10-11, section 5) chose `clo
 because it "sells exactly what the broker holds" (coin-fee-reduced qty, precision). The 2026-10-12
 paper probe sold the exact net `qty_available` (0.000117817 BTC, 9 decimals) with a plain market
 sell and closed cleanly with no dust (`docs/alpaca-notes.md`, step 2). That is one BTC sample.
-**WP 1.6 must confirm it per traded symbol on Alpaca paper** and map `Position.qty` from Alpaca's
-`qty_available` (not `qty`). Remaining difference from `close_position`: the qty is read a moment
-before the send; if the position grows in between (a late entry fill), the sell leaves a remainder
-the Position Manager already retries.
+**WP 1.6 must confirm it per traded symbol on Alpaca paper** and map Alpaca's `qty` to
+`Position.qty` and `qty_available` to `Position.qty_available` (2.4). Remaining difference from
+`close_position`: the qty is read a moment before the send; if the position grows in between (a
+late entry fill), the sell leaves a remainder the Position Manager already retries.
 
 ### 2.2 SimBroker
 
@@ -86,9 +89,40 @@ SimBroker currently rejects an off-increment sell unless it came from `close_pos
 `DustRemainder` if below `min_qty`), mirroring the paper probe. Any other off-increment sell is
 still rejected.
 
-### 2.3 Entries
+### 2.3 Client id format: a journal namespace (revised after PR #33 review)
 
-Entries keep `at-c{cycle_id}-e` (D14). No change.
+Row and cycle ids are unique only within one journal. A second journal (a reset, a test copy)
+trading on the same broker account produces the same ids, and a reused id from the other journal
+can match on symbol, side, qty and time, so a shape check cannot prove the order is ours (anti-goal
+in section 1). Therefore:
+
+- **Journal id:** a random 8-hex-char id generated once per journal and stored in `control_state`
+  (`journal_id`). Migration 0007 writes it **(builder call: generated in the migration with
+  `secrets.token_hex(4)`; never regenerated; 32 bits is ample for the handful of journals one
+  account sees)**.
+- **Format:** exits `at-{jid}-o{row_id}`, entries `at-{jid}-c{cycle_id}-e` (replacing D14's
+  `at-c{cycle_id}-e`). Both fit the 64-char column.
+- **Ownership proof:** a broker order belongs to a row only if its client id equals the row's
+  client id exactly **and** that id carries this journal's `jid`. A row whose client id is NULL or
+  not in this journal's namespace (legacy format) has no ownership proof (3.4, 5.2).
+
+No real legacy rows exist: Alpaca has never placed an order through the bot (1.6), so old-format
+rows exist only in SimBroker journals.
+
+### 2.4 Total versus free qty (revised after PR #33 review)
+
+Coins reserved by a pending sell are still held: they count toward exposure until the sell fills.
+So the total and the free qty are kept apart:
+
+- `Position` (broker type) gains `qty_available: Dec` (free to sell); `qty` stays the total held.
+  SimBroker: `qty_available = held - pending sell remainders`. AlpacaBroker (1.6): Alpaca `qty`
+  and `qty_available` one-to-one.
+- `HeldPosition` gains `qty_available`. Exposure, the dust test (`is_dust`) and every entry check
+  keep using `qty` (total), unchanged.
+- `check_exit` sizes the exit with `qty_available`. If the holding is not dust but
+  `qty_available < min_qty` (an earlier sell reserves it), `check_exit` rejects with reason
+  `reserved by pending sells in <SYM>`: no order row, not dust, not `no_position`; the Position
+  Manager's backoff retries **(builder call)**.
 
 ## 3. Resolver (PLAN 3.2 item 4)
 
@@ -136,13 +170,14 @@ process is sending it.
 New broker method `get_order_by_client_id(client_order_id) -> BrokerOrderView | None` (section 4).
 `None` means the broker answered and has no such order; any exception means "don't know".
 
-- Row without a client id (legacy exits from before this WP): no lookup possible; it becomes an
-  incident at once, reason `no_client_id`.
-- Found: the view must match the row: same `symbol`, `side`, `qty`, and the broker's `created_at`
-  no earlier than `row.submitted_at - 5 min` **(builder call: the skew bound)**. For a type (b) row
-  the broker order id must also equal the row's. Match → link (3.7). Mismatch → incident at once,
-  reason `client_id_mismatch` (a reused id from another journal on the same account, or a broker
-  inconsistency). Never link a mismatch.
+- Row without ownership proof (client id NULL or not in this journal's namespace, 2.3): no lookup;
+  it becomes an incident at once, reason `no_ownership_proof`.
+- Found: ownership comes from the namespaced client id (2.3); the view must also match the row:
+  same `symbol`, `side`, `qty`, and the broker's `created_at` no earlier than
+  `row.submitted_at - 5 min` **(builder call: the skew bound, a consistency check, not the
+  ownership proof)**. For a type (b) row the broker order id must also equal the row's. Match →
+  link (3.7). Mismatch → incident at once, reason `client_id_mismatch` (a broker inconsistency).
+  Never link a mismatch.
 - `None`: zero match this pass. Keep waiting (3.5).
 - Exception: not looked up this pass. Keep waiting.
 
@@ -187,15 +222,18 @@ takes over (5.2, 5.3).
 
 ### 3.7 Link
 
-Linking writes `broker_order_id` (type a), clears `resolve_since`, and publishes `OrderResolved`
-(`order_row_id`, `broker_order_id`, `client_order_id`, `how="resolver"`) in one unit, then logs
+Linking a type (a) row writes `broker_order_id` and publishes `OrderResolved` (`order_row_id`,
+`broker_order_id`, `client_order_id`, `how="resolver"`) in one unit, then logs
 `risk.order_resolved`. The row is then read by the normal sync path on the same pass or the next,
 which books its fills and settles it.
 
-For a type (b) row a match only proves the broker still knows the order under our client id. The
-row then reads through `get_order` as usual; if `get_order` keeps raising `OrderNotFound` while
-the client-id lookup finds it, the row becomes an incident at its deadline (reason
-`lookup_inconsistent`) **(builder call)**.
+For a type (b) row a match writes nothing: it only proves the broker still knows the order under
+our client id. **`resolve_since` is kept** (revised after PR #33 review). It is cleared only by a
+successful normal `get_order` read of the row, by the row becoming an incident, or by a repair
+command; a client-id hit never clears or restarts it. So if `get_order` keeps raising
+`OrderNotFound` while the client-id lookup keeps finding the order, the row becomes an incident at
+`resolve_since + order_resolution_timeout_s`, reason `lookup_inconsistent`, exactly once, across
+restarts.
 
 ### 3.8 Effects elsewhere
 
@@ -203,10 +241,10 @@ the client-id lookup finds it, the row becomes an incident at its deadline (reas
   cancelled normally.
 - The Position Manager's exit logic needs no change: once linked and settled, its existing retry
   rules see the real outcome. `classify_sells` already holds exits back while any sell on the
-  position is `unresolved` or `in_flight`, so a new exit is never sent while an earlier sell still
-  reserves qty. If one still is (flatten racing a pending sell), the broker rejects the
-  oversized sell, the row is `rejected`, and the existing backoff retries once the earlier sell
-  settles **(builder call: no pending-sell subtraction in the engine)**.
+  position is `unresolved` or `in_flight`, so a new exit is normally not sent while an earlier sell
+  still reserves qty. If one is (flatten racing a pending sell), the exit is sized from
+  `qty_available` (2.4) and so never oversells; a fully reserved holding is rejected before any
+  row is written and the existing backoff retries once the earlier sell settles.
 - `check()` keeps failing closed on the symbol while any row is unsettled (existing D19 and
   open-entry rules).
 
@@ -265,8 +303,11 @@ id, and otherwise a new `get_order_view(order_id) -> BrokerOrderView` **(builder
 For an unsettled row that either has no broker id and is `pending`/`unknown` (incident or not),
 or is a type (b) incident (`not_found`, `lookup_inconsistent`, `client_id_mismatch` on a row with a
 broker id), whose broker id is then replaced (D20.5). Connects the broker (read-only), reads the
-order, and checks symbol, side, qty, client id (if the row has one) and the 5-minute `created_at`
-bound as in 3.4. On match: writes `broker_order_id` (`before` keeps the old one),
+order, and requires the ownership proof of 2.3 (the broker order's client id equals the row's
+namespaced client id) plus the symbol, side, qty and 5-minute `created_at` checks of 3.4. A row
+without ownership proof (`no_ownership_proof`: NULL or legacy client id) is refused: it goes to the
+runbook's manual procedure, where the operator's own evidence is the proof (revised after PR #33
+review). On match: writes `broker_order_id` (`before` keeps the old one),
 clears `incident`, `incident_at`, `resolve_since`; `OperatorRepair(action="link")`. On mismatch it
 refuses and prints the differences; there is no override **(builder call: no `--force`; a wrong
 link books a foreign order)**. The next core run settles the row through the normal sync.
@@ -290,24 +331,32 @@ and the mark is final. The command cannot check the evidence; it records it.
 For a sell row whose latest `LedgerAnomaly` is `oversell` and that is still unsettled. Sets a new
 flag `orders.excess_external = true`; `OperatorRepair(action="oversell")`.
 
-Ledger change **(builder call: the allocation rule below)**. The split is persisted on the row,
-derived from booked fills, never from memory:
+Ledger change: **one per-fill allocation** for proceeds, fees, P&L and the event (revised after
+PR #33 review; an order-wide ratio and a per-fill fee rule disagree when fills differ in price).
+The split is persisted per fill when the fill is booked, never recomputed from memory or from a
+final ratio:
 
-- In `_sell`, when a fill exceeds the open qty plus carried dust and the row has
-  `excess_external`, the ledger consumes all carried dust (as today: `dust_consumed`,
-  `SymbolDust` reduced), sets `position.qty = 0`, and adds the remainder to a new column
-  `orders.external_qty` instead of raising `oversell`. The position's share of the sell is its
-  open qty plus the carried dust it consumed, exactly what an ordinary close books today.
-- `_sell` currently adds the whole fill's fee to `position.fees` before the excess check. With
-  `excess_external` it adds only the position's share, pro rata by qty.
-- `_maybe_close` computes `realized_pnl` from the linked fills as today, except that each fill of
-  an order with `external_qty > 0` contributes its cash effect scaled by
-  `(order filled qty - external_qty) / order filled qty`.
-- At the row's settlement the ledger publishes `ExternalHoldingSold` with
-  `external_qty = orders.external_qty`, `dust_consumed = 0` (the dust went to the position),
-  `proceeds_usd` and `fees_usd` scaled by `external_qty / filled qty`. It does **not** call
-  `_external_sale` (that path consumes `SymbolDust` itself and runs only for rows without a
-  position; calling it here would take the dust twice).
+- Fills are allocated in booking order (the order the ledger already books them). Each fill goes
+  to the position first, up to what the position can still absorb: its open qty plus the carried
+  dust (`SymbolDust`). Whatever of that fill is beyond it, and every later fill of the row, is
+  external. The external part of each fill is stored in a new column `fills.external_qty`
+  (0 for every ordinary fill).
+- In `_sell`, with `excess_external` set on the row, the fill that crosses the position's capacity
+  consumes all carried dust (as today: `dust_consumed`, `SymbolDust` reduced), sets
+  `position.qty = 0`, and writes its `external_qty` instead of raising `oversell`. Later fills of
+  the row are fully external (`external_qty = qty`).
+- Every fill's position share is `qty - external_qty`. Fees: `_sell` adds to `position.fees` only
+  `fee * (qty - external_qty) / qty` of each fill (today it adds the whole fee before the excess
+  check). P&L: `_maybe_close` sums each linked fill's cash effect scaled by the same factor.
+- At the row's settlement the ledger publishes `ExternalHoldingSold` from the same stored split:
+  `external_qty = sum(fills.external_qty)`, `proceeds_usd = sum(price * external_qty)`,
+  `fees_usd = sum(fee_usd * external_qty / qty)`, `dust_consumed = 0` (the dust went to the
+  position). It does **not** call `_external_sale` (that path consumes `SymbolDust` itself and runs
+  only for rows without a position; calling it here would take the dust twice).
+
+Each fill's position part plus its external part equals the fill exactly (same rounding rule as
+the ledger's other Decimal splits; any rounding residue goes to the external part **(builder
+call)**).
 
 No balance is edited by the command. The next sync pass after restart applies it; the pause stays
 set until the operator resumes.
@@ -315,12 +364,16 @@ set until the operator resumes.
 ## 6. Schema (migration 0007)
 
 `orders`:
-- `incident` `String(24)` nullable: `no_client_id`, `client_id_mismatch`, `not_found`,
+- `incident` `String(24)` nullable: `no_ownership_proof`, `client_id_mismatch`, `not_found`,
   `lookup_failed`, `lookup_inconsistent`;
 - `incident_at` `UTCDateTime` nullable;
 - `resolve_since` `UTCDateTime` nullable (type b clock);
-- `excess_external` bool, default false;
-- `external_qty` `Money`-style Decimal, default 0 (5.4).
+- `excess_external` bool, default false.
+
+`fills`:
+- `external_qty` Decimal, default 0 (5.4).
+
+`control_state`: the `journal_id` row (2.3), written by the migration.
 
 New event types: `OrderIncident`, `OrderResolved`, `OperatorRepair`.
 
@@ -336,14 +389,17 @@ corrected (section 7).
   needs the 1.5d journal-repair tooling" claims; update "Current limits".
 - Risk Engine spec (2026-10-11) section 5 and `exit()`'s docstring ("carries no client_order_id"):
   dated update note, exits now use `submit_order`.
+- D14's entry client id `at-c{cycle_id}-e` (PLAN D14, `risk/checks.py`, Risk Engine spec): dated
+  note that new ids carry the journal namespace (2.3).
 - PLAN 1.5 row and D20; CLAUDE.md command list (`autotrader repair ...`).
 - `docs/alpaca-notes.md`: 1.6 must verify the exact-qty sell per symbol and duplicate client-id
   behaviour.
 
 ## 8. Acceptance tests (SimBroker, no real API)
 
-1. An exit sends `submit_order` with `client_order_id = at-o<row>` and the broker qty; an
-   off-increment full-holding sell after a coin-fee buy is accepted and leaves no dust.
+1. An exit sends `submit_order` with `client_order_id = at-<jid>-o<row>` and the broker's free
+   qty; an off-increment full-holding sell after a coin-fee buy is accepted and leaves no dust.
+   Entries use `at-<jid>-c<cycle>-e`; `jid` is stable across restarts of one journal.
 2. Lost response (submit accepted, then raised): the row is `unknown`; the next pass finds it by
    client id, links it (`OrderResolved`), books its fills and settles it.
 3. Hidden order: invisible for 50 s, then visible: linked, no incident.
@@ -356,17 +412,31 @@ corrected (section 7).
 7. In-flight row (submit still running) is never looked up.
 8. Client-id hit with a different qty or a `created_at` before the bound: incident
    `client_id_mismatch`, never linked.
-9. Legacy exit row without client id: incident `no_client_id` on the first pass.
+9. Rows without ownership proof (NULL client id, legacy `at-o<row>` / `at-c<cycle>-e` id):
+   incident `no_ownership_proof` on the first pass, no lookup; `repair link` refuses them.
+9a. Two journals on one SimBroker account (different `jid`), identical symbol/side/qty orders
+    inside the 5-minute window, the second journal's submit response lost: the first journal's
+    order is never linked, by the resolver or by `repair link`.
+9b. Total vs free qty: an appreciated holding fully reserved by a pending sell still counts at its
+    total qty in gross exposure, so a different-symbol entry that would exceed the exposure cap is
+    rejected; an exit on the reserved symbol is rejected `reserved by pending sells` with no row.
 10. Type (b): `get_order` raises `OrderNotFound` for a known id; `resolve_since` persisted;
     entries on every symbol rejected until the deadline; incident at the deadline, after which
     only its own symbol is blocked and `get_order` is no longer called for it; `repair link`
     replaces its broker id.
+10a. Type (b) with `get_order` always `OrderNotFound` and the client-id lookup always matching,
+    across the full deadline and a restart: `resolve_since` never resets; exactly one
+    `lookup_inconsistent` incident.
 11. `repair` refuses while the core holds the lock, with empty evidence, on a settled row, and on a
     link mismatch; each successful command writes exactly one `OperatorRepair` event with the row
     change in the same unit.
 12. `repair not-submitted` then a sync pass: row settled with zero fill, reservation released.
-13. `repair oversell`: position closes with P&L on its qty only, dust consumed,
-    `ExternalHoldingSold` for the excess, no further `LedgerAnomaly`, pause still set.
+13. `repair oversell`: position closes, dust consumed once, `ExternalHoldingSold` for the excess,
+    no further `LedgerAnomaly`, pause still set. With two fills at different prices (one-coin
+    position, sell 1 @ 100 then 1 @ 200): the first fill is the position's, the second external;
+    position fees, P&L and the event's `proceeds_usd`/`fees_usd` each assert their own amounts
+    (not only that cash is conserved). Booking the first fill, restarting, then booking the second
+    gives the same amounts.
 14. No path anywhere sets `not_submitted` from a zero-match lookup (grep-level check in review plus
     tests 4 and 5).
 
