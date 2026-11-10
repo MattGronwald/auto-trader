@@ -11,7 +11,7 @@ update/delete for events and no delete anywhere (SPEC §4.8: nothing is deleted)
 """
 
 from collections.abc import Collection, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from typing import cast as typing_cast
@@ -447,6 +447,15 @@ async def open_entry_orders(session: AsyncSession) -> list[Order]:
     return list(rows)
 
 
+async def unsettled_sell_symbols(session: AsyncSession) -> set[str]:
+    """Symbols with a sell order not yet settled by the ledger, whatever its status and
+    whether it is the bot's own exit or an external sell."""
+    rows = await session.scalars(
+        select(Order.symbol).where(Order.side == "sell", Order.settled_at.is_(None)).distinct()
+    )
+    return {symbol for symbol in rows if symbol is not None}
+
+
 async def unsettled_orders(session: AsyncSession) -> list[Order]:
     """Every order whose effects are not fully applied yet (WP 1.5b), in id order: the
     ledger books a symbol's orders oldest first."""
@@ -599,7 +608,10 @@ async def max_hwm(session: AsyncSession) -> Decimal | None:
 
 async def day_start_equity(session: AsyncSession, day_start: datetime) -> Decimal | None:
     """Equity of the last snapshot at or before `day_start`; if there is none (first day
-    of operation), the first snapshot after it. None without any snapshot."""
+    of operation), the first snapshot after it. None without any snapshot.
+
+    Informational only (`equity_snapshots.daily_pnl`); no limit may use it: decisions use
+    `trusted_day_start_equity` (D19)."""
     before = await session.scalar(
         select(EquitySnapshot.equity)
         .where(EquitySnapshot.ts <= day_start)
@@ -625,3 +637,16 @@ async def strategy_trade_stats(session: AsyncSession, strategy_id: int) -> tuple
     )
     pnls = list(await session.scalars(closed))
     return len(pnls), sum(1 for p in pnls if p is not None and p > 0)
+
+
+async def trusted_day_start_equity(
+    session: AsyncSession, day_start: datetime, max_age: timedelta
+) -> Decimal | None:
+    """Equity of the latest snapshot in [day_start - max_age, day_start], else None.
+    No fallback to older or later snapshots: a stale baseline is not a baseline (D19)."""
+    return await session.scalar(
+        select(EquitySnapshot.equity)
+        .where(EquitySnapshot.ts >= day_start - max_age, EquitySnapshot.ts <= day_start)
+        .order_by(EquitySnapshot.ts.desc())
+        .limit(1)
+    )
