@@ -447,8 +447,9 @@ async def test_step_timeout_is_error_and_not_retried(
         await asyncio.Event().wait()
         return StubSkip("unreachable")
 
+    # 1.0 s: real-time headroom for the non-hanging steps; only decide should time out.
     runner = make_runner(
-        sessions, bus, gate, FakeRisk(), strategy_id, decide=hang, step_timeout_s=0.01
+        sessions, bus, gate, FakeRisk(), strategy_id, decide=hang, step_timeout_s=1.0
     )
     cid = await new_cycle(sessions, strategy_id)
     await runner._run(cid, candidate())
@@ -699,7 +700,10 @@ async def test_gate_blocks_admission_fail_closed(
         write_kill_file(tmp_path / "KILL", source="cli", reason="test", now=NOW)
     else:
         use = BrokenGate(hang=gate_kind == "hangs")
-    runner = make_runner(sessions, bus, use, FakeRisk(), strategy_id, step_timeout_s=0.01)
+    # Only the gate that never answers needs the tiny budget; the real gate (kill file + DB)
+    # and the raising gate get the default budget, so only the hung read can time out.
+    budget = 0.01 if gate_kind == "hangs" else 30.0
+    runner = make_runner(sessions, bus, use, FakeRisk(), strategy_id, step_timeout_s=budget)
     with capture_logs() as logs:
         await runner.on_candidate(candidate())
     (reason,) = dropped(logs)

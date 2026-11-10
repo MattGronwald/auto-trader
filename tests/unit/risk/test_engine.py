@@ -908,8 +908,9 @@ class StuckGate:
 async def test_unanswered_pre_submit_gate_means_not_submitted(
     fail: str, sim: SimBroker, sessions: async_sessionmaker[AsyncSession], cycle_id: int
 ) -> None:
-    engine = make_engine_(sim, sessions, StuckGate(fail), io_timeout_s=0.05, monotonic=Mono())
-    result = await asyncio.wait_for(engine.check(intent(cycle_id)), 2)
+    # 1.0 s: real-time headroom for the non-hanging calls; only the hung call should time out.
+    engine = make_engine_(sim, sessions, StuckGate(fail), io_timeout_s=1.0, monotonic=Mono())
+    result = await asyncio.wait_for(engine.check(intent(cycle_id)), 10)
     assert result.status == "not_submitted"
     (row,) = await orders(sessions)
     assert (row.status, row.broker_order_id) == ("not_submitted", None)
@@ -929,17 +930,17 @@ async def test_hung_exit_state_rejects_and_hung_close_is_unknown(
     sessions: async_sessionmaker[AsyncSession], gate: ControlGate
 ) -> None:
     request = ExitRequest(symbol=BTC, reason="stop")
-    stuck = make_engine_(
-        _sim(HangingPositions), sessions, gate, io_timeout_s=0.05, monotonic=Mono()
-    )
-    rejected = await asyncio.wait_for(stuck.exit(request), 2)
+    # 1.0 s: real-time headroom for the non-hanging calls; only the hung call should time out.
+    stuck = make_engine_(_sim(HangingPositions), sessions, gate, io_timeout_s=1.0, monotonic=Mono())
+    rejected = await asyncio.wait_for(stuck.exit(request), 10)
     assert rejected.decision.reasons == ("state unavailable: TimeoutError",)
     assert await orders(sessions) == []
 
     broker = _sim(HangingClose)
     await _held_btc(broker)
-    closing = make_engine_(broker, sessions, gate, io_timeout_s=0.05, monotonic=Mono())
-    result = await asyncio.wait_for(closing.exit(request), 2)
+    # 1.0 s: real-time headroom for the non-hanging calls; only the hung call should time out.
+    closing = make_engine_(broker, sessions, gate, io_timeout_s=1.0, monotonic=Mono())
+    result = await asyncio.wait_for(closing.exit(request), 10)
     assert result.decision.approved and result.status == "unknown"
     (row,) = await orders(sessions)
     assert (row.side, row.status, row.broker_order_id) == ("sell", "unknown", None)
