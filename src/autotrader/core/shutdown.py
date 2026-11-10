@@ -3,12 +3,14 @@
 `ShutdownControl.begin()` is plain synchronous code: the first SIGINT/SIGTERM calls it from a
 Python-level `signal.signal` handler, which runs between bytecodes even while the event loop
 is stuck in synchronous Python code. It records the monotonic deadline (T from the trigger)
-and starts the watchdog thread *before* asking the loop for the async teardown. Every exit
-cause uses it; later calls are no-ops. A second signal calls `os._exit(130)` at once: no
-async cleanup and no lock release (process death releases the journal lock). The watchdog
-thread ends the process with `os._exit(70)` at T + 5 s if teardown still hangs. It is never
-cancelled: it is a daemon thread, so it never delays a normal exit, and it still fires if the
-interpreter's own exit hangs (aiosqlite worker threads are non-daemon and are joined there).
+and arms the watchdog (assigns its deadline; the polling thread was pre-started by the CLI)
+*before* asking the loop for the async teardown. Every exit cause uses it; later calls are
+no-ops. A second signal calls `os._exit(130)` at once: no async cleanup and no lock release
+(process death releases the journal lock). The watchdog thread (polling, started before the
+handler is installed) ends the process with `os._exit(70)` at T + 5 s if teardown still hangs.
+It is never cancelled: it is a daemon thread, so it never delays a normal exit, and it still
+fires if the interpreter's own exit hangs (aiosqlite worker threads are non-daemon and are
+joined there).
 
 Limits: a Python-level handler runs only when the main thread executes bytecode, so a first
 signal that arrives while the main thread is stuck in a C call that never returns arms
@@ -38,46 +40,96 @@ EXIT_HARD = 130
 EXIT_WATCHDOG = 70
 
 
-class _Timer(Protocol):
+class _Thread(Protocol):
     daemon: bool
 
     def start(self) -> None: ...
 
 
-TimerFactory = Callable[[float, Callable[[], None]], _Timer]
+ThreadFactory = Callable[[Callable[[], None]], _Thread]
 SignalHandler = Callable[[int, FrameType | None], None]
 
 
+def _daemon_thread(target: Callable[[], None]) -> threading.Thread:
+    return threading.Thread(target=target, name="watchdog", daemon=True)
+
+
 class Watchdog:
-    """Last resort: a daemon thread that ends the process if teardown hangs."""
+    """Last resort: a daemon thread that ends the process if teardown hangs.
+
+    The thread is started up front (`start()`, called by the CLI before the signal handler is
+    installed) and polls a deadline every `poll_s`. `arm()` only assigns that deadline, so it
+    is safe inside a signal handler: starting a thread there can deadlock when the signal lands
+    while the main thread is itself inside `Thread.start()`. A watchdog that was never started
+    must not be silently off, so `arm()` then falls back to starting the thread (with that
+    risk) and writes `core.watchdog_late_start` to stderr."""
 
     def __init__(
         self,
         *,
-        timer_factory: TimerFactory = threading.Timer,
         exit: Callable[[int], object] = os._exit,
         stderr: TextIO | None = None,
         log_wait_s: float = 0.5,
+        clock: Callable[[], float] = time.monotonic,
+        thread_factory: ThreadFactory = _daemon_thread,
+        sleep: Callable[[float], object] = time.sleep,
+        poll_s: float = 0.1,
     ) -> None:
-        self._factory = timer_factory
         self._exit = exit
         self._stderr = stderr
         self._log_wait_s = log_wait_s
-        self._timer: _Timer | None = None
+        self._clock = clock
+        self._factory = thread_factory
+        self._sleep = sleep
+        self._poll_s = poll_s
+        self._deadline: float | None = None
+        self._thread: _Thread | None = None
 
     @property
     def armed(self) -> bool:
-        return self._timer is not None
+        return self._deadline is not None
+
+    @property
+    def started(self) -> bool:
+        return self._thread is not None
+
+    def start(self) -> None:
+        """Start the polling thread (idempotent)."""
+        if self._thread is not None:
+            return
+        thread = self._factory(self._run)
+        thread.daemon = True
+        thread.start()
+        self._thread = thread
 
     def arm(self, seconds: float) -> None:
         """Guarantee exit within `seconds`: fire `log_wait_s` early, so the bounded
-        diagnostic wait in `_fire` still ends by the deadline."""
-        if self._timer is not None:
+        diagnostic wait in `_fire` still ends by the deadline. First deadline wins. Only
+        assigns a float (no lock, no thread start): signal-handler safe."""
+        if self._deadline is not None:
             return
-        timer = self._factory(max(0.0, seconds - self._log_wait_s), self._fire)
-        timer.daemon = True
-        timer.start()
-        self._timer = timer
+        if self._thread is None:
+            self._say_late_start()
+            self.start()
+        self._deadline = self._clock() + max(0.0, seconds - self._log_wait_s)
+
+    def poll(self) -> bool:
+        """One check: fire and return True once the deadline has passed."""
+        deadline = self._deadline
+        if deadline is None or self._clock() < deadline:
+            return False
+        self._fire()
+        return True
+
+    def _run(self) -> None:
+        while not self.poll():
+            self._sleep(self._poll_s)
+
+    def _say_late_start(self) -> None:
+        stream = self._stderr if self._stderr is not None else sys.stderr
+        with contextlib.suppress(Exception):
+            stream.write(json.dumps({"event": "core.watchdog_late_start", "level": "error"}) + "\n")
+            stream.flush()
 
     def _fire(self) -> None:
         """Exit 70, whatever happens to the diagnostic line. The line is best-effort: it is

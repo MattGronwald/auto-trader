@@ -116,6 +116,7 @@ def _run_core_process(
         typer.echo("interrupted while waiting for the journal lock", err=True)
         return EXIT_HARD
     dog = watchdog if watchdog is not None else Watchdog()
+    dog.start()  # before the handler: arming it from the handler must not start a thread
     control = ShutdownControl(timeout_s, arm_watchdog=dog.arm)
     install(make_signal_handler(control))
     try:

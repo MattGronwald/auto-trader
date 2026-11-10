@@ -258,14 +258,24 @@ class Spy:
         return self.result
 
 
-class FakeTimer:
-    def __init__(self, seconds: float, fn: Callable[[], None]) -> None:
-        self.seconds = seconds
+class FakeThread:
+    def __init__(self, target: Callable[[], None]) -> None:
+        self.target = target
         self.daemon = False
         self.started = False
 
     def start(self) -> None:
         self.started = True
+
+
+class Threads:
+    def __init__(self) -> None:
+        self.made: list[FakeThread] = []
+
+    def __call__(self, target: Callable[[], None]) -> FakeThread:
+        thread = FakeThread(target)
+        self.made.append(thread)
+        return thread
 
 
 class Locks:
@@ -325,12 +335,10 @@ def test_signal_during_migration_arms_the_watchdog_and_skips_startup(tmp_path: P
     configure_logging(stream=io.StringIO())  # an earlier CliRunner test left a closed stdout
     cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
     locks = Locks()
-    timers: list[FakeTimer] = []
+    threads = Threads()
     handlers: list[Any] = []
-
-    def factory(seconds: float, fn: Callable[[], None]) -> FakeTimer:
-        timers.append(FakeTimer(seconds, fn))
-        return timers[-1]
+    now = [100.0]
+    dog = Watchdog(thread_factory=threads, clock=lambda: now[0], exit=Spy(), stderr=io.StringIO())
 
     def upgrade(url: str) -> None:
         from autotrader.journal import db
@@ -348,7 +356,7 @@ def test_signal_during_migration_arms_the_watchdog_and_skips_startup(tmp_path: P
         cfg,
         Settings(_env_file=None),
         load_profile(cfg.strategy),
-        watchdog=Watchdog(timer_factory=factory, exit=Spy()),
+        watchdog=dog,
         install=handlers.append,
         upgrade=upgrade,
         make_source=lambda settings, symbols: Source(),
@@ -357,19 +365,19 @@ def test_signal_during_migration_arms_the_watchdog_and_skips_startup(tmp_path: P
     locks.release()
 
     assert code == 0
-    assert timers and timers[0].started and timers[0].seconds == 34.5  # exit by T + 5 = 35
+    assert len(threads.made) == 1 and threads.made[0].started
+    now[0] = 134.4
+    assert dog.poll() is False
+    now[0] = 134.5  # exit by T + 5 = 35, less the log wait
+    assert dog.poll() is True
     assert Source.stopped
 
 
 def test_failure_inside_run_exits_1_and_leaves_the_watchdog_armed(tmp_path: Path) -> None:
     cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
     locks = Locks()
-    timers: list[FakeTimer] = []
+    threads = Threads()
     order: list[str] = []
-
-    def factory(seconds: float, fn: Callable[[], None]) -> FakeTimer:
-        timers.append(FakeTimer(seconds, fn))
-        return timers[-1]
 
     def run(coro: Coroutine[Any, Any, int]) -> int:
         coro.close()
@@ -380,7 +388,7 @@ def test_failure_inside_run_exits_1_and_leaves_the_watchdog_armed(tmp_path: Path
         cfg,
         Settings(_env_file=None),
         load_profile(cfg.strategy),
-        watchdog=Watchdog(timer_factory=factory, exit=Spy()),
+        watchdog=Watchdog(thread_factory=threads, exit=Spy()),
         install=Spy(),
         upgrade=Spy(),
         make_source=Spy(),
@@ -391,7 +399,32 @@ def test_failure_inside_run_exits_1_and_leaves_the_watchdog_armed(tmp_path: Path
 
     assert code == 1
     assert order == ["run"]
-    assert len(timers) == 1 and timers[0].started  # armed for the exit; never cancelled
+    assert len(threads.made) == 1 and threads.made[0].started  # pre-started; never cancelled
+
+
+def test_cli_starts_the_watchdog_before_installing_the_signal_handler(tmp_path: Path) -> None:
+    cfg = load_config(_tmp_config(tmp_path), Settings(_env_file=None))
+    locks = Locks()
+    dog = Watchdog(thread_factory=Threads(), exit=Spy())
+    seen: list[bool] = []
+
+    def install(handler: Any) -> None:
+        seen.append(dog.started)
+
+    _run_core_process(
+        cfg,
+        Settings(_env_file=None),
+        load_profile(cfg.strategy),
+        watchdog=dog,
+        install=install,
+        upgrade=Spy(),
+        make_source=Spy(),
+        run=lambda coro: (coro.close(), 0)[1],
+        acquire=locks,
+    )
+    locks.release()
+
+    assert seen == [True]
 
 
 def test_ctrl_c_while_waiting_for_the_lock_exits_130(tmp_path: Path) -> None:
@@ -433,7 +466,7 @@ def test_startup_failure_before_run_core_is_logged_as_core_failed(
         cfg,
         Settings(_env_file=None),
         load_profile(cfg.strategy),
-        watchdog=Watchdog(timer_factory=FakeTimer, exit=Spy()),
+        watchdog=Watchdog(thread_factory=Threads(), exit=Spy()),
         install=Spy(),
         upgrade=upgrade,
         make_source=Spy(),
@@ -466,7 +499,7 @@ def test_failure_run_core_already_logged_is_not_logged_twice(
         cfg,
         Settings(_env_file=None),
         load_profile(cfg.strategy),
-        watchdog=Watchdog(timer_factory=FakeTimer, exit=Spy()),
+        watchdog=Watchdog(thread_factory=Threads(), exit=Spy()),
         install=Spy(),
         upgrade=Spy(),
         make_source=Spy(),
@@ -494,7 +527,7 @@ def test_engine_failure_inside_run_core_exits_1_with_a_one_line_summary(
         cfg,
         Settings(_env_file=None),
         load_profile(cfg.strategy),
-        watchdog=Watchdog(timer_factory=FakeTimer, exit=Spy()),
+        watchdog=Watchdog(thread_factory=Threads(), exit=Spy()),
         install=Spy(),
         upgrade=Spy(),
         make_source=Spy(),
