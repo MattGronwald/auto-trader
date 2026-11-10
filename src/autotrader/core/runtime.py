@@ -4,6 +4,14 @@ Connects the broker, backfills and streams bars for the universe, persists 1m ba
 Signal Scanner on closed bars (WP 1.2) and snapshots equity for the daily-loss/drawdown
 checks. The broker is handed to the `RiskEngine`, its only holder from then on (SPEC §0.1).
 
+WP 1.5d-1 (spec 2026-11-09, 5): every `risk.snapshot` step also runs the ledger's cash check
+(guard, snapshot, `check_cash`) and drives the engine's cash-reconciliation fault, which rejects
+every entry (`cash reconciliation failed`) while set: set at startup (`not yet reconciled`) and
+by any stage that raises (sticky until restart for `CommitUncertain`), cleared by a completed
+check (`baseline`, `ok`, `discrepancy`; the latter committed the manual pause), unchanged by a
+`skipped` one. The engine gets `snapshot_interval_s=snapshot_s`: an entry also needs a loop
+snapshot and a day-start baseline within `2 x snapshot_s`.
+
 WP 1.5c (spec 2026-10-19, 4.7-4.8): `exit()` is called by the Position Manager in the
 supervised `positions.manage` loop (every 1 s), and the `ledger.sync` loop reads every unsettled
 order and books its fills every 2 s through the shared `Ledger`; a hung order read never delays
@@ -45,12 +53,13 @@ from typing import Any, Protocol
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from autotrader.core.bus import EventBus
+from autotrader.broker.base import Account
+from autotrader.core.bus import CommitUncertain, EventBus
 from autotrader.core.config import AppConfig, Settings, StrategyProfile
 from autotrader.core.feed import BarClosed, BarSource, MarketFeed
 from autotrader.core.flatten import request_flatten, wait_for_result
 from autotrader.core.kill import ControlGate, ControlStatus
-from autotrader.core.ledger import Ledger
+from autotrader.core.ledger import CashGuard, CashResult, Ledger
 from autotrader.core.lock import JournalLock, canonical_journal
 from autotrader.core.position_manager import PositionManager
 from autotrader.core.scanner import Scanner
@@ -76,7 +85,17 @@ MANAGE_STALL_S = 30.0
 
 
 class _Snapshotter(Protocol):
-    async def snapshot_equity(self) -> object: ...
+    async def snapshot_equity(self) -> Account: ...
+
+    def set_cash_fault(self, reason: str, *, sticky: bool = False) -> None: ...
+
+    def cash_reconciled(self) -> None: ...
+
+
+class _CashChecker(Protocol):
+    async def cash_guard(self) -> CashGuard: ...
+
+    async def check_cash(self, account: Account, guard: CashGuard) -> CashResult: ...
 
 
 class ControlPoller:
@@ -128,17 +147,50 @@ class ControlPoller:
             log.warning("core.kill_cleared")
 
 
-async def _snapshot_step(risk: _Snapshotter) -> None:
-    """One equity snapshot; failures are logged, never raised (the engine bounds its own
-    broker calls, `io_timeout_s`, and its journal writes are never cancelled)."""
+def _cash_fault(risk: _Snapshotter, stage: str, error: Exception) -> None:
+    """Spec 2026-11-09 5.2, any stage: `CommitUncertain` holds until restart (sticky)."""
+    risk.set_cash_fault(
+        f"{stage}: {type(error).__name__}", sticky=isinstance(error, CommitUncertain)
+    )
+
+
+async def _snapshot_step(risk: _Snapshotter, ledger: _CashChecker) -> None:
+    """One equity snapshot plus the ledger's cash check (spec 2026-11-09 5.1-5.2): the guard
+    is read before the account read (D17), `snapshot_equity()` commits the snapshot and
+    returns that account, `check_cash()` compares it. Any stage that raises sets the engine's
+    cash fault (`<stage>: <ExceptionType>`); `baseline`, `ok` and `discrepancy` clear it,
+    `skipped` leaves it. A failed guard read still takes the snapshot (tomorrow's baseline)
+    but skips the check. Failures are logged, never raised (the engine bounds its own broker
+    calls, `io_timeout_s`, and journal writes are never cancelled); `CancelledError` is not
+    caught."""
+    guard: CashGuard | None
     try:
-        await risk.snapshot_equity()
-    except TimeoutError:
+        guard = await ledger.cash_guard()
+    except Exception as e:
+        log.exception("ledger.cash_check_failed", stage="guard")
+        _cash_fault(risk, "guard", e)
+        guard = None
+    try:
+        account = await risk.snapshot_equity()
+    except TimeoutError as e:
         log.error("risk.snapshot_failed", timeout=True)
-    except Exception:
+        _cash_fault(risk, "snapshot", e)
+        return
+    except Exception as e:  # it may have committed the snapshot before raising
         log.exception("risk.snapshot_failed")
-    else:
-        log.info("risk.snapshot_written")
+        _cash_fault(risk, "snapshot", e)
+        return
+    log.info("risk.snapshot_written")
+    if guard is None:  # no guard, no valid comparison
+        return
+    try:
+        result = await ledger.check_cash(account, guard)
+    except Exception as e:
+        log.exception("ledger.cash_check_failed", stage="check")
+        _cash_fault(risk, "check", e)
+        return
+    if result in ("baseline", "ok", "discrepancy"):  # a discrepancy committed its pause
+        risk.cash_reconciled()
 
 
 async def _sync_step(risk: RiskEngine, ledger: Ledger) -> None:
@@ -237,6 +289,7 @@ async def run_core(
             sessions=sessions,
             ledger=ledger,
             trading_day_tz=cfg.trading_day_tz,
+            snapshot_interval_s=snapshot_s,  # freshness bound and baseline window: 2x this
         )
         log.info("risk.engine_ready", mode=cfg.mode)
         if control.requested:  # no await from here on: nothing starts after a stop request
@@ -248,7 +301,12 @@ async def run_core(
                 Loop("feed.tick", feed.tick, tick_s, FEED_STALL_S),
                 Loop("control.poll", poller.step, tick_s, CONTROL_STALL_S, "error"),
                 Loop("control.kill_file", poller.file_step, tick_s, CONTROL_STALL_S, "error"),
-                Loop("risk.snapshot", partial(_snapshot_step, risk), snapshot_s, 2 * snapshot_s),
+                Loop(
+                    "risk.snapshot",
+                    partial(_snapshot_step, risk, ledger),
+                    snapshot_s,
+                    2 * snapshot_s,
+                ),
                 Loop("ledger.sync", partial(_sync_step, risk, ledger), sync_s, SYNC_STALL_S),
                 Loop("positions.manage", pm.step, manage_s, MANAGE_STALL_S, "error"),
             ],
