@@ -15,7 +15,7 @@ snapshot and a day-start baseline within `2 x snapshot_s`.
 WP 1.5c (spec 2026-10-19, 4.7-4.8): `exit()` is called by the Position Manager in the
 supervised `positions.manage` loop (every 1 s), and the `ledger.sync` loop reads every unsettled
 order and books its fills every 2 s through the shared `Ledger`; a hung order read never delays
-the Position Manager. `check()` still waits for the Cycle Runner (WP 1.5d). With
+the Position Manager. `check()` still waits for the Cycle Runner (WP 1.5d-3). With
 `shutdown.flatten`, teardown runs a bounded `flatten` step after the startup step: it requests a
 flatten (keeping a pending CLI request) and waits up to half the remaining budget for the
 still-running loops to reach flat, then teardown continues either way.

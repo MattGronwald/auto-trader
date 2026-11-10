@@ -39,7 +39,7 @@ no `check()` until WP 1.5d-3, so today these describe what the engine will do.
 |---|---|---|
 | `daily-loss baseline unavailable` | No equity snapshot in [trading-day start - 120 s, trading-day start] (2 x the 60 s snapshot interval). | The next trading day that has such a snapshot. Nothing to fix. |
 | `equity snapshot overdue` | The snapshot loop has not committed a snapshot yet in this process, or the last one is older than 120 s. | A snapshot loop commit (within 60 s once the loop is healthy). |
-| `cash reconciliation failed` | The ledger cash check has not completed since startup, or its guard, snapshot or check stage raised. | A completed cash check with result baseline, ok or discrepancy (not `skipped`). After a `CommitUncertain` error it holds until the core is restarted. |
+| `cash reconciliation failed` | The ledger cash check has not completed since startup, or its guard, snapshot or check stage raised. | A completed cash check with result baseline, ok or discrepancy (not `skipped`). After a `CommitUncertain` error it holds until the core is restarted. A completed check can also be `skipped`: the ledger skips the comparison when any order row has `settled_at` NULL (at either guard read) or the order/fill generation (`max(orders.id)`, fill watermark) moved between the reads. A skipped check neither sets nor clears the fault and logs no `ledger.cash_check_failed`, so after a restart one stuck unsettled row keeps entries rejected. Find it with `SELECT id, symbol, side, status FROM orders WHERE settled_at IS NULL;` and settle it (see below). |
 | `unsettled sell on <SYM>` | An order row with side `sell` and `settled_at` NULL exists on that symbol. | The ledger settles the row. A `pending`/`unknown` sell without a broker id stays until the 1.5d-2 resolver or the manual procedure below settles it. |
 
 Pre-submit re-check: a fault, an overdue snapshot or `trading day changed` that appears after
@@ -50,7 +50,7 @@ gather and the submit. It is per attempt, with nothing to clear: the next `check
 new day, which itself needs a trusted baseline (`daily-loss baseline unavailable` otherwise).
 
 `daily-loss baseline unavailable` is expected for the whole trading day after downtime across the
-00:00 UTC trading-day start (the core was down, so no snapshot fell in the window). It is not a
+trading-day start (00:00 in `trading_day_tz`, UTC by default; the core was down, so no snapshot fell in the window). It is not a
 fault; entries resume the next day.
 
 ### Cash discrepancy
@@ -71,7 +71,8 @@ the same unit, so the next check compares from the new level.
   error is re-raised and the anomaly may not be recorded. Check `control_state.paused` and the
   `LedgerAnomaly` events; set the pause by hand if it is missing, then investigate the anomaly.
 - `positions.cancel_failed_repeatedly`: an entry cancel failed 3 times; retries back off 1, 2,
-  4 ... up to 30 s. Check the order at the broker; the retries continue on their own.
+  4 ... up to 30 s. Check the order at the broker; the retries continue on their own. The line
+  repeats at the 13th failure and every 10th after (23rd, 33rd, ...) while the cancel keeps failing.
 - `ledger.cash_check_failed`: a stage of the cash step raised (`stage` field); entries stay
   rejected with `cash reconciliation failed` until a check completes.
 - `core.watchdog_late_start` (stderr JSON): the shutdown watchdog was armed without having been
@@ -233,7 +234,7 @@ operator decides.
    the incident is resolved; that is expected.
 
 With `AlpacaBroker` in 1.5c this cannot arise in production: `can_place_orders()` is false, so
-the Position Manager attempts no exits or cancels, and nothing places entries before 1.5d. A
+the Position Manager attempts no exits or cancels, and nothing places entries before 1.5d-3. A
 direct engine call would still fail with `OrderMethodsUnavailable` before anything is sent and be
 recorded `not_submitted`. The sync loop cannot read Alpaca orders yet either.
 

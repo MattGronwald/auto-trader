@@ -6,7 +6,7 @@ step in one loop never delays another. The heartbeat is when `step()` last compl
 `check()` logs a stall once per transition and never cancels a slow step (cancelling could
 cut a journal write mid-commit). A raising step is logged and the loop carries on; a task
 killed by an escaped `BaseException` is logged and restarted. `Freshness` probes track data
-age (e.g. the last committed equity snapshot) separately from loop liveness.
+age (e.g. the snapshot loop's last committed snapshot) separately from loop liveness.
 `stop(deadline)` logs a loop task that already died (`task_died`, as `check()` does), lets
 steps finish until the deadline, then cancels the rest once and leaves them behind.
 """
