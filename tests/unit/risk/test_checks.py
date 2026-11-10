@@ -66,6 +66,7 @@ def run(
     control: ControlStatus = ALLOWED,
     mode_matches: bool = True,
     risk: dict[str, Any] | None = None,
+    faults: tuple[str, ...] = (),
 ) -> RiskDecision:
     profile = PROFILE.model_copy(update={"risk": PROFILE.risk.model_copy(update=risk or {})})
     return check_entry(
@@ -75,6 +76,7 @@ def run(
         profile=profile,
         control=control,
         mode_matches=mode_matches,
+        faults=faults,
     )
 
 
@@ -178,6 +180,30 @@ def test_daily_loss_rejects_and_pauses_until_next_day() -> None:
     d = run(portfolio={"equity": D("970")})  # loss 30 = 3 % of 1000
     assert not d.approved and "daily loss" in d.reasons[0]
     assert d.pause == "until_next_day"
+
+
+def test_fault_rejects_after_control_without_pause() -> None:
+    faults = ("equity snapshot overdue", "cash reconciliation failed")
+    d = run(faults=faults)
+    assert not d.approved and d.reasons == ("equity snapshot overdue",)
+    assert d.pause is None
+    killed = ControlStatus(killed=True, reasons=("kill file present",))
+    assert run(faults=faults, control=killed).reasons == ("control: kill file present",)
+
+
+def test_missing_baseline_rejects_without_pause() -> None:
+    d = run(portfolio={"day_start_equity": None})
+    assert not d.approved and d.reasons == ("daily-loss baseline unavailable",)
+    assert d.pause is None
+
+
+def test_unsettled_sell_rejects_its_symbol_only() -> None:
+    d = run(portfolio={"unsettled_sells": frozenset({BTC})})
+    assert not d.approved and d.reasons == ("unsettled sell on BTC/USD",)
+    assert d.pause is None
+    # 5a symbols are not "busy": one held position (limit 2 - 1) still leaves room for BTC.
+    ok = {"positions": (held(SOL),), "unsettled_sells": frozenset({ETH})}
+    assert run(portfolio=ok).approved
 
 
 def test_drawdown_rejects_and_pauses_manually() -> None:

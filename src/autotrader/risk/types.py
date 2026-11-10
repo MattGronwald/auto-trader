@@ -57,10 +57,11 @@ class OpenEntry(_Frozen):
 class PortfolioState(_Frozen):
     equity: Dec
     cash: Dec
-    day_start_equity: Dec
+    day_start_equity: Dec | None  # None: no trusted baseline; check_entry then rejects
     hwm: Dec
     positions: tuple[HeldPosition, ...] = ()
     open_entries: tuple[OpenEntry, ...] = ()
+    unsettled_sells: frozenset[str] = frozenset()  # symbols with a sell not yet settled
     entries_last_hour: int = 0
     entries_today: int = 0
     strategy_trades_n: int = 0
