@@ -30,8 +30,9 @@ The examples assume the default `config.yaml` (journal `data/autotrader.db`, SQL
 
 ## Entries rejected
 
-`RiskEngine.check()` rejects an entry with one of these reasons. Each is a persisted risk
-decision: no pause is set and no order row is written. Exits are never affected. `run core` calls
+`RiskEngine.check()` rejects an entry with one of these reasons. Each reason in the table
+below is a gather-time rejection: a persisted risk decision, no pause is set and no order row is
+written (the pre-submit case after the table is different). Exits are never affected. `run core` calls
 no `check()` until WP 1.5d-3, so today these describe what the engine will do.
 
 | Reason | Meaning | Clears when |
@@ -41,8 +42,12 @@ no `check()` until WP 1.5d-3, so today these describe what the engine will do.
 | `cash reconciliation failed` | The ledger cash check has not completed since startup, or its guard, snapshot or check stage raised. | A completed cash check with result baseline, ok or discrepancy (not `skipped`). After a `CommitUncertain` error it holds until the core is restarted. |
 | `unsettled sell on <SYM>` | An order row with side `sell` and `settled_at` NULL exists on that symbol. | The ledger settles the row. A `pending`/`unknown` sell without a broker id stays until the 1.5d-2 resolver or the manual procedure below settles it. |
 
-A fault, an overdue snapshot or a trading-day change that appears after the gather but before the
-broker call marks the order row `not_submitted` (log `risk.entry_not_submitted`); nothing is sent.
+Pre-submit re-check: a fault, an overdue snapshot or `trading day changed` that appears after
+the gather but before the broker call marks the order row `not_submitted` (log
+`risk.entry_not_submitted` with `reasons`); nothing is sent. This differs from the table: an order
+row exists and is marked. `trading day changed` means the trading day rolled over between the
+gather and the submit. It is per attempt, with nothing to clear: the next `check()` runs on the
+new day, which itself needs a trusted baseline (`daily-loss baseline unavailable` otherwise).
 
 `daily-loss baseline unavailable` is expected for the whole trading day after downtime across the
 00:00 UTC trading-day start (the core was down, so no snapshot fell in the window). It is not a

@@ -651,8 +651,8 @@ class RiskEngine:
     async def snapshot_equity(self) -> Account:
         """Called every `snapshot_interval_s` by `run core`'s supervised `risk.snapshot` loop. Its
         broker calls have their own `io_timeout_s` budget; journal writes are never cancelled.
-        Lock-free on purpose: it must never delay an exit. Returns the account it read, so a
-        `run core` feeds it to the ledger's cash check without a second broker call."""
+        Lock-free on purpose: it must never delay an exit. Returns the account it read, so
+        `run core` can feed it to the ledger's cash check without a second broker call."""
         deadline = self._monotonic() + self._io_timeout  # its own budget; no lock shared
         account = await self._within(deadline, self._broker.get_account)
         now = self._clock()  # receipt time stamps the row (spec 2026-11-09 3.1)
