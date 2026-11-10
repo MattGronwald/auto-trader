@@ -309,6 +309,11 @@ load or by injecting a 60 ms delay into a non-hanging call) and fixes it so that
 meant to hang can exhaust the budget, without wall-clock assertions (WP workflow lesson). The fix
 must not weaken what each test proves.
 
+**2026-11-09 correction (plan dry run):** "only the call meant to hang can exhaust the budget" is
+not achievable deterministically while `_within` gives every call real seconds; the fix is a
+large real-time margin (budget 1 s, 20x the observed failure) and is documented as a margin, not a
+guarantee. A fake event-loop clock would be needed for a guarantee and is not worth it here.
+
 ## 10. Docs
 
 Same PR as the code:
