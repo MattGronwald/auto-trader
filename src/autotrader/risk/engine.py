@@ -631,10 +631,10 @@ class RiskEngine:
                         deadline, partial(self._broker.cancel_order, row.broker_order_id)
                     )
                 except Exception:
-                    log.exception("risk.cancel_failed", order_id=row.id, symbol=row.symbol)
+                    log.exception("risk.cancel_failed", order_row=row.id, symbol=row.symbol)
                     failed.append(row.id)
                 else:
-                    log.info("risk.entry_cancel_requested", order_id=row.id, symbol=row.symbol)
+                    log.info("risk.entry_cancel_requested", order_row=row.id, symbol=row.symbol)
                     requested.append(row.id)
             return CancelResult(
                 requested=tuple(requested), failed=tuple(failed), unresolved=tuple(unresolved)

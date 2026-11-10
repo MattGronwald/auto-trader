@@ -357,6 +357,37 @@ async def test_without_kill_flatten_positions_keep_normal_management(
     assert (await h.position(pid)).exit_trigger == "stop"
 
 
+async def test_failed_cancel_backs_off(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    sim = make_sim(cls=CancelSpy)
+    assert isinstance(sim, CancelSpy)
+    h = Harness(sessions, bus, sim=sim)
+    row_id, entry_id = await h.submit_entry(ETH)
+    sim.fail.add(entry_id)
+    h.controls.latest = KILLED
+    attempts: list[int] = []
+    with capture_logs() as logs:
+        for t in range(9):
+            before = len(named(logs, "risk.cancel_failed"))
+            await h.pm.step()
+            if len(named(logs, "risk.cancel_failed")) > before:
+                attempts.append(t)
+            h.clock.advance(1)
+    assert attempts == [0, 1, 3, 7]  # delays of 1, 2 and 4 s
+    (alert,) = named(logs, "positions.cancel_failed_repeatedly")
+    assert alert["order_row"] == row_id and alert["failures"] == 3
+    assert named(logs, "risk.cancel_failed")[2]["order_row"] == row_id
+    sim.fail.clear()
+    h.clock.advance(8)
+    with capture_logs() as logs:
+        await h.pm.step()  # due again: the cancel is accepted
+        await h.pm.step()
+    assert sim.cancels == [entry_id]  # accepted once, excluded afterwards
+    (req,) = named(logs, "risk.entry_cancel_requested")
+    assert req["order_row"] == row_id and "order_id" not in req
+
+
 async def test_clearing_the_kill_stops_cancels_and_keeps_latched_exits(
     sessions: async_sessionmaker[AsyncSession], bus: EventBus
 ) -> None:
@@ -364,12 +395,13 @@ async def test_clearing_the_kill_stops_cancels_and_keeps_latched_exits(
     assert isinstance(sim, CancelSpy)
     h = Harness(sessions, bus, sim=sim, config=app_config(kill_flatten=True))
     pid = await h.open_position()
-    _, entry_id = await h.submit_entry(ETH)
+    row_id, entry_id = await h.submit_entry(ETH)
     sim.fail.add(entry_id)
     h.controls.latest = KILLED
     with capture_logs() as logs:
         await h.pm.step()
-    assert len(named(logs, "risk.cancel_failed")) == 1
+    (failed,) = named(logs, "risk.cancel_failed")
+    assert failed["order_row"] == row_id and "order_id" not in failed
     assert (await h.position(pid)).exit_trigger == "kill"
     sim.fail.clear()
     h.controls.latest = CLEAR
@@ -594,6 +626,7 @@ async def test_an_unknown_external_exit_alerts_every_60_s_without_a_holding(
     lines = named(logs, "positions.exit_unresolved")
     assert len(lines) == 2  # at 0 and at 61 s
     assert all(line["order_rows"] == [sell.id] and line["external"] for line in lines)
+    assert all(line["symbol"] == ETH and "key" not in line for line in lines)
     h.controls.latest = CLEAR
     with capture_logs() as logs:
         for t in (121, 150, 181):
@@ -618,6 +651,7 @@ async def test_a_stuck_external_sell_alerts_without_a_second_sell(
     lines = named(logs, "positions.exit_stuck")
     assert len(lines) == 2
     assert all(line["order_rows"] == [sell.id] and line["external"] for line in lines)
+    assert all(line["symbol"] == ETH and "key" not in line for line in lines)
 
 
 # --- the flat check --------------------------------------------------------------------

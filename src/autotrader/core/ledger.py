@@ -667,16 +667,17 @@ class Ledger:
         fields = {"kind": error.kind, "order_row": order_row_id, "detail": error.detail}
         try:
             await self._bus.publish_tx(build, verify_unit)
-        finally:
-            # Logged even when the commit raises (CommitUncertain or a journal error; it
-            # propagates as before): the anomaly was seen either way. Nothing is logged if
-            # `build` raised before deciding.
-            if outcome == ["persists"]:
-                log.debug("ledger.anomaly_persists", kind=error.kind, order_row=order_row_id)
-            elif outcome == ["repaused"]:
-                log.warning("ledger.anomaly_repaused", **fields)
-            elif outcome == ["new"]:
-                log.error("ledger.anomaly", **fields)
+        except Exception as e:
+            # Not logged as an anomaly or a re-pause: the commit may not have landed, and a
+            # warning must not claim a pause that did not. The sync loop books the row again.
+            log.error("ledger.anomaly_unrecorded", error=type(e).__name__, **fields)
+            raise
+        if outcome == ["persists"]:
+            log.debug("ledger.anomaly_persists", kind=error.kind, order_row=order_row_id)
+        elif outcome == ["repaused"]:
+            log.warning("ledger.anomaly_repaused", **fields)
+        elif outcome == ["new"]:
+            log.error("ledger.anomaly", **fields)
 
     # --- cash (D17) ----------------------------------------------------------------------
 

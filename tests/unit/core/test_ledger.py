@@ -1039,6 +1039,34 @@ async def test_a_persisting_anomaly_writes_one_event_and_keeps_re_pausing(
     assert [e["event"] for e in logs if e["log_level"] in ("error", "warning")] == []
 
 
+async def test_anomaly_repause_not_logged_when_commit_fails(
+    sessions: async_sessionmaker[AsyncSession],
+    hooked: tuple[Ledger, list[DomainEvent], EventBus],
+    hook: CommitHook,
+) -> None:
+    ledger, _, _ = hooked
+    row = await _sell_row(sessions)
+    lone = OrderUpdate(
+        order_row_id=row,
+        status="filled",
+        filled_qty=D("1"),
+        fills=(_sell_fill("x:1"),),
+        min_qty=RULES.min_qty,
+    )
+    assert await ledger.apply(lone) == "anomaly"
+    async with sessions() as s:
+        await repo.set_control(s, PAUSED_KEY, False)  # the operator resumes
+    hook.fail_before = 1  # the re-pause unit's commit fails
+
+    with capture_logs() as logs, pytest.raises(CommitUncertain):
+        await ledger.apply(lone)
+    assert not [e for e in logs if e["event"] == "ledger.anomaly_repaused"]
+    (line,) = [e for e in logs if e["event"] == "ledger.anomaly_unrecorded"]
+    assert line["log_level"] == "error"
+    assert line["kind"] == "sell_without_position" and line["order_row"] == row
+    assert line["error"] == "CommitUncertain" and "detail" in line
+
+
 async def test_a_changed_anomaly_on_the_same_row_writes_a_new_event(
     sessions: async_sessionmaker[AsyncSession], ledger: Ledger
 ) -> None:

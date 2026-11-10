@@ -449,7 +449,7 @@ async def test_an_unknown_exit_without_a_broker_id_is_never_retried(
     sessions: async_sessionmaker[AsyncSession], bus: EventBus
 ) -> None:
     h = Harness(sessions, bus, sim=make_sim(cls=LostClose))
-    await h.open_position()
+    pid = await h.open_position()
     h.quote(BTC, 95.0)
     await h.pm.step()
     with capture_logs() as logs:
@@ -461,13 +461,14 @@ async def test_an_unknown_exit_without_a_broker_id_is_never_retried(
     lines = named(logs, "positions.exit_unresolved")
     assert len(lines) == 2
     assert all(line["order_rows"] == [sell.id] and not line["external"] for line in lines)
+    assert all(line["position_id"] == pid and "key" not in line for line in lines)
 
 
 async def test_an_in_flight_exit_alerts_when_stuck(
     sessions: async_sessionmaker[AsyncSession], bus: EventBus
 ) -> None:
     h = Harness(sessions, bus)
-    await h.open_position()
+    pid = await h.open_position()
     h.quote(BTC, 95.0)
     await h.pm.step()
     with capture_logs() as logs:
@@ -478,6 +479,8 @@ async def test_an_in_flight_exit_alerts_when_stuck(
         await h.pm.step()
     (stuck,) = named(logs, "positions.exit_stuck")
     assert stuck["order_rows"] == [(await h.sells())[0].id]
+    assert stuck["position_id"] == pid
+    assert stuck["external"] is False and "key" not in stuck
     assert len(await h.sells()) == 1
 
 
