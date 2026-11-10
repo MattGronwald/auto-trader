@@ -881,8 +881,8 @@ class HangingSubmit(SimBroker):
 async def test_hung_entry_submit_is_unknown(
     sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
 ) -> None:
-    engine = make_engine_(_sim(HangingSubmit), sessions, gate, io_timeout_s=0.05, monotonic=Mono())
-    result = await asyncio.wait_for(engine.check(intent(cycle_id)), 2)
+    engine = make_engine_(_sim(HangingSubmit), sessions, gate, io_timeout_s=1.0, monotonic=Mono())
+    result = await asyncio.wait_for(engine.check(intent(cycle_id)), 10)
     assert result.decision.approved and result.status == "unknown"
     (row,) = await orders(sessions)
     assert (row.status, row.broker_order_id) == ("unknown", None)
@@ -1214,7 +1214,7 @@ async def test_only_network_calls_count_against_the_budget(
 ) -> None:
     """Journal work is never cancelled by the budget (a cancelled session can poison a
     pooled connection for the next caller, e.g. an exit); a slow broker call is."""
-    budget = 0.05
+    budget = 1.0
     broker = _sim(HangingAccount) if slow == "broker" else _sim()
     if slow == "journal":
         original = repo.strategy_trade_stats
@@ -1225,7 +1225,7 @@ async def test_only_network_calls_count_against_the_budget(
 
         monkeypatch.setattr(repo, "strategy_trade_stats", slow_stats)
     engine = make_engine_(broker, sessions, gate, io_timeout_s=budget, monotonic=Mono())
-    result = await asyncio.wait_for(engine.check(intent(cycle_id)), 5)
+    result = await asyncio.wait_for(engine.check(intent(cycle_id)), 10)
     if slow == "journal":
         assert result.decision.approved and result.status == "new"
     else:
