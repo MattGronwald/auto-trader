@@ -26,6 +26,13 @@ snapshot or to current equity; `repo.day_start_equity` feeds only the informatio
 pre-boundary baseline. `last_snapshot_at` follows the snapshot loop (`snapshot_equity()`)
 only, never the peak snapshot `check()` writes.
 
+Health faults (spec 2026-11-09 4, 5.2, 6): `health_faults()` is read at the start of
+`_gather_entry` and reaches `check_entry(faults=...)`, which rejects with the first one right
+after check 1 and sets no pause. In order: `equity snapshot overdue` (no loop snapshot yet in
+this process, or one older than `2 x snapshot_interval_s`) and `cash reconciliation failed`
+(`cash_fault`, initially `not yet reconciled`; cleared by `cash_reconciled()`; a sticky fault,
+`CommitUncertain`, holds until restart and is never downgraded). Exits ignore both.
+
 Each locked section has ONE budget of `io_timeout_s`, measured from taking its lock and
 shared by its network/gate awaits only (gate.status, get_account, get_positions, each
 asset_rules, get_order and order_fills, submit/close); each is wrapped in `_within`. Journal
@@ -162,8 +169,43 @@ class RiskEngine:
         # yet); the peak snapshot `check()` writes never sets it (spec 2026-11-09 4). Drives
         # run core's `risk.snapshot_overdue`, separately from the snapshot loop's liveness.
         self.last_snapshot_at: float | None = None
+        # Cash-reconciliation fault (spec 2026-11-09 5.2): in memory, per process. Set until
+        # the cash step has reconciled once; sticky (CommitUncertain) holds until restart.
+        self.cash_fault: str | None = "not yet reconciled"
+        self._cash_fault_sticky = False
         self._entry_lock = asyncio.Lock()  # check(): two entries never pass check 5 together
         self._exit_lock = asyncio.Lock()  # exit(): never waits for an entry
+
+    # --- health: entry faults (spec 2026-11-09 4, 5.2, 6) ------------------------------
+
+    def set_cash_fault(self, reason: str, *, sticky: bool = False) -> None:
+        """Fail entries closed until `cash_reconciled()`. Stickiness only ever goes from
+        false to true: a later plain fault replaces the reason of a non-sticky one but never
+        downgrades a sticky one. Logged on transitions only (clear -> set, or becoming sticky)."""
+        was_set, was_sticky = self.cash_fault is not None, self._cash_fault_sticky
+        if not was_sticky:
+            self.cash_fault = reason
+        self._cash_fault_sticky = was_sticky or sticky
+        if not was_set or (self._cash_fault_sticky and not was_sticky):
+            log.warning("risk.cash_fault_set", reason=self.cash_fault, sticky=sticky)
+
+    def cash_reconciled(self) -> None:
+        """Clear the cash fault; a no-op while it is sticky."""
+        if self._cash_fault_sticky or self.cash_fault is None:
+            return
+        self.cash_fault = None
+        log.info("risk.cash_fault_cleared")
+
+    def health_faults(self) -> tuple[str, ...]:
+        """Reasons that reject every entry, read with the engine clock right now: no loop
+        snapshot yet or one older than `2 x snapshot_interval_s`, then the cash fault."""
+        faults: list[str] = []
+        last = self.last_snapshot_at
+        if last is None or self._monotonic() - last > 2 * self._snapshot_interval_s:
+            faults.append("equity snapshot overdue")
+        if self.cash_fault is not None:
+            faults.append("cash reconciliation failed")
+        return tuple(faults)
 
     # --- entries ---------------------------------------------------------------------
 
@@ -175,7 +217,9 @@ class RiskEngine:
             deadline = self._monotonic() + self._io_timeout
             now = self._clock()
             try:
-                control, portfolio, market = await self._gather_entry(intent.symbol, now, deadline)
+                control, portfolio, market, faults = await self._gather_entry(
+                    intent.symbol, now, deadline
+                )
             except Exception as e:  # fail closed: unknown state must not allow an entry
                 log.exception("risk.state_unavailable", symbol=intent.symbol)
                 decision = RiskDecision(
@@ -190,6 +234,7 @@ class RiskEngine:
                 profile=self._profile,
                 control=control,
                 mode_matches=self._mode == self._broker.mode(),
+                faults=faults,
             )
             await self._persist(intent.cycle_id, "entry", decision, now)
             if not decision.approved or decision.order is None:
@@ -228,9 +273,11 @@ class RiskEngine:
 
     async def _gather_entry(
         self, symbol: str, now: datetime, deadline: float
-    ) -> tuple[ControlStatus, PortfolioState, MarketSnapshot]:
+    ) -> tuple[ControlStatus, PortfolioState, MarketSnapshot, tuple[str, ...]]:
         """Only the network/gate awaits are budgeted; a timeout raises out of here and
-        `check()` turns it into the persisted `state unavailable` rejection."""
+        `check()` turns it into the persisted `state unavailable` rejection. The health
+        faults are read first, before the order sync; the gather runs fully either way."""
+        faults = self.health_faults()
         # Book our own orders BEFORE reading positions: a fill the sync observed is then in
         # the journal and in the positions read below (never neither position nor entry).
         synced = await self._sync(deadline)
@@ -331,7 +378,7 @@ class RiskEngine:
             rules=rules,
             fees=fees,
         )
-        return control, portfolio, market
+        return control, portfolio, market, faults
 
     async def sync_orders(self) -> SyncResult:
         """Read-only broker view of every unsettled order for the ledger (spec 4.2). Takes

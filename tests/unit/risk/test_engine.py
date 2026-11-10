@@ -12,6 +12,7 @@ from typing import Any, NoReturn, TypeVar
 import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from structlog.testing import capture_logs
 
 import autotrader.risk.engine as engine_module
 from autotrader.broker.base import (
@@ -190,8 +191,9 @@ def make_engine_(
     monotonic: "Mono | None" = None,
     cls: type[RiskEngine] = RiskEngine,
     ledger: Accounting | None = None,
+    healthy: bool = True,
 ) -> RiskEngine:
-    return cls(
+    engine = cls(
         broker,
         profile=PROFILE,
         strategy_id=1,
@@ -205,6 +207,10 @@ def make_engine_(
         io_timeout_s=io_timeout_s,
         monotonic=time.monotonic if monotonic is None else monotonic,
     )
+    if healthy:  # a fresh loop snapshot and a reconciled cash step (spec 2026-11-09 4, 5.2)
+        engine.last_snapshot_at = (time.monotonic if monotonic is None else monotonic)()
+        engine.cash_reconciled()
+    return engine
 
 
 def intent(cycle_id: int, **kw: object) -> EntryIntent:
@@ -1304,19 +1310,21 @@ async def test_last_snapshot_at_tracks_committed_writes(
 ) -> None:
     mono = Mono()
     mono.t = 2.0
-    ok = make_engine_(_broker(SimBroker), sessions, gate, monotonic=mono)
+    ok = make_engine_(_broker(SimBroker), sessions, gate, monotonic=mono, healthy=False)
     assert ok.last_snapshot_at is None
     await ok.snapshot_equity()
     assert ok.last_snapshot_at == 2.0
 
-    no_account = make_engine_(_broker(AccountDown), sessions, gate, monotonic=mono)
+    no_account = make_engine_(_broker(AccountDown), sessions, gate, monotonic=mono, healthy=False)
     with pytest.raises(ConnectionError):
         await no_account.snapshot_equity()
     assert no_account.last_snapshot_at is None  # nothing was written
 
     mono.t = 5.0  # advance, so the assertion shows the value was set by this write
     later = Clock(NOW + timedelta(minutes=1))  # equity_snapshots.ts is unique
-    partial = make_engine_(_broker(PositionsDown), sessions, gate, clock=later, monotonic=mono)
+    partial = make_engine_(
+        _broker(PositionsDown), sessions, gate, clock=later, monotonic=mono, healthy=False
+    )
     with pytest.raises(ConnectionError):
         await partial.snapshot_equity()
     assert partial.last_snapshot_at == 5.0  # equity/HWM still committed
@@ -2000,7 +2008,116 @@ async def test_peak_snapshot_in_check_does_not_refresh_last_snapshot_at(
     broker.equity = D("1100")  # above the seeded HWM 1000: check() writes a peak row
     mono = Mono()
     mono.t = 3.0
-    engine = make_engine_(broker, sessions, gate, monotonic=mono)
+    engine = make_engine_(broker, sessions, gate, monotonic=mono, healthy=False)
     await engine.check(intent(cycle_id))
     assert [r.equity for r in await snapshots(sessions)] == [D("1000"), D("1100")]
     assert engine.last_snapshot_at is None
+
+
+# --- health faults: snapshot freshness and the cash-reconciliation fault ----------------
+
+
+async def reasons_of(engine: RiskEngine, cycle_id: int) -> tuple[str, ...]:
+    result = await engine.check(intent(cycle_id))
+    return result.decision.reasons
+
+
+async def test_fresh_engine_rejects_snapshot_overdue_first(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    engine = make_engine_(sim, sessions, gate, healthy=False)
+    result = await engine.check(intent(cycle_id))
+    assert not result.decision.approved
+    assert result.decision.reasons == ("equity snapshot overdue",)
+    assert result.decision.pause is None
+    assert engine.health_faults() == ("equity snapshot overdue", "cash reconciliation failed")
+
+
+async def test_loop_snapshot_older_than_two_intervals_rejects(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    mono = Mono()
+    engine = make_engine_(_broker(SimBroker), sessions, gate, monotonic=mono, healthy=False)
+    await engine.snapshot_equity()  # t = 0
+    engine.cash_reconciled()
+    mono.t = 120.0
+    assert (await engine.check(intent(cycle_id))).decision.approved
+    mono.t = 121.0
+    assert await reasons_of(engine, cycle_id) == ("equity snapshot overdue",)
+
+
+async def test_startup_cash_fault_rejects_until_reconciled(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    engine = make_engine_(sim, sessions, gate, healthy=False)
+    engine.last_snapshot_at = time.monotonic()
+    assert engine.cash_fault == "not yet reconciled"
+    assert await reasons_of(engine, cycle_id) == ("cash reconciliation failed",)
+    engine.cash_reconciled()
+    assert engine.cash_fault is None
+    assert (await engine.check(intent(cycle_id))).decision.approved
+
+
+async def test_sticky_cash_fault_survives_reconciliation(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    engine = make_engine_(sim, sessions, gate, healthy=False)
+    engine.last_snapshot_at = time.monotonic()
+    engine.set_cash_fault("CommitUncertain", sticky=True)
+    engine.cash_reconciled()
+    assert engine.cash_fault == "CommitUncertain"
+    assert await reasons_of(engine, cycle_id) == ("cash reconciliation failed",)
+
+    other = make_engine_(sim, sessions, gate, healthy=False)
+    other.last_snapshot_at = time.monotonic()
+    other.set_cash_fault("x")
+    assert other.cash_fault == "x"
+    other.cash_reconciled()
+    assert other.cash_fault is None
+    assert (await other.check(intent(cycle_id))).decision.approved
+
+
+async def test_plain_fault_never_downgrades_a_sticky_one(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    engine = make_engine_(sim, sessions, gate, healthy=False)
+    engine.last_snapshot_at = time.monotonic()
+    engine.set_cash_fault("a", sticky=True)
+    engine.set_cash_fault("b")
+    engine.cash_reconciled()
+    assert await reasons_of(engine, cycle_id) == ("cash reconciliation failed",)
+
+
+async def test_restart_with_fresh_journal_baseline_still_waits_for_loop_and_cash(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    # The autouse baseline is a trusted pre-boundary snapshot in the journal; a new engine
+    # (a restart) still needs its own loop snapshot and a reconciled cash step.
+    engine = make_engine_(_broker(SimBroker), sessions, gate, healthy=False)
+    assert await reasons_of(engine, cycle_id) == ("equity snapshot overdue",)
+    await engine.snapshot_equity()
+    assert await reasons_of(engine, cycle_id) == ("cash reconciliation failed",)
+    engine.cash_reconciled()
+    assert (await engine.check(intent(cycle_id))).decision.approved
+
+
+async def test_fault_transitions_are_logged_once(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    engine = make_engine_(sim, sessions, gate, healthy=False)
+    with capture_logs() as logs:
+        engine.set_cash_fault("first")
+        engine.set_cash_fault("second")
+        engine.cash_reconciled()
+        engine.cash_reconciled()
+        engine.set_cash_fault("third")
+        engine.set_cash_fault("third", sticky=True)
+        engine.set_cash_fault("third", sticky=True)
+    set_ = [e for e in logs if e["event"] == "risk.cash_fault_set"]
+    cleared = [e for e in logs if e["event"] == "risk.cash_fault_cleared"]
+    assert len(cleared) == 1 and cleared[0]["log_level"] == "info"
+    # A fresh engine already carries `not yet reconciled`: "first"/"second" are no transition.
+    assert [(e["reason"], e["sticky"], e["log_level"]) for e in set_] == [
+        ("third", False, "warning"),
+        ("third", True, "warning"),
+    ]

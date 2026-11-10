@@ -6,6 +6,7 @@ from the entry order's outcome when `check()` syncs orders.
 """
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
@@ -159,6 +160,8 @@ async def wire(
         ledger=Ledger(bus, sessions, clock=lambda: NOW),
         clock=lambda: NOW,
     )
+    engine.last_snapshot_at = time.monotonic()
+    engine.cash_reconciled()
     runner = CycleRunner(
         profile=prof,
         strategy_id=strategy_id,
