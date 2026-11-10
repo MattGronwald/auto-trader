@@ -7,6 +7,9 @@ journal-namespaced client ids as the ownership proof (2.3), the type (b) clock s
 hits (3.7), one per-fill oversell allocation (5.4). A cold
 builder check against the code ran before review; its findings are folded in (3.1, 3.2, 3.6, 3.8,
 5.4).
+Revised 2026-11-10 after the plan dry run and the PR #34 review (owner go, D20.10-11): the
+incident hold-back is kept (3.6), clock clears and type (b) incidents are conditional on the clock
+they observed (3.6, 3.7), `repair link` accepts type (b) `lookup_failed` (5.2, 8).
 
 ## 1. Scope and intent
 
@@ -220,12 +223,12 @@ unsettled, keeps its reservation and keeps blocking entries on the symbol and fl
 retried. The resolver does not look it up again: automatic investigation is bounded; the operator
 takes over (5.2, 5.3).
 
-**Note 2026-11-10 (plan dry run, owner decision pending):** because an incident row is never read
+**Note 2026-11-10 (plan dry run; owner decision: keep, D20.10):** because an incident row is never read
 again, `Ledger.apply_all` holds back every later row on its symbol until the operator repairs it,
 a later exit's fills included (the broker sold, the journal position stays open, the cash check
 stays `skipped`). The hold-back predates 1.5d-2 (id-less rows); incidents make it indefinite.
-The implementation plan keeps it (booking a later exit before an unresolved earlier entry gives
-anomalies or a wrong P&L), pins it with a test and documents it in the runbook.
+It is kept (booking a later exit before an unresolved earlier entry gives anomalies or a wrong
+P&L), pinned with a test and documented in the runbook.
 
 ### 3.7 Link
 
@@ -237,7 +240,10 @@ which books its fills and settles it.
 For a type (b) row a match writes nothing: it only proves the broker still knows the order under
 our client id. **`resolve_since` is kept** (revised after PR #33 review). It is cleared only by a
 successful normal `get_order` read of the row, by the row becoming an incident, or by a repair
-command; a client-id hit never clears or restarts it. So if `get_order` keeps raising
+command; a client-id hit never clears or restarts it. (2026-11-10, PR #34 review: a clear and a
+type (b) incident each apply only while `resolve_since` still holds the value their decision
+observed, checked in the write itself; a late clear never erases a newer clock, and an incident
+decided on a clock that was cleared meanwhile is not written.) So if `get_order` keeps raising
 `OrderNotFound` while the client-id lookup keeps finding the order, the row becomes an incident at
 `resolve_since + order_resolution_timeout_s`, reason `lookup_inconsistent`, exactly once, across
 restarts.
@@ -308,8 +314,10 @@ id, and otherwise a new `get_order_view(order_id) -> BrokerOrderView` **(builder
 ### 5.2 `repair link <row> <broker_order_id>`
 
 For an unsettled row that either has no broker id and is `pending`/`unknown` (incident or not),
-or is a type (b) incident (`not_found`, `lookup_inconsistent`, `client_id_mismatch` on a row with a
-broker id), whose broker id is then replaced (D20.5). Connects the broker (read-only), reads the
+or is a type (b) incident (`not_found`, `lookup_failed`, `lookup_inconsistent`, `client_id_mismatch`
+on a row with a broker id), whose broker id is then replaced (D20.5; `lookup_failed` added
+2026-11-10 after the PR #34 review, D20.11: without it a type (b) row whose client-id lookups
+failed until the deadline had no CLI repair at all). Connects the broker (read-only), reads the
 order, and requires the ownership proof of 2.3 (the broker order's client id equals the row's
 namespaced client id) plus the symbol, side, qty and 5-minute `created_at` checks of 3.4. A row
 without ownership proof (`no_ownership_proof`: NULL or legacy client id) is refused: it goes to the
@@ -430,7 +438,9 @@ corrected (section 7).
 10. Type (b): `get_order` raises `OrderNotFound` for a known id; `resolve_since` persisted;
     entries on every symbol rejected until the deadline; incident at the deadline, after which
     only its own symbol is blocked and `get_order` is no longer called for it; `repair link`
-    replaces its broker id.
+    replaces its broker id. With client-id lookups failing through the deadline the incident is
+    `lookup_failed`; after the broker recovers, `repair link` links it and the next sync settles it
+    (added 2026-11-10, PR #34).
 10a. Type (b) with `get_order` always `OrderNotFound` and the client-id lookup always matching,
     across the full deadline and a restart: `resolve_since` never resets; exactly one
     `lookup_inconsistent` incident.

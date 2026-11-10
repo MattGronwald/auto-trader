@@ -9,8 +9,9 @@ incidents, and `autotrader repair link|not-submitted|oversell` replaces hand-wri
 **Architecture:** Pure helpers (ownership, match, client-id formats) in a new `risk/resolve.py`.
 The engine decides (it alone holds the broker): `sync_orders()` = the read step both callers use
 plus a resolve step only it runs; it returns its decisions as `SyncResult.resolutions`. The
-ledger writes them (it alone holds the bus): `apply_all()` applies resolutions as conditional
-`publish_tx` units before booking. The oversell split lives in the ledger's `_sell` /
+ledger writes them (it alone holds the bus): `apply_all()` applies resolutions before booking,
+each as a conditional write (links and incidents as `publish_tx` units with their event, clock
+starts and clears as plain session writes). The oversell split lives in the ledger's `_sell` /
 `_maybe_close`. Repair = journal-side `core/repair.py` (prepare, then commit one unit) plus a
 `repair` typer sub-app in `cli_repair.py`.
 
@@ -26,17 +27,22 @@ section numbers below refer to it). Decisions: PLAN.md D20.
 point, an exact `_split` for ordinary fills, broker failures in `repair link`, a benign refusal
 logged as `bus.unit_failed`, a JSON-typed migration insert, SimBroker `created_at` sitting on the
 skew bound, and two design points: a stale type (b) incident (fixed in Tasks 5-6) and incident
-rows holding back later bookings on their symbol (**owner decision, see "Open decision"**).
+rows holding back later bookings on their symbol (owner decision: keep, see "Incident hold-back").
 
-**Open decision (dry-run finding, not in the spec):** an incident row is never read again, so
+**Incident hold-back (dry-run finding; owner decision 2026-11-10: keep, D20.10):** an incident row is never read again, so
 `Ledger.apply_all` holds back every later row on its symbol until the operator repairs it,
 including a later exit's fills (the broker sells, the journal position stays open, the cash
 check stays `skipped`). That hold-back predates this WP (id-less rows), but incidents make it
 indefinite. Relaxing it would book an exit before an unresolved earlier entry (anomalies, or
 a wrong P&L). This plan keeps the hold-back (fail safe) and makes it visible: a test pins it
 (Task 6), `risk.order_incident_open` lists the held-back rows, and the runbook says an incident
-must be repaired before anything later on its symbol books (Task 11). Spec 3.6 gets a dated note
-in this plan PR.
+must be repaired before anything later on its symbol books (Task 11). Spec 3.6 has a dated note.
+
+**PR #34 review (Codex, 2026-11-10), folded in:** (1) the type (b) incident guard is in the
+`UPDATE`'s `WHERE`, not a Python comparison before it (WAL + the driver's implicit transactions
+let a clear commit between the read and the write); (2) `clear_clock` carries the clock it
+observed and clears only that one, so a delayed clear can never erase a newer episode's clock;
+(3) `repair link` also accepts type (b) `lookup_failed` incidents (spec 5.2, D20.11).
 
 ## Global Constraints
 
@@ -80,8 +86,9 @@ in this plan PR.
    (`lookup_failed` if none). Test in Task 6.
 5. A type (b) clock **cleared by a successful `get_order`** read, then a later `OrderNotFound`:
    the clock restarts at the new miss, not at the old `resolve_since`. A type (b) incident
-   decided before such a clear is not written (dry-run race: `check()`'s own read clears the
-   clock between `sync_orders` deciding and `apply_all` writing). Tests in Tasks 5 and 6.
+   decided before such a clear is not written, even if the clear commits between the incident
+   unit's read and its write; a clear decided on an old clock never erases a newer one. Tests
+   in Tasks 5 and 6.
 
 ---
 
@@ -237,7 +244,8 @@ Behaviour:
       at: AwareDatetime
       broker_order_id: str | None = None  # link only
       reason: IncidentReason | None = None  # incident only
-      clock: AwareDatetime | None = None  # type (b) incident only: the resolve_since it was decided on
+      # clear_clock and type (b) incidents: the resolve_since the decision observed
+      clock: AwareDatetime | None = None
   ```
   and `SyncResult.resolutions: tuple[OrderResolution, ...] = ()`.
 - Produces (`core/ledger.py`): `class OrderResolved(LedgerEvent)`: `order_row_id`, `broker_order_id`, `client_order_id: str | None`, `how: Literal["resolver"] = "resolver"`; `class OrderIncident(LedgerEvent)`: `order_row_id`, `symbol`, `side`, `qty: Decimal`, `client_order_id`, `broker_order_id`, `reason: str`, `submitted_at: datetime`.
@@ -245,15 +253,17 @@ Behaviour:
 
 Writes, each its own unit; a unit whose conditional update matched no row returns `None` (no event):
 - `link`: `UPDATE orders SET broker_order_id=?, updated_at=at WHERE id=? AND broker_order_id IS NULL AND settled_at IS NULL AND incident IS NULL`, event `OrderResolved`; after commit `log.info("risk.order_resolved", order_row=..., broker_order_id=...)`.
-- `incident`: `... SET incident=reason, incident_at=at, resolve_since=NULL WHERE id=? AND incident IS NULL AND settled_at IS NULL`, plus, when `clock` is set (type (b)), the row's `resolve_since` must still equal `clock` (compare in Python after reading the row in the unit; datetimes are text on SQLite). A stale type (b) decision, whose clock `check()`'s own read cleared (`clear_clock`) or restarted in between, writes nothing (dry-run race). Event `OrderIncident` (row fields read in the unit); after commit `log.error("risk.order_incident", order_row=..., symbol=..., reason=...)`.
-- `start_clock`: `... SET resolve_since=at WHERE id=? AND resolve_since IS NULL AND incident IS NULL`; `clear_clock`: `... SET resolve_since=NULL WHERE id=? AND resolve_since IS NOT NULL`. Plain session writes, no event, no bus (bookkeeping like `update_order`).
+- `incident`: `... SET incident=reason, incident_at=at, resolve_since=NULL WHERE id=? AND incident IS NULL AND settled_at IS NULL`, plus `AND resolve_since = :clock` when `clock` is set (type (b)). The guard MUST be in the `UPDATE` itself, not a Python comparison before it: the journal runs WAL and the driver opens a transaction only at the first write, so a clear can commit between the unit's read and its `UPDATE` (Codex reproduced it). Bind `:clock` through the column (`Order.resolve_since == r.clock`): `UTCDateTime` stores naive UTC on SQLite, so the bound value equals the stored one. Build the event only if the `UPDATE`'s `rowcount == 1` (read the row's fields in the same unit after the update); otherwise return `None`. A stale type (b) decision, whose clock was cleared or restarted, writes nothing. Event `OrderIncident`; after commit `log.error("risk.order_incident", order_row=..., symbol=..., reason=...)`.
+- `start_clock`: `... SET resolve_since=at WHERE id=? AND resolve_since IS NULL AND incident IS NULL AND settled_at IS NULL`; `clear_clock`: `... SET resolve_since=NULL WHERE id=? AND resolve_since = :clock` (the clock its read observed; a delayed clear never erases a newer episode's clock). Plain session writes, no event, no bus (bookkeeping like `update_order`).
 - A resolution that raises is logged `ledger.resolution_failed` (`order_row`, `action`, exc_info) and does not stop the others or the booking. `CancelledError` propagates.
 
 - [ ] **Step 1: Failing tests** (`test_ledger.py`, rows built like the file's other order rows):
   - `test_link_writes_once_and_publishes_once`: two identical `link` resolutions in one call -> `broker_order_id` set, exactly one `OrderResolved` event; a `link` on a row that already has a broker id or an incident writes nothing.
   - `test_incident_writes_once_clears_the_clock_and_logs`: `start_clock` then `incident` -> `incident`, `incident_at` set, `resolve_since is None`, one `OrderIncident` with the row's fields, one `risk.order_incident` log; a second `incident` with another reason changes nothing.
   - `test_start_clock_never_moves_an_existing_clock`; `test_clear_clock`.
-  - `test_stale_type_b_incident_is_not_written` (Review Focus 5): row with `resolve_since=t0`; an `incident` with `clock=t0` applied after a `clear_clock` -> nothing written, no event; with `clock=t0` while `resolve_since=t0` -> written.
+  - `test_stale_type_b_incident_is_not_written` (Review Focus 5): row with `resolve_since=t0`; an `incident` with `clock=t0` applied after a `clear_clock(clock=t0)` -> nothing written, no event; with `clock=t0` while `resolve_since=t0` -> written.
+  - `test_clear_committed_inside_the_incident_unit_wins` (PR #34 finding 1): needs a new hook, since `tests/dbhooks.py` only hooks `commit()` (and pausing after the `UPDATE` would hold SQLite's write lock, so the other session's clear would fail after `busy_timeout`). Add `CommitHook.block_before_update: asyncio.Event | None` (+ `update_reached: asyncio.Event`): the next `HookedSession.execute` of an `Update` on `orders` sets `update_reached` and awaits the event before executing (one-shot, like `block_before`). The pause is after any read the unit does and before its first write, so a regression to a Python-side check would read `t0`, pause, and still write. Test: arm the hook; start the incident unit as a task; await `update_reached`; commit `clear_clock(clock=t0)` from a plain session; set the event; await the task -> no incident, no `OrderIncident`, `resolve_since is None`.
+  - `test_delayed_clear_never_erases_a_newer_clock` (PR #34 finding 2): `resolve_since=t0`; apply `clear_clock(clock=t0)` and `start_clock(at=t1)` (the sync loop's episode), then the delayed `clear_clock(clock=t0)` -> `resolve_since == t1`.
   - `test_failed_resolution_does_not_block_booking`: a `link` whose unit raises (`hooked_sessionmaker` `fail_before=1`) is logged `ledger.resolution_failed`, the same pass still books another symbol's update.
 - [ ] **Step 2:** `uv run pytest tests/unit/core/test_ledger.py -v -k "link or incident or clock or resolution"`. Expected: FAIL.
 - [ ] **Step 3:** Implement; extend the ledger module docstring (resolutions are applied first, each conditional).
@@ -274,16 +284,19 @@ Writes, each its own unit; a unit whose conditional update matched no row return
 Read step (both callers; spec 3.2): skip rows with `incident` set (no update, not failed); id-less
 local finals as today; id-less `pending`/`unknown` -> type (a) candidates; for rows with a broker id,
 `OrderNotFound` from the read -> type (b) candidate (and in `failed`), other exceptions -> `failed` as
-today; a successful read of a row with `resolve_since` set adds `clear_clock`.
+today; a successful read of a row with `resolve_since` set adds `clear_clock` with
+`clock=row.resolve_since` (the value this read observed).
 
 Resolve step (`sync_orders` only), `now = self._clock()` once, `jid = await self._journal_id()`:
 - type (a) rows in `self._in_flight` are skipped (checked at lookup time, after any await).
 - `jid is None` (hand-deleted row): resolve nothing this pass, `log.error("risk.journal_id_missing")`
   (marking every row `no_ownership_proof` would turn a journal fault into permanent incidents).
 - no ownership proof (`not owns(row.client_order_id, jid)`) -> `incident` `no_ownership_proof` at once, no lookup.
-- type (b): `since = row.resolve_since` or, if None, `now` plus a `start_clock` resolution (emitted
-  before any incident for the row, also for `no_ownership_proof`). Every type (b) incident carries
-  `clock=since` (Task 5 writes it only if the clock is unchanged).
+- type (b): `since = row.resolve_since` or, if None, `now` plus a `start_clock` resolution with
+  `at=since` (the identical value; emitted before any incident for the row, also for
+  `no_ownership_proof`). Every type (b) incident carries `clock=since`; Task 5 writes it only while
+  `resolve_since == since`, so never re-read the clock between the two (a different value would
+  silently push the incident to a later pass).
 - lookup `get_order_by_client_id` via `_within(deadline, ...)`; a spent budget = not looked up.
 - found: `row.client_order_id == view.client_order_id` and `mismatches(...)` empty (type (b) passes `broker_order_id=row.broker_order_id`) -> type (a): `link`; type (b): nothing (clock kept, spec 3.7). Otherwise -> `incident` `client_id_mismatch` at once.
 - `None` -> outcome `not_found`; exception -> `lookup_failed`; remember it in `self._last_outcome: dict[int, IncidentReason]`.
@@ -311,7 +324,8 @@ the mismatch test (8) moves the row's `submitted_at` past the bound on purpose.
   - `test_rows_without_ownership_proof_are_incidents_without_lookup` (9): `NULL`, `at-o5`, `at-c7-e` client ids -> `no_ownership_proof` on pass 1, lookup spy not called.
   - `test_other_journals_order_is_never_linked` (9a): two journals (two `db_url`s, different `jid`) on one SimBroker; journal A's order exists; journal B's identical-shape submit response is lost (`fail_submit_after_accept`) -> B links its own order only, never A's (assert B's `broker_order_id` != A's). A regression guard: the lookup is by B's own namespaced id, so A's order is never even returned.
   - `test_type_b_incident_after_check_cleared_the_clock_is_dropped` (Review Focus 5, end to end): `sync_orders()` decides a type (b) incident at the deadline; before `apply_all`, `unforget` and run `check()` (its read emits `clear_clock`); then apply -> no incident, row readable and booked normally.
-  - `test_incident_holds_back_later_rows_on_its_symbol` (Open decision): BTC entry incident, then a later BTC sell row that fills -> its fills stay unbooked while the incident is open (`ledger.update_deferred`); ETH books normally; after `repair` (link) the BTC rows book in order.
+  - `test_delayed_check_clear_keeps_the_new_episode_bound` (PR #34 finding 2, end to end): `forget` -> `t0`; `check()`'s read (after `unforget`) produces `clear_clock(t0)` but its `apply_all` is held (barrier: build the engine with `ledger=` a small `Accounting` wrapper whose `apply_all` sets `reached`, awaits an event, then delegates to the real `Ledger`; the test applies the sync-loop passes to the real `Ledger` directly, and `sync_orders` takes no lock); the sync loop clears `t0`, `forget` again, persists `t1`; release `check()` -> `resolve_since == t1`, and the incident comes at exactly `t1 + 80 s`.
+  - `test_incident_holds_back_later_rows_on_its_symbol` (D20.10): BTC entry incident, then a later BTC sell row that fills -> its fills stay unbooked while the incident is open (`ledger.update_deferred`); ETH books normally; after `repair` (link) the BTC rows book in order.
   - `test_generic_read_failure_stays_failed_not_type_b` and `test_resolver_idles_without_journal_id` (coverage: a non-`OrderNotFound` read error is not a type (b) candidate; `jid is None` resolves nothing and logs `risk.journal_id_missing`).
   - `test_type_b_blocks_all_until_deadline_then_only_its_symbol` (10): `rekey(id)` + `hide(new client id)` -> `resolve_since` persisted; ETH entry rejected `state unavailable: SyncIncomplete` until +80 s; then incident `not_found`, ETH approved, BTC rejected; `get_order` spy no longer called for it.
   - `test_type_b_inconsistent_lookup_is_one_incident_across_restart` (10a): `forget(id)`; passes up to +40 s, restart, passes to +80 s -> `resolve_since` unchanged throughout, exactly one `OrderIncident` with `lookup_inconsistent`.
@@ -403,7 +417,7 @@ with `qty = external_qty = sum(external_qty)`, `dust_consumed = 0`, `proceeds_us
   ```
 - Preconditions (each failure raises `RepairRefused` with the reason printed by the CLI):
   - all: the row exists and `settled_at IS NULL`.
-  - link (spec 5.2): (`broker_order_id IS NULL` and status in `pending`/`unknown`) or (`broker_order_id` set and `incident in {"not_found", "lookup_inconsistent", "client_id_mismatch"}`); `owns(row.client_order_id, jid)` (else refuse "no ownership proof: use the runbook's manual procedure"); `lookup(row.client_order_id)` -> `None` refuses; `view.client_order_id != row.client_order_id`, `view.order_id != broker_order_id` or non-empty `mismatches(..., broker_order_id=None)` refuses with every difference. `after = {broker_order_id: <given>, incident: None, incident_at: None, resolve_since: None}`. No `--force`.
+  - link (spec 5.2): (`broker_order_id IS NULL` and status in `pending`/`unknown`) or (`broker_order_id` set and `incident in {"not_found", "lookup_failed", "lookup_inconsistent", "client_id_mismatch"}`, spec 5.2 / D20.11); `owns(row.client_order_id, jid)` (else refuse "no ownership proof: use the runbook's manual procedure"); `lookup(row.client_order_id)` -> `None` refuses; `view.client_order_id != row.client_order_id`, `view.order_id != broker_order_id` or non-empty `mismatches(..., broker_order_id=None)` refuses with every difference. `after = {broker_order_id: <given>, incident: None, incident_at: None, resolve_since: None}`. No `--force`.
   - not_submitted (5.3): `broker_order_id IS NULL`, status `pending`/`unknown`. `after = {status: "not_submitted", incident: None, incident_at: None}`.
   - oversell (5.4): `side == "sell"`, latest `LedgerAnomaly` (`repo.last_anomalies`) has `kind == "oversell"`, `excess_external` false. `after = {excess_external: True}`.
 - `commit`: one `publish_tx` unit that re-reads the row; unless every `before` column still holds its value, `build` records the refusal in a holder and returns `None` (no write, no event), and `commit` raises `RepairRefused("row changed since it was read")` after `publish_tx` returned. (Raising inside `build` would make the bus log `bus.unit_failed` at error level for a benign refusal.) Otherwise writes `after` (plus `updated_at = now`) and returns `OperatorRepair`. Never touches positions, fills, balances or `paused`.
@@ -411,6 +425,7 @@ with `qty = external_qty = sum(external_qty)`, `dust_consumed = 0`, `proceeds_us
 - [ ] **Step 1: Failing tests** (`test_repair.py`, journal + SimBroker lookup via `read_order_by_client_id`):
   - per command: refuses a settled row; refuses its wrong-state rows; success writes the row change and exactly one `OperatorRepair` (`action`, `before`, `after`, `evidence`, `operator`) in one unit (`hooked_sessionmaker` `fail_before=1` -> neither the row change nor the event lands).
   - link: refuses NULL/legacy/other-journal client ids (spec 8 test 9, 9a), a lookup miss, a different `order_id`, and a qty mismatch (lists the difference); links a type (b) incident row to a rekeyed id (spec 8 test 10, last clause).
+  - `test_type_b_lookup_failed_incident_is_repairable` (PR #34 finding 3, end to end): `forget(id)` plus a client-id lookup that raises through the deadline -> incident `lookup_failed`; the broker recovers (`unforget`, lookup works); `repair link` with the same id succeeds with one `OperatorRepair`; the next `apply_all(await engine.sync_orders())` reads and settles the row.
   - `test_not_submitted_then_sync_settles_with_zero_fill` (spec 8 test 12): commit, then `ledger.apply_all(await engine.sync_orders())` -> row settled, `filled_qty == 0`, the symbol's entry no longer blocked by it.
   - `test_oversell_repair_then_sync_closes_the_position` (spec 8 test 13, end to end): ledger reports `oversell` and pauses; `prepare_oversell` + `commit`; next pass books it (`ExternalHoldingSold`), no new `LedgerAnomaly`, `paused` still true.
   - `test_commit_refuses_a_row_changed_since_prepare`: `RepairRefused`, nothing written, no `bus.unit_failed` log.
