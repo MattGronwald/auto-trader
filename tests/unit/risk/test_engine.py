@@ -2,7 +2,7 @@
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
@@ -46,7 +46,7 @@ from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
 from autotrader.risk.checks import check_entry
-from autotrader.risk.engine import Accounting, Gate, RiskEngine
+from autotrader.risk.engine import Accounting, Gate, OrderResult, RiskEngine
 from autotrader.risk.types import (
     CancelResult,
     EntryIntent,
@@ -57,6 +57,7 @@ from autotrader.risk.types import (
     RiskDecision,
     SyncResult,
 )
+from tests.dbhooks import CommitHook, hooked_sessionmaker
 from tests.health import seed_baseline
 
 REPO = Path(__file__).resolve().parents[3]
@@ -2122,3 +2123,177 @@ async def test_fault_transitions_are_logged_once(
         ("third", False, "warning"),
         ("third", True, "warning"),
     ]
+
+
+# --- pre-submit health re-check (spec 2026-11-09 6.1, cases 14a-14d) ----------------------
+
+
+class RecheckGate:
+    """Allows every call; the second one (check()'s pre-submit re-check) first awaits
+    `on_recheck`, so the test acts after the gather, decision and order-row insert."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.on_recheck: Callable[[], Awaitable[None]] | None = None
+
+    async def status(self, now: datetime | None = None) -> ControlStatus:
+        self.calls += 1
+        if self.calls == 2 and self.on_recheck is not None:
+            await self.on_recheck()
+        return ControlStatus(killed=False, reasons=())
+
+
+class BlockingInsertEngine(RiskEngine):
+    """Once the entry decision is persisted, arms `hook.block_before`: the next commit, the
+    order-row insert, waits for `release`."""
+
+    hook: CommitHook
+    release: asyncio.Event
+
+    async def _persist(
+        self, cycle_id: int | None, kind: str, decision: RiskDecision, now: datetime
+    ) -> None:
+        await super()._persist(cycle_id, kind, decision, now)
+        if kind == "entry":
+            self.hook.block_before = self.release
+
+
+LATE_CASES = ["cash_fault", "sticky_cash_fault", "order_insert", "snapshot_age", "trading_day"]
+LATE_REASON = {
+    "cash_fault": "cash reconciliation failed",
+    "sticky_cash_fault": "cash reconciliation failed",
+    "order_insert": "cash reconciliation failed",
+    "snapshot_age": "equity snapshot overdue",
+    "trading_day": "trading day changed",
+}
+
+
+@dataclass
+class LateRun:
+    result: OrderResult
+    exited: OrderResult | None
+    logs: list[MutableMapping[str, Any]]
+    btc_orders: list[str]  # BTC order ids the broker received
+
+
+async def _late_fault(case: str, db_url: str, cycle_id: int, *, exit_meanwhile: bool) -> LateRun:
+    """A healthy entry gather and decision; then `case` turns one health input bad before
+    the submit (at the pre-submit gate call, or while the order-row insert commit waits).
+    With `exit_meanwhile`, an ETH exit (held and priced, so check 8 passes) runs to its end
+    while the entry waits at that barrier."""
+    db = make_engine(db_url)
+    hook = CommitHook()
+    sessions = hooked_sessionmaker(db, hook)
+    try:
+        broker = await _holding_eth()
+        gate = RecheckGate()
+        mono = Mono()
+        start = datetime(2026, 10, 9, 23, 59, 59, tzinfo=UTC) if case == "trading_day" else NOW
+        clock = Clock(start)
+        engine = make_engine_(
+            broker,
+            sessions,
+            gate,
+            view=FakeView(prices={ETH: 100.0}),
+            clock=clock,
+            monotonic=mono,
+            cls=BlockingInsertEngine if case == "order_insert" else RiskEngine,
+        )
+        if case == "snapshot_age":
+            mono.t = 119.0  # the loop snapshot (at t=0) is 119 s old at the gather
+        exits: list[OrderResult] = []
+
+        async def exit_eth() -> None:
+            if exit_meanwhile:
+                exits.append(await engine.exit(ExitRequest(symbol=ETH, reason="stop")))
+
+        async def turn_bad() -> None:
+            if case == "cash_fault":
+                engine.set_cash_fault("cash mismatch")
+            elif case == "sticky_cash_fault":
+                engine.set_cash_fault("CommitUncertain", sticky=True)
+            elif case == "snapshot_age":
+                mono.t = 121.0
+            elif case == "trading_day":
+                clock.now = datetime(2026, 10, 10, 0, 0, 1, tzinfo=UTC)
+            await exit_eth()
+
+        with capture_logs() as logs:
+            if case == "order_insert":
+                assert isinstance(engine, BlockingInsertEngine)
+                engine.hook, engine.release = hook, asyncio.Event()
+                entry = asyncio.create_task(engine.check(intent(cycle_id)))
+                try:
+                    await asyncio.wait_for(hook.reached.wait(), 2)  # the insert commit waits
+                    engine.set_cash_fault("cash mismatch")
+                    await asyncio.wait_for(exit_eth(), 10)  # completes while it waits
+                    assert not entry.done()
+                    engine.release.set()
+                    result = await asyncio.wait_for(entry, 2)
+                finally:
+                    entry.cancel()
+                    await asyncio.gather(entry, return_exceptions=True)
+            else:
+                gate.on_recheck = turn_bad
+                result = await asyncio.wait_for(engine.check(intent(cycle_id)), 10)
+        btc = [o.id for o in broker._orders.values() if o.order.symbol == BTC]
+        return LateRun(result, exits[0] if exits else None, logs, btc)
+    finally:
+        await db.dispose()
+
+
+async def _assert_not_submitted(
+    run: LateRun, case: str, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    assert run.result.decision.approved and run.result.status == "not_submitted"
+    assert run.result.broker_order_id is None
+    assert run.btc_orders == []  # nothing reached the broker
+    (row,) = [o for o in await orders(sessions) if o.symbol == BTC]
+    assert (row.status, row.broker_order_id) == ("not_submitted", None)
+    assert run.result.order_row_id == row.id
+    (dec,) = [d for d in await decisions(sessions) if d.kind == "entry"]
+    assert dec.approved  # the approved decision stays persisted
+    (late,) = [e for e in run.logs if e["event"] == "risk.entry_not_submitted"]
+    assert late["reasons"] == [LATE_REASON[case]]
+
+
+@pytest.mark.parametrize("sticky", [False, True])
+async def test_cash_fault_set_after_gather_stops_the_submit(
+    sticky: bool, db_url: str, sessions: async_sessionmaker[AsyncSession], cycle_id: int
+) -> None:
+    case = "sticky_cash_fault" if sticky else "cash_fault"
+    run = await _late_fault(case, db_url, cycle_id, exit_meanwhile=False)
+    await _assert_not_submitted(run, case, sessions)
+
+
+async def test_cash_fault_set_during_order_insert_stops_the_submit(
+    db_url: str, sessions: async_sessionmaker[AsyncSession], cycle_id: int
+) -> None:
+    run = await _late_fault("order_insert", db_url, cycle_id, exit_meanwhile=False)
+    await _assert_not_submitted(run, "order_insert", sessions)
+
+
+async def test_snapshot_ageing_past_the_bound_during_gather_stops_the_submit(
+    db_url: str, sessions: async_sessionmaker[AsyncSession], cycle_id: int
+) -> None:
+    run = await _late_fault("snapshot_age", db_url, cycle_id, exit_meanwhile=False)
+    await _assert_not_submitted(run, "snapshot_age", sessions)
+
+
+async def test_trading_day_change_between_gather_and_submit_stops_the_submit(
+    db_url: str, sessions: async_sessionmaker[AsyncSession], cycle_id: int
+) -> None:
+    run = await _late_fault("trading_day", db_url, cycle_id, exit_meanwhile=False)
+    await _assert_not_submitted(run, "trading_day", sessions)
+
+
+@pytest.mark.parametrize("case", LATE_CASES)
+async def test_exit_goes_through_while_entry_submit_is_blocked(
+    case: str, db_url: str, sessions: async_sessionmaker[AsyncSession], cycle_id: int
+) -> None:
+    run = await _late_fault(case, db_url, cycle_id, exit_meanwhile=True)
+    assert run.exited is not None
+    assert run.exited.decision.approved and run.exited.status == "new"
+    await _assert_not_submitted(run, case, sessions)
+    (sell,) = [o for o in await orders(sessions) if o.side == "sell"]
+    assert (sell.symbol, sell.status) == (ETH, "new")

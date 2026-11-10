@@ -2,7 +2,7 @@
 
 `check()` gathers state under the entry lock, runs the pure `check_entry`, persists the
 decision, applies a pause side effect on rejection, writes the order row, asks the
-control gate again right before submitting, then submits. `exit()` is
+control gate and re-checks engine health right before submitting, then submits. `exit()` is
 reduce-only and ignores kill/pause. Any failure while gathering rejects (fail closed).
 
 Two locks: entries serialise on one, exits on another, and an exit never waits for an
@@ -31,7 +31,10 @@ Health faults (spec 2026-11-09 4, 5.2, 6): `health_faults()` is read at the star
 after check 1 and sets no pause. In order: `equity snapshot overdue` (no loop snapshot yet in
 this process, or one older than `2 x snapshot_interval_s`) and `cash reconciliation failed`
 (`cash_fault`, initially `not yet reconciled`; cleared by `cash_reconciled()`; a sticky fault,
-`CommitUncertain`, holds until restart and is never downgraded). Exits ignore both.
+`CommitUncertain`, holds until restart and is never downgraded). After the pre-submit gate
+re-check, `check()` reads `health_faults()` again, plus `trading day changed` when the engine
+clock's trading day differs from the gather's (spec 2026-11-09 6.1): any of them leaves the
+order row `not_submitted` (`risk.entry_not_submitted`) and nothing is sent. Exits ignore all.
 
 Each locked section has ONE budget of `io_timeout_s`, measured from taking its lock and
 shared by its network/gate awaits only (gate.status, get_account, get_positions, each
@@ -266,6 +269,20 @@ class RiskEngine:
             if not allowed:
                 await self._set_status(row.id, "not_submitted")
                 log.warning("risk.entry_not_submitted", reasons=reasons)
+                return OrderResult(decision, row.id, "not_submitted")
+            # Health may have turned bad since the gather (spec 2026-11-09 6.1): synchronous
+            # state and clock reads only, so no await separates this from the submit.
+            late = (
+                *self.health_faults(),
+                *(
+                    ("trading day changed",)
+                    if day_start(self._clock(), self._tz) != day_start(now, self._tz)
+                    else ()
+                ),
+            )
+            if late:
+                await self._set_status(row.id, "not_submitted")
+                log.warning("risk.entry_not_submitted", reasons=list(late))
                 return OrderResult(decision, row.id, "not_submitted")
             return await self._submit(
                 row.id, decision, deadline, lambda: self._broker.submit_order(order)
