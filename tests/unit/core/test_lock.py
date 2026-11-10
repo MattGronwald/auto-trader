@@ -84,6 +84,32 @@ def test_contention_waits_with_bounded_polls(tmp_path: Path) -> None:
     assert sleeps == [1.0, 1.0, 1.0]  # polls at 0, 1, 2, 3 s; gives up past 2.5 s
 
 
+def test_restart_waits_for_and_then_acquires_the_lock(tmp_path: Path) -> None:
+    url = url_for(tmp_path / "j.db")
+    now = [0.0]
+    sleeps: list[float] = []
+
+    with held_elsewhere(url) as old_core:
+        assert old_core.stdin is not None
+
+        def sleep(s: float) -> None:
+            # The waiter found the lock held and is waiting: now the old core exits.
+            sleeps.append(s)
+            now[0] += s
+            if len(sleeps) == 1:
+                assert old_core.stdin is not None
+                old_core.stdin.close()
+                old_core.wait(timeout=10)
+
+        lock = acquire(url, wait_s=35.0, poll_s=1.0, monotonic=lambda: now[0], sleep=sleep)
+    try:
+        assert lock.held
+        assert sleeps == [1.0]  # refused once while held, acquired on the next poll
+        assert lock.lock_path.read_text().startswith(f"PID {os.getpid()} since ")
+    finally:
+        lock.release()
+
+
 @pytest.mark.parametrize("kind", ["file", "directory"])
 def test_symlinked_journal_contends_with_the_real_path(tmp_path: Path, kind: str) -> None:
     real_dir = tmp_path / "real"

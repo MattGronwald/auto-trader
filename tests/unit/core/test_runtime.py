@@ -1,30 +1,41 @@
 import asyncio
+import contextlib
 import gc
 import io
 import json
-from collections.abc import Awaitable, Callable, Iterator, Sequence
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, MutableMapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from structlog.testing import capture_logs
 
+import tests.unit.risk.test_engine as te
 from autotrader.broker.base import Account, AssetRules, BrokerError, FeeSchedule, Position
-from autotrader.core.bus import EventBus
+from autotrader.broker.sim import SimBroker
+from autotrader.core import runtime
+from autotrader.core.bus import CommitUncertain, EventBus
 from autotrader.core.config import AppConfig, Settings, load_config, load_profile
 from autotrader.core.feed import Latest, MarketFeed
 from autotrader.core.flatten import request_flatten
-from autotrader.core.kill import ControlStatus
+from autotrader.core.kill import PAUSED_KEY, ControlGate, ControlStatus
+from autotrader.core.ledger import CashGuard, CashResult, Ledger
 from autotrader.core.lock import JournalLock, acquire
 from autotrader.core.logging import configure_logging
 from autotrader.core.runtime import ControlPoller, _snapshot_step, _sync_step, run_core
 from autotrader.core.shutdown import EXIT_CLEAN, EXIT_FAILED, ShutdownControl
 from autotrader.core.types import Bar, Quote
 from autotrader.journal import models as m
+from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
+from autotrader.risk.engine import RiskEngine
+from tests.dbhooks import CommitHook, hooked_sessionmaker
+from tests.health import seed_baseline
 
 REPO = Path(__file__).resolve().parents[3]
 
@@ -256,32 +267,353 @@ async def test_broker_connect_failure_aborts_startup(cfg: AppConfig, lock: Journ
     assert control.cause == "startup_failure" and dog.armed
 
 
-class FlakySnapshots:
-    """Times out (the engine's own budget), then raises, then succeeds."""
+@pytest.mark.parametrize("order", ["before_run_core_saw_the_stop", "after_teardown_began"])
+async def test_startup_raising_after_the_stop_won_the_race(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch, order: str
+) -> None:
+    control, _ = make_control()
+    teardown_began = asyncio.Event()
+    real_teardown = runtime._teardown
 
-    def __init__(self) -> None:
-        self.calls = 0
+    async def teardown(*args: Any, **kwargs: Any) -> list[str]:
+        teardown_began.set()
+        return await real_teardown(*args, **kwargs)
 
-    async def snapshot_equity(self) -> None:
-        self.calls += 1
-        if self.calls == 1:
-            raise TimeoutError
-        if self.calls == 2:
-            raise ConnectionError("broker down")
+    async def backfill(self: Any) -> None:
+        control.begin("signal")  # the stop request wins the race against the startup
+        if order == "after_teardown_began":
+            await teardown_began.wait()
+        raise RuntimeError("backfill broke")
+
+    monkeypatch.setattr("autotrader.core.runtime._teardown", teardown)
+    monkeypatch.setattr("autotrader.core.runtime.MarketFeed.backfill", backfill)
+    with capture_logs() as logs:
+        if order == "before_run_core_saw_the_stop":
+            # The startup task is done (raised) by the time run_core looks: a startup failure.
+            with pytest.raises(RuntimeError, match="backfill broke"):
+                await asyncio.wait_for(start_core(cfg, lock, control), timeout=5)
+        else:
+            # Teardown awaits the unfinished startup as its first step: that step failed.
+            assert await asyncio.wait_for(start_core(cfg, lock, control), timeout=5) == (
+                EXIT_FAILED
+            )
+    events = [e["event"] for e in logs]
+    assert teardown_began.is_set() and control.cause == "signal"
+    if order == "before_run_core_saw_the_stop":
+        (failed,) = [e for e in logs if e["event"] == "core.failed"]
+        assert failed["cause"] == "signal" and str(failed["exc_info"]) == "backfill broke"
+        assert control.failure_logged  # so the CLI (exit 1) does not log it again
+        assert "core.shutdown_step_failed" not in events
+    else:
+        (step,) = [e for e in logs if e["event"] == "core.shutdown_step_failed"]
+        assert step["step"] == "startup" and "backfill broke" in step["error"]
+        assert "core.failed" not in events and not control.failure_logged
+        (shutdown_failed,) = [e for e in logs if e["event"] == "core.shutdown_failed"]
+        assert shutdown_failed["steps"] == ["startup"]
+
+
+async def test_stream_death_does_not_also_log_shutdown_failed(
+    cfg: AppConfig, lock: JournalLock
+) -> None:
+    control, _ = make_control()
+    with capture_logs() as logs, pytest.raises(ConnectionError, match="stream died"):
+        await asyncio.wait_for(
+            start_core(cfg, lock, control, source=StreamingSource(fail_stream=True)), timeout=5
+        )
+    events = [e["event"] for e in logs]
+    assert events.count("core.failed") == 1 and control.failure_logged
+    assert "core.shutdown_failed" not in events and "core.shutdown_step_failed" not in events
+    assert "core.stopped" in events  # the rest of the teardown was clean
+
+
+Stage = Literal["guard", "snapshot", "check"]
+STAGES: tuple[Stage, ...] = ("guard", "snapshot", "check")
+GUARD = CashGuard(generation=(0, 0), unsettled=False)
+ACCOUNT = Account(equity=Decimal("1000"), cash=Decimal("1000"))
+
+
+class FakeStep:
+    """Both sides of `_snapshot_step` (engine and ledger) over one call log, no DB.
+    `fail[stage]` raises once in that stage. The fault mirrors the engine's rules:
+    stickiness only goes false -> true, and `cash_reconciled()` is a no-op while sticky."""
+
+    def __init__(self, result: CashResult = "ok") -> None:
+        self.result: CashResult = result
+        self.fail: dict[str, Exception] = {}
+        self.calls: list[str] = []
+        self.faults: list[tuple[str, bool]] = []
+        self.cash_fault: str | None = "not yet reconciled"
+        self.sticky = False
+
+    def _stage(self, stage: Stage) -> None:
+        self.calls.append(stage)
+        error = self.fail.pop(stage, None)
+        if error is not None:
+            raise error
+
+    async def cash_guard(self) -> CashGuard:
+        self._stage("guard")
+        return GUARD
+
+    async def snapshot_equity(self) -> Account:
+        self._stage("snapshot")
+        return ACCOUNT
+
+    async def check_cash(self, account: Account, guard: CashGuard) -> CashResult:
+        assert account is ACCOUNT and guard is GUARD  # what the earlier stages returned
+        self._stage("check")
+        return self.result
+
+    def set_cash_fault(self, reason: str, *, sticky: bool = False) -> None:
+        self.faults.append((reason, sticky))
+        if not self.sticky:
+            self.cash_fault = reason
+        self.sticky = self.sticky or sticky
+
+    def cash_reconciled(self) -> None:
+        self.calls.append("reconciled")
+        if not self.sticky:
+            self.cash_fault = None
+
+
+def _events(logs: list[MutableMapping[str, Any]]) -> list[str]:
+    return [e["event"] for e in logs]
+
+
+@pytest.mark.parametrize("result", ["baseline", "ok", "discrepancy"])
+async def test_snapshot_step_runs_guard_snapshot_check_in_order_and_clears_on_ok(
+    result: CashResult,
+) -> None:
+    step = FakeStep(result)
+    with capture_logs() as logs:
+        await _snapshot_step(step, step)
+    assert step.calls == ["guard", "snapshot", "check", "reconciled"]
+    assert step.faults == [] and step.cash_fault is None
+    assert _events(logs) == ["risk.snapshot_written"]
+
+
+async def test_skipped_cash_check_leaves_the_fault_unchanged() -> None:
+    step = FakeStep("skipped")
+    with capture_logs() as logs:
+        await _snapshot_step(step, step)
+    assert step.calls == ["guard", "snapshot", "check"]  # no cash_reconciled()
+    assert step.faults == [] and step.cash_fault == "not yet reconciled"
+    assert _events(logs) == ["risk.snapshot_written"]
+    step.set_cash_fault("check: ConnectionError")  # a later skipped step clears no fault
+    await _snapshot_step(step, step)
+    assert step.cash_fault == "check: ConnectionError"
+
+
+async def test_failed_guard_still_takes_the_snapshot_and_skips_the_check() -> None:
+    step = FakeStep()
+    step.fail["guard"] = ConnectionError("journal down")
+    with capture_logs() as logs:
+        await _snapshot_step(step, step)
+    assert step.calls == ["guard", "snapshot"]
+    assert step.faults == [("guard: ConnectionError", False)]
+    failed, written = logs
+    assert (failed["event"], failed["stage"], failed["log_level"]) == (
+        "ledger.cash_check_failed",
+        "guard",
+        "error",
+    )
+    assert failed["exc_info"]
+    assert written["event"] == "risk.snapshot_written"
+
+
+async def test_snapshot_failure_after_commit_sets_the_fault_and_skips_the_check() -> None:
+    """`snapshot_equity()` may commit its row and then raise on the position read."""
+    step = FakeStep()
+    step.fail["snapshot"] = ConnectionError("positions down")
+    with capture_logs() as logs:
+        await _snapshot_step(step, step)
+    assert step.calls == ["guard", "snapshot"]
+    assert step.faults == [("snapshot: ConnectionError", False)]
+    (failed,) = logs
+    assert (failed["event"], failed["log_level"]) == ("risk.snapshot_failed", "error")
+    assert failed["exc_info"] and "timeout" not in failed
+
+
+async def test_failed_cash_check_sets_the_fault_and_logs_the_stage() -> None:
+    step = FakeStep()
+    step.fail["check"] = ConnectionError("journal down")
+    with capture_logs() as logs:
+        await _snapshot_step(step, step)
+    assert step.calls == ["guard", "snapshot", "check"]
+    assert step.faults == [("check: ConnectionError", False)]
+    written, failed = logs
+    assert written["event"] == "risk.snapshot_written"
+    assert (failed["event"], failed["stage"], failed["log_level"]) == (
+        "ledger.cash_check_failed",
+        "check",
+        "error",
+    )
+    assert failed["exc_info"]
+
+
+@pytest.mark.parametrize("stage", STAGES)
+async def test_commit_uncertain_in_any_stage_sets_a_sticky_fault(stage: Stage) -> None:
+    step = FakeStep("ok")
+    step.fail[stage] = CommitUncertain("CashChecked may or may not be committed")
+    await _snapshot_step(step, step)
+    assert step.faults == [(f"{stage}: CommitUncertain", True)]
+    assert step.sticky and step.cash_fault == f"{stage}: CommitUncertain"
+    await _snapshot_step(step, step)  # every stage succeeds, the check returns ok
+    assert step.calls[-4:] == ["guard", "snapshot", "check", "reconciled"]
+    assert step.cash_fault == f"{stage}: CommitUncertain"  # held until restart
+    fresh = FakeStep("ok")  # a new process (engine) starts clear of it
+    await _snapshot_step(fresh, fresh)
+    assert fresh.cash_fault is None
+
+
+@pytest.mark.parametrize("stage", STAGES)
+async def test_plain_error_in_any_stage_sets_a_recoverable_fault(stage: Stage) -> None:
+    step = FakeStep("ok")
+    step.fail[stage] = ConnectionError("down")
+    await _snapshot_step(step, step)
+    assert step.faults == [(f"{stage}: ConnectionError", False)]
+    assert not step.sticky and step.cash_fault == f"{stage}: ConnectionError"
+    await _snapshot_step(step, step)
+    assert step.cash_fault is None
 
 
 async def test_snapshot_step_logs_failures_and_successes() -> None:
-    buf = io.StringIO()
-    configure_logging(stream=buf)
-    snapshots = FlakySnapshots()
-    for _ in range(3):
-        await _snapshot_step(snapshots)
-    events = [ln for ln in _log_lines(buf) if ln["event"].startswith("risk.snapshot")]
-    assert [(ln["event"], ln.get("timeout")) for ln in events] == [
+    step = FakeStep("ok")
+    with capture_logs() as logs:
+        step.fail["snapshot"] = TimeoutError()  # the engine's own budget
+        await _snapshot_step(step, step)
+        step.fail["snapshot"] = ConnectionError("broker down")
+        await _snapshot_step(step, step)
+        await _snapshot_step(step, step)
+    events = [e for e in logs if e["event"].startswith("risk.snapshot")]
+    assert [(e["event"], e.get("timeout")) for e in events] == [
         ("risk.snapshot_failed", True),
         ("risk.snapshot_failed", None),
         ("risk.snapshot_written", None),
     ]
+    assert step.faults == [("snapshot: TimeoutError", False), ("snapshot: ConnectionError", False)]
+
+
+@pytest.fixture
+def journal_url(tmp_path: Path) -> Iterator[str]:
+    """A migrated journal; sync, since `upgrade()` runs its own event loop."""
+    url = f"sqlite+aiosqlite:///{tmp_path / 'cash.db'}"
+    upgrade(url)
+    yield url
+
+
+class ArmingLedger:
+    """The real ledger for the step; `arm` makes the next `check_cash` commit fail before it
+    commits (armed only after the snapshot committed, so it hits the cash unit itself)."""
+
+    def __init__(self, ledger: Ledger, hook: CommitHook) -> None:
+        self.ledger = ledger
+        self.hook = hook
+        self.arm = False
+        self.results: list[str] = []
+
+    async def cash_guard(self) -> CashGuard:
+        return await self.ledger.cash_guard()
+
+    async def check_cash(self, account: Account, guard: CashGuard) -> CashResult:
+        if self.arm:
+            self.hook.fail_before, self.arm = 1, False
+        try:
+            result = await self.ledger.check_cash(account, guard)
+        except Exception as e:
+            self.results.append(type(e).__name__)
+            raise
+        self.results.append(result)
+        return result
+
+
+@dataclass
+class CashRig:
+    risk: RiskEngine
+    ledger: ArmingLedger
+    sim: SimBroker
+    clock: Any
+    sessions: async_sessionmaker[AsyncSession]
+
+    async def step(self) -> None:
+        self.clock.now += timedelta(seconds=60)  # `equity_snapshots.ts` is unique
+        await _snapshot_step(self.risk, self.ledger)
+
+    async def entry(self) -> tuple[str, ...]:
+        self.clock.now += timedelta(seconds=1)  # check() writes its own peak snapshot
+        result = await self.risk.check(te.intent(await te.new_cycle(self.sessions)))
+        assert not result.decision.approved
+        return result.decision.reasons
+
+    async def paused(self) -> Any:
+        async with self.sessions() as s:
+            return await repo.get_control(s, PAUSED_KEY)
+
+
+@contextlib.asynccontextmanager
+async def cash_rig(url: str, kill_file: Path) -> AsyncIterator[CashRig]:
+    """Real `RiskEngine` + `Ledger` + SimBroker over a commit-hooked journal, unhealthy at
+    start (no loop snapshot, `not yet reconciled`), with a trusted day-start baseline."""
+    db = make_engine(url)
+    hook = CommitHook()
+    sessions = hooked_sessionmaker(db, hook)
+    clock = te.Clock(te.NOW)
+    sim = SimBroker(
+        cash=Decimal("1000"),
+        fees=te.FEES,
+        slippage_bps=Decimal(0),
+        asset_rules={te.BTC: te.RULES},
+        timeframe="5m",
+    )
+    sim.process_bar(te.five(29))
+    ledger = Ledger(EventBus(sessions), sessions, clock=clock)
+    gate = ControlGate(kill_file, sessions)
+    risk = te.make_engine_(
+        sim, sessions, gate, clock=clock, monotonic=te.Mono(), ledger=ledger, healthy=False
+    )
+    try:
+        await seed_baseline(sessions, te.NOW)
+        yield CashRig(risk, ArmingLedger(ledger, hook), sim, clock, sessions)
+    finally:
+        await db.dispose()
+
+
+async def test_failed_discrepancy_commit_keeps_entries_closed(
+    journal_url: str, tmp_path: Path
+) -> None:
+    """Spec 11 cases 10 and 14: the PR #29 probe (-19.84 USD), the `CashDiscrepancy` unit's
+    commit fails and cannot be verified: no pause, entries still rejected, until restart."""
+    async with cash_rig(journal_url, tmp_path / "KILL") as rig:
+        await rig.step()
+        assert rig.ledger.results == ["baseline"] and rig.risk.cash_fault is None
+
+        rig.sim.cash -= Decimal("19.84")
+        rig.ledger.arm = True
+        await rig.step()
+        assert rig.ledger.results[-1] == "CommitUncertain"
+        assert await rig.paused() is None  # the pause rolled back with the event
+        assert rig.risk.cash_fault == "check: CommitUncertain" and rig.risk.cash_fault_sticky
+        assert await rig.entry() == ("cash reconciliation failed",)
+
+        await rig.step()  # hook clear: the same discrepancy commits its pause now
+        assert rig.ledger.results[-1] == "discrepancy"
+        assert await rig.paused() is True
+        assert rig.risk.cash_fault == "check: CommitUncertain" and rig.risk.cash_fault_sticky
+
+
+async def test_discrepancy_clears_a_plain_fault_and_the_pause_rejects(
+    journal_url: str, tmp_path: Path
+) -> None:
+    async with cash_rig(journal_url, tmp_path / "KILL") as rig:
+        await rig.step()
+        assert rig.ledger.results == ["baseline"]
+        rig.risk.set_cash_fault("check: ConnectionError")
+        rig.sim.cash -= Decimal("19.84")
+        await rig.step()
+        assert rig.ledger.results[-1] == "discrepancy"
+        assert rig.risk.cash_fault is None and rig.risk.health_faults() == ()
+        assert await rig.paused() is True
+        assert await rig.entry() == ("control: trading paused (manual resume required)",)
 
 
 async def test_hung_snapshot_at_the_default_interval_never_delays_kill_detection(

@@ -37,7 +37,7 @@ uv run mypy                  # strict, src + tests (paths from pyproject)
 uv run autotrader --help     # CLI; unimplemented commands exit 2
 uv run autotrader check-config  # validate config.yaml + env + profile, print profile hash
 uv run autotrader db upgrade    # apply migrations to config.yaml's database.url
-uv run autotrader run core       # market feed + scanner + kill detection + order sync + Position Manager against Alpaca paper (no orders until WP 1.6); single-writer journal lock; Ctrl-C stops (twice = hard stop, exit 130)
+uv run autotrader run core       # market feed + scanner + kill detection + order sync + Position Manager + 60 s equity snapshot and cash check (pauses on a discrepancy) against Alpaca paper (no orders until WP 1.6); single-writer journal lock; Ctrl-C stops (twice = hard stop, exit 130)
 uv run autotrader kill [--reason ...] / kill --clear  # kill-switch (fallback: touch data/control/KILL)
 uv run autotrader flatten [--reason ...] / flatten --cancel   # reduce-only flatten via the running core; sets the manual pause (docs/runbook.md)
 uv run alembic revision --autogenerate -m "..."  # new migration after editing journal/models.py

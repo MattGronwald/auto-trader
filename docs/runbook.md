@@ -7,24 +7,77 @@ Requirements live in `SPEC.md`, delivery status in `PLAN.md`.
 The examples assume the default `config.yaml` (journal `data/autotrader.db`, SQLite). Run SQL with
 `sqlite3 data/autotrader.db`. Never delete journal rows; change only the columns a procedure names.
 
-## Current limits (WP 1.5c)
+## Current limits (WP 1.5d-1)
 
 - `run core` connects `AlpacaBroker`, which cannot place orders until WP 1.6: its order methods
   raise `OrderMethodsUnavailable` and `can_place_orders()` is false. The Position Manager still
   evaluates and latches triggers (`positions.exit_triggered`) and logs
   `positions.broker_cannot_trade` once, but sends no exits and no cancels. A flatten stays pending
   with `reason: "broker cannot place orders"`.
-- `run core` places no entries until the Cycle Runner is wired in WP 1.5d.
+- `run core` places no entries until the Cycle Runner is wired in WP 1.5d-3 (it calls no
+  `check()` yet). The rejection reasons in "Entries rejected" below are enforced by
+  `RiskEngine.check()` and apply once it is wired.
 - An exit or entry left `pending`/`unknown` without a broker order id is never retried and never
   resolved automatically until the 1.5d resolver. Use the manual procedure below.
 - Recovering from an `oversell` anomaly needs journal-repair tooling that WP 1.5d owns (see below).
 - An external sale that failed is retried only after the order-sync loop has settled the failed
   row, so external retries run every max(backoff, about 2 s).
-- An entry on a symbol whose external sale is partly filled and still unsettled would merge that
-  sale into the new trade's P&L, with no `ExternalHoldingSold`. It cannot happen in 1.5c (no
-  entries are placed); WP 1.5d must block or defer such an entry before the Cycle Runner is wired.
+- An entry on a symbol with an unsettled sell row (an external sale included) is rejected by
+  `check()` (`unsettled sell on <SYM>`, see "Entries rejected"), so a partly filled external
+  sale can no longer merge into a new trade's P&L.
 - The flatten-state guards rely on SQLite's write lock. Postgres needs `SELECT ... FOR UPDATE`
   (WP 3.5 ownership work).
+
+## Entries rejected
+
+`RiskEngine.check()` rejects an entry with one of these reasons. Each reason in the table
+below is a gather-time rejection: a persisted risk decision, no pause is set and no order row is
+written (the pre-submit case after the table is different). Exits are never affected. `run core` calls
+no `check()` until WP 1.5d-3, so today these describe what the engine will do.
+
+| Reason | Meaning | Clears when |
+|---|---|---|
+| `daily-loss baseline unavailable` | No equity snapshot in [trading-day start - 120 s, trading-day start] (2 x the 60 s snapshot interval). | The next trading day that has such a snapshot. Nothing to fix. |
+| `equity snapshot overdue` | The snapshot loop has not committed a snapshot yet in this process, or the last one is older than 120 s. | A snapshot loop commit (within 60 s once the loop is healthy). |
+| `cash reconciliation failed` | The ledger cash check has not completed since startup, or its guard, snapshot or check stage raised. | A completed cash check with result baseline, ok or discrepancy (not `skipped`). After a `CommitUncertain` error it holds until the core is restarted. A completed check can also be `skipped`: the ledger skips the comparison when any order row has `settled_at` NULL (at either guard read) or the order/fill generation (`max(orders.id)`, fill watermark) moved between the reads. A skipped check neither sets nor clears the fault and logs no `ledger.cash_check_failed`, so after a restart one stuck unsettled row keeps entries rejected. Find it with `SELECT id, symbol, side, status FROM orders WHERE settled_at IS NULL;` and settle it (see below). |
+| `unsettled sell on <SYM>` | An order row with side `sell` and `settled_at` NULL exists on that symbol. | The ledger settles the row. A `pending`/`unknown` sell without a broker id stays until the 1.5d-2 resolver or the manual procedure below settles it. |
+
+Pre-submit re-check: a fault, an overdue snapshot or `trading day changed` that appears after
+the gather but before the broker call marks the order row `not_submitted` (log
+`risk.entry_not_submitted` with `reasons`); nothing is sent. This differs from the table: an order
+row exists and is marked. `trading day changed` means the trading day rolled over between the
+gather and the submit. It is per attempt, with nothing to clear: the next `check()` runs on the
+new day, which itself needs a trusted baseline (`daily-loss baseline unavailable` otherwise).
+
+`daily-loss baseline unavailable` is expected for the whole trading day after downtime across the
+trading-day start (00:00 in `trading_day_tz`, UTC by default; the core was down, so no snapshot fell in the window). It is not a
+fault; entries resume the next day.
+
+### Cash discrepancy
+
+The snapshot step of `run core` runs the ledger cash check against the Alpaca paper account every
+60 s. A discrepancy commits the manual pause and a `CashDiscrepancy` event, and re-baselines in
+the same unit, so the next check compares from the new level.
+
+1. Read the event: `SELECT ts, payload FROM events WHERE type = 'CashDiscrepancy' ORDER BY id;`
+   (`expected`, `actual`, `diff`, `n_fills`, `baseline_ts`).
+2. Explain the change (a manual transfer or trade, a fee posted outside the fills, a missed fill)
+   and record it. Do not resume while it is unexplained.
+3. Resume with the manual-pause SQL in "Resuming after a pause".
+
+### Log lines to act on
+
+- `ledger.anomaly_unrecorded` (error): the pause/event commit of a ledger anomaly raised; the
+  error is re-raised and the anomaly may not be recorded. Check `control_state.paused` and the
+  `LedgerAnomaly` events; set the pause by hand if it is missing, then investigate the anomaly.
+- `positions.cancel_failed_repeatedly`: an entry cancel failed 3 times; retries back off 1, 2,
+  4 ... up to 30 s. Check the order at the broker; the retries continue on their own. The line
+  repeats at the 13th failure and every 10th after (23rd, 33rd, ...) while the cancel keeps failing.
+- `ledger.cash_check_failed`: a stage of the cash step raised (`stage` field); entries stay
+  rejected with `cash reconciliation failed` until a check completes.
+- `core.watchdog_late_start` (stderr JSON): the shutdown watchdog was armed without having been
+  started up front, so it started its thread inside the stop path (signal-safety risk). It still
+  guards the stop; report it as a bug.
 
 ## Resuming after a pause
 
@@ -33,7 +86,8 @@ These set the manual pause (`control_state.paused = true`):
 - a ledger anomaly (`ledger.anomaly`), re-asserted on the next sync pass after a resume while it
   persists (another `LedgerAnomaly` event, `ledger.anomaly_repaused` warning), so fix the journal
   first;
-- an unexplained cash change (`CashDiscrepancy`);
+- an unexplained cash change (`CashDiscrepancy`; `run core` checks cash every 60 s, see "Entries
+  rejected");
 - the Risk Engine on the max-drawdown check (`risk.paused_manual_resume`).
 
 The daily-loss check sets `control_state.paused_until` instead (`risk.paused_until`): it blocks
@@ -180,7 +234,7 @@ operator decides.
    the incident is resolved; that is expected.
 
 With `AlpacaBroker` in 1.5c this cannot arise in production: `can_place_orders()` is false, so
-the Position Manager attempts no exits or cancels, and nothing places entries before 1.5d. A
+the Position Manager attempts no exits or cancels, and nothing places entries before 1.5d-3. A
 direct engine call would still fail with `OrderMethodsUnavailable` before anything is sent and be
 recorded `not_submitted`. The sync loop cannot read Alpaca orders yet either.
 

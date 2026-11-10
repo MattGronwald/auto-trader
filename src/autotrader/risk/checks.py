@@ -1,8 +1,12 @@
 """Pure Risk Engine checks (SPEC §4.5, spec 2026-10-11 §4-5). No I/O, no clock.
 
-`check_entry` evaluates the 11 checks in order and stops at the first failure; that
-reason is what gets persisted. `check_exit` is reduce-only (G1): it never looks at
-control state, pauses or rate limits, so a stop-out can't be blocked.
+`check_entry` evaluates the checks in order and stops at the first failure; that
+reason is what gets persisted. Order: 1 control and mode, the caller's fault reasons
+(first one wins), 2 market, 3 daily loss (a missing baseline rejects), 4 drawdown,
+5a unsettled sell on the symbol, 5 positions, 6 stop, 7-11 sizing and limits. The
+fault, baseline and unsettled-sell rejections never set a pause.
+`check_exit` is reduce-only (G1): it never looks at control state,
+pauses or rate limits, so a stop-out can't be blocked.
 """
 
 from collections.abc import Sequence
@@ -61,6 +65,7 @@ def check_entry(
     profile: StrategyProfile,
     control: ControlStatus,
     mode_matches: bool,
+    faults: tuple[str, ...] = (),
 ) -> RiskDecision:
     limits = profile.risk
     # 1. control and mode
@@ -68,6 +73,9 @@ def check_entry(
         return _reject("control: " + "; ".join(control.reasons))
     if not mode_matches:
         return _reject("mode mismatch between config and broker")
+    # Caller-detected faults (e.g. overdue snapshot): reject on the first, no pause.
+    if faults:
+        return _reject(faults[0])
     # 2. market
     if intent.symbol not in profile.universe:
         return _reject(f"{intent.symbol} not in universe")
@@ -85,13 +93,20 @@ def check_entry(
     if spread_bps > profile.scanner.max_spread_bps:
         return _reject(f"spread {spread_bps:.2f} bps > {profile.scanner.max_spread_bps}")
     # 3. daily loss
-    loss = portfolio.day_start_equity - portfolio.equity
-    if loss >= limits.max_daily_loss_pct / _PCT * portfolio.day_start_equity:
+    baseline = portfolio.day_start_equity
+    if baseline is None:
+        return _reject("daily-loss baseline unavailable")
+    loss = baseline - portfolio.equity
+    if loss >= limits.max_daily_loss_pct / _PCT * baseline:
         return _reject(f"daily loss {loss} >= {limits.max_daily_loss_pct} %", "until_next_day")
     # 4. drawdown
     drawdown = portfolio.hwm - portfolio.equity
     if drawdown >= limits.max_drawdown_pct / _PCT * portfolio.hwm:
         return _reject(f"drawdown {drawdown} >= {limits.max_drawdown_pct} %", "manual")
+    # 5a. a sell on this symbol has not settled: its cash is not spendable yet. Only the
+    # symbol itself is blocked; these symbols do not count toward max_positions.
+    if intent.symbol in portfolio.unsettled_sells:
+        return _reject(f"unsettled sell on {intent.symbol}")
     # 5. positions (dust ignored)
     held = {p.symbol for p in portfolio.positions if not p.is_dust}
     busy = held | {o.symbol for o in portfolio.open_entries}

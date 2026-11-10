@@ -245,7 +245,7 @@ class Event(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     ts: Mapped[datetime] = mapped_column(index=True)
-    type: Mapped[str] = mapped_column(String(64))
+    type: Mapped[str] = mapped_column(String(64), index=True)
     cycle_id: Mapped[int | None] = mapped_column(ForeignKey("cycles.id"))
     payload: Mapped[Json]
 

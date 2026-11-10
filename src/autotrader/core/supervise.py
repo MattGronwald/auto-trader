@@ -6,9 +6,9 @@ step in one loop never delays another. The heartbeat is when `step()` last compl
 `check()` logs a stall once per transition and never cancels a slow step (cancelling could
 cut a journal write mid-commit). A raising step is logged and the loop carries on; a task
 killed by an escaped `BaseException` is logged and restarted. `Freshness` probes track data
-age (e.g. the last committed equity snapshot) separately from loop liveness.
-`stop(deadline)` lets steps finish until the deadline, then cancels the rest once and leaves
-them behind.
+age (e.g. the snapshot loop's last committed snapshot) separately from loop liveness.
+`stop(deadline)` logs a loop task that already died (`task_died`, as `check()` does), lets
+steps finish until the deadline, then cancels the rest once and leaves them behind.
 """
 
 import asyncio
@@ -99,10 +99,16 @@ class Supervisor:
                 log.info(f"{probe.name}_fresh")
 
     async def stop(self, deadline: float) -> list[str]:
-        """Let running steps finish until `deadline` (on `clock`), then cancel the rest
-        once and leave them behind. Returns the names that had to be cancelled."""
+        """Log loop tasks that already died, let running steps finish until `deadline` (on
+        `clock`), then cancel the rest once and leave them behind. Returns the names that had
+        to be cancelled."""
         if self._stopping is not None:
             self._stopping.set()
+        for name, task in self._tasks.items():
+            # A loop task that died since the last check() is logged as check() does, not
+            # skipped silently; it is not restarted. (A loop only ends early by raising.)
+            if task.done() and not task.cancelled() and (error := task.exception()) is not None:
+                log.error(f"{name}.task_died", error=repr(error))
         running = {task: name for name, task in self._tasks.items() if not task.done()}
         if not running:
             return []

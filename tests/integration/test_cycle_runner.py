@@ -6,6 +6,7 @@ from the entry order's outcome when `check()` syncs orders.
 """
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
@@ -32,6 +33,7 @@ from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
 from autotrader.risk.engine import RiskEngine
+from tests.health import seed_baseline
 
 PROFILE_PATH = Path(__file__).resolve().parents[2] / "strategies" / "fast_momentum_v1.yaml"
 BTC = "BTC/USD"
@@ -130,7 +132,10 @@ def db_url(tmp_path: Path) -> str:
 @pytest.fixture
 async def sessions(db_url: str) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     engine = make_engine(db_url)
-    yield make_sessionmaker(engine)
+    sessions = make_sessionmaker(engine)
+    # Here, not in wire(): one test wires twice and equity_snapshots.ts is unique.
+    await seed_baseline(sessions, NOW)
+    yield sessions
     await engine.dispose()
 
 
@@ -155,6 +160,8 @@ async def wire(
         ledger=Ledger(bus, sessions, clock=lambda: NOW),
         clock=lambda: NOW,
     )
+    engine.last_snapshot_at = time.monotonic()
+    engine.cash_reconciled()
     runner = CycleRunner(
         profile=prof,
         strategy_id=strategy_id,

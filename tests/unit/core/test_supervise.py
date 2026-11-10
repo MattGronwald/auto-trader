@@ -3,6 +3,8 @@ import io
 import json
 from typing import Any
 
+from structlog.testing import capture_logs
+
 from autotrader.core.logging import configure_logging
 from autotrader.core.supervise import Freshness, Loop, Supervisor
 
@@ -143,6 +145,28 @@ async def test_check_never_restarts_loops_after_stop() -> None:
     assert await sup.stop(asyncio.get_running_loop().time() + 1) == []
     sup.check()
     assert "feed.tick.task_died" not in events(buf)
+
+
+async def test_stop_logs_tasks_that_died_before_it() -> None:
+    release = asyncio.Event()
+
+    async def dying() -> None:
+        raise Killer("snapshot task killed")
+
+    async def running() -> None:
+        await release.wait()
+
+    sup = Supervisor([Loop("risk.snapshot", dying, 0.001, 120), Loop("feed.tick", running, 1, 30)])
+    sup.start()
+    dead = next(t for t in asyncio.all_tasks() if t.get_name() == "risk.snapshot")
+    await asyncio.wait({dead})  # died before the stop, and no check() has seen it
+    release.set()
+    with capture_logs() as logs:
+        assert await sup.stop(asyncio.get_running_loop().time() + 1) == []
+    died = [e for e in logs if e["event"] == "risk.snapshot.task_died"]
+    assert len(died) == 1 and died[0]["log_level"] == "error"
+    assert died[0]["error"] == repr(Killer("snapshot task killed"))
+    assert [e["event"] for e in logs] == ["risk.snapshot.task_died"]  # the live loop: nothing
 
 
 async def test_stop_cancels_a_cancellation_resistant_step_once_and_leaves_it() -> None:

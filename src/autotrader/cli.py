@@ -116,6 +116,7 @@ def _run_core_process(
         typer.echo("interrupted while waiting for the journal lock", err=True)
         return EXIT_HARD
     dog = watchdog if watchdog is not None else Watchdog()
+    dog.start()  # before the handler: arming it from the handler must not start a thread
     control = ShutdownControl(timeout_s, arm_watchdog=dog.arm)
     install(make_signal_handler(control))
     try:
@@ -134,13 +135,14 @@ def _run_core_process(
             )
         )
     except Exception as e:
-        # A failure before run_core's teardown (migration, source, preconditions, engine) is
-        # logged here, with the traceback; one that run_core re-raises was logged there
-        # (shutdown had begun), so it isn't logged twice.
-        first = not control.requested
-        control.begin("startup_failure")  # no-op if teardown already began
-        if first:
+        # A failure run_core did not log (migration, source, preconditions, engine) is logged
+        # here, with the traceback, even after an earlier stop request (a signal during the
+        # migration); one that run_core logged before its teardown and re-raised set
+        # `failure_logged`, so it isn't logged twice.
+        control.begin("startup_failure")  # no-op if another cause came first
+        if not control.failure_logged:
             log.error("core.failed", cause=control.cause, exc_info=e)
+            control.failure_logged = True
         typer.echo(f"run core failed: {type(e).__name__}: {e}", err=True)
         code = EXIT_FAILED
     return code

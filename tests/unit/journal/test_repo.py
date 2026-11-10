@@ -323,6 +323,63 @@ async def test_snapshots_and_day_start_equity(session: AsyncSession) -> None:
     assert latest is not None and latest.equity == Decimal("995")
 
 
+async def test_trusted_day_start_equity_accepts_only_the_pre_boundary_window(
+    session: AsyncSession,
+) -> None:
+    start = datetime(2026, 10, 9, tzinfo=UTC)
+    window = timedelta(seconds=120)
+
+    async def snap(ts: datetime, eq: str) -> None:
+        await repo.insert_equity_snapshot(
+            session,
+            ts=ts,
+            equity=Decimal(eq),
+            cash=Decimal(eq),
+            exposure=Decimal(0),
+            hwm=Decimal(eq),
+            daily_pnl=Decimal(0),
+        )
+
+    assert await repo.trusted_day_start_equity(session, start, window) is None
+    await snap(start - timedelta(seconds=121), "900")
+    await snap(start + timedelta(seconds=1), "1100")
+    assert await repo.trusted_day_start_equity(session, start, window) is None  # no fallback
+    await snap(start - window, "950")
+    assert await repo.trusted_day_start_equity(session, start, window) == Decimal("950")
+    await snap(start, "990")
+    assert await repo.trusted_day_start_equity(session, start, window) == Decimal("990")
+
+
+async def test_unsettled_sell_symbols_any_status_own_or_external(session: AsyncSession) -> None:
+    async def row(symbol: str, side: str, status: str, settled: bool = False) -> None:
+        order = await repo.insert_order(
+            session,
+            cycle_id=None,
+            client_order_id=None,
+            symbol=symbol,
+            mode="paper",
+            type_="limit",
+            side=side,
+            qty=Decimal("1"),
+            limit_price=Decimal("100"),
+            stop_price=None,
+            tp_price=None,
+            status=status,
+            now=T0,
+        )
+        if settled:
+            await session.execute(
+                update(m.Order).where(m.Order.id == order.id).values(settled_at=T0)
+            )
+            await session.commit()
+
+    await row("BTC/USD", "sell", "pending")
+    await row("ETH/USD", "sell", "not_submitted")
+    await row("SOL/USD", "sell", "filled", settled=True)
+    await row("AVAX/USD", "buy", "pending")
+    assert await repo.unsettled_sell_symbols(session) == {"BTC/USD", "ETH/USD"}
+
+
 async def test_snapshot_exposure_may_be_unknown(session: AsyncSession) -> None:
     await repo.insert_equity_snapshot(
         session,

@@ -2,7 +2,7 @@
 
 `check()` gathers state under the entry lock, runs the pure `check_entry`, persists the
 decision, applies a pause side effect on rejection, writes the order row, asks the
-control gate again right before submitting, then submits. `exit()` is
+control gate and re-checks engine health right before submitting, then submits. `exit()` is
 reduce-only and ignores kill/pause. Any failure while gathering rejects (fail closed).
 
 Two locks: entries serialise on one, exits on another, and an exit never waits for an
@@ -15,6 +15,26 @@ and the Position Manager manages it (WP 1.5c).
 `check()` first syncs every unsettled order (`sync_orders`) and books it through the ledger
 (`core/ledger.py`, WP 1.5b); an unreadable order, or a symbol whose booking raised in the
 ledger, rejects every entry (`state unavailable: SyncIncomplete`). Exits never sync.
+After that sync, a symbol with any unsettled sell row (own or external) rejects its entries.
+
+Daily-loss baseline (D19, spec 2026-11-09 3): the equity of the latest snapshot observed in
+the `2 x snapshot_interval_s` before the trading-day start; without one, entries are rejected
+(`daily-loss baseline unavailable`) for the whole day. No fallback to an older or later
+snapshot or to current equity; `repo.day_start_equity` feeds only the informational
+`daily_pnl` column. Every snapshot row is stamped with the engine clock read after
+`get_account()` returned (receipt time), so a read that crosses 00:00 never counts as a
+pre-boundary baseline. `last_snapshot_at` follows the snapshot loop (`snapshot_equity()`)
+only, never the peak snapshot `check()` writes.
+
+Health faults (spec 2026-11-09 4, 5.2, 6): `health_faults()` is read at the start of
+`_gather_entry` and reaches `check_entry(faults=...)`, which rejects with the first one right
+after check 1 and sets no pause. In order: `equity snapshot overdue` (no loop snapshot yet in
+this process, or one older than `2 x snapshot_interval_s`) and `cash reconciliation failed`
+(`cash_fault`, initially `not yet reconciled`; cleared by `cash_reconciled()`; a sticky fault,
+`CommitUncertain`, holds until restart and is never downgraded). After the pre-submit gate
+re-check, `check()` reads `health_faults()` again, plus `trading day changed` when the engine
+clock's trading day differs from the gather's (spec 2026-11-09 6.1): any of them leaves the
+order row `not_submitted` (`risk.entry_not_submitted`) and nothing is sent. Exits ignore all.
 
 Each locked section has ONE budget of `io_timeout_s`, measured from taking its lock and
 shared by its network/gate awaits only (gate.status, get_account, get_positions, each
@@ -132,6 +152,7 @@ class RiskEngine:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         io_timeout_s: float = 10.0,
         monotonic: Callable[[], float] = time.monotonic,
+        snapshot_interval_s: float = 60.0,
     ) -> None:
         self._broker = broker
         self._profile = profile
@@ -145,11 +166,49 @@ class RiskEngine:
         self._clock = clock
         self._io_timeout = io_timeout_s
         self._monotonic = monotonic  # the budget clock (injectable for tests)
-        # Monotonic time of the last committed equity snapshot (None = none yet): drives
+        # The snapshot loop's period; the trusted baseline window is twice it (D19).
+        self._snapshot_interval_s = snapshot_interval_s
+        # Monotonic time of the last equity snapshot the snapshot LOOP committed (None = none
+        # yet); the peak snapshot `check()` writes never sets it (spec 2026-11-09 4). Drives
         # run core's `risk.snapshot_overdue`, separately from the snapshot loop's liveness.
         self.last_snapshot_at: float | None = None
+        # Cash-reconciliation fault (spec 2026-11-09 5.2): in memory, per process. Set until
+        # the cash step has reconciled once; sticky (CommitUncertain) holds until restart.
+        self.cash_fault: str | None = "not yet reconciled"
+        self.cash_fault_sticky = False
         self._entry_lock = asyncio.Lock()  # check(): two entries never pass check 5 together
         self._exit_lock = asyncio.Lock()  # exit(): never waits for an entry
+
+    # --- health: entry faults (spec 2026-11-09 4, 5.2, 6) ------------------------------
+
+    def set_cash_fault(self, reason: str, *, sticky: bool = False) -> None:
+        """Fail entries closed until `cash_reconciled()`. Stickiness only ever goes from
+        false to true: a later plain fault replaces the reason of a non-sticky one but never
+        downgrades a sticky one. Logged on transitions only (clear -> set, or becoming sticky)."""
+        was_set, was_sticky = self.cash_fault is not None, self.cash_fault_sticky
+        if not was_sticky:
+            self.cash_fault = reason
+        self.cash_fault_sticky = was_sticky or sticky
+        if not was_set or (self.cash_fault_sticky and not was_sticky):
+            log.warning("risk.cash_fault_set", reason=self.cash_fault, sticky=sticky)
+
+    def cash_reconciled(self) -> None:
+        """Clear the cash fault; a no-op while it is sticky."""
+        if self.cash_fault_sticky or self.cash_fault is None:
+            return
+        self.cash_fault = None
+        log.info("risk.cash_fault_cleared")
+
+    def health_faults(self) -> tuple[str, ...]:
+        """Reasons that reject every entry, read with the engine clock right now: no loop
+        snapshot yet or one older than `2 x snapshot_interval_s`, then the cash fault."""
+        faults: list[str] = []
+        last = self.last_snapshot_at
+        if last is None or self._monotonic() - last > 2 * self._snapshot_interval_s:
+            faults.append("equity snapshot overdue")
+        if self.cash_fault is not None:
+            faults.append("cash reconciliation failed")
+        return tuple(faults)
 
     # --- entries ---------------------------------------------------------------------
 
@@ -161,7 +220,9 @@ class RiskEngine:
             deadline = self._monotonic() + self._io_timeout
             now = self._clock()
             try:
-                control, portfolio, market = await self._gather_entry(intent.symbol, now, deadline)
+                control, portfolio, market, faults = await self._gather_entry(
+                    intent.symbol, now, deadline
+                )
             except Exception as e:  # fail closed: unknown state must not allow an entry
                 log.exception("risk.state_unavailable", symbol=intent.symbol)
                 decision = RiskDecision(
@@ -176,6 +237,7 @@ class RiskEngine:
                 profile=self._profile,
                 control=control,
                 mode_matches=self._mode == self._broker.mode(),
+                faults=faults,
             )
             await self._persist(intent.cycle_id, "entry", decision, now)
             if not decision.approved or decision.order is None:
@@ -208,15 +270,31 @@ class RiskEngine:
                 await self._set_status(row.id, "not_submitted")
                 log.warning("risk.entry_not_submitted", reasons=reasons)
                 return OrderResult(decision, row.id, "not_submitted")
+            # Health may have turned bad since the gather (spec 2026-11-09 6.1): synchronous
+            # state and clock reads only, so no await separates this from the submit.
+            late = (
+                *self.health_faults(),
+                *(
+                    ("trading day changed",)
+                    if day_start(self._clock(), self._tz) != day_start(now, self._tz)
+                    else ()
+                ),
+            )
+            if late:
+                await self._set_status(row.id, "not_submitted")
+                log.warning("risk.entry_not_submitted", reasons=list(late))
+                return OrderResult(decision, row.id, "not_submitted")
             return await self._submit(
                 row.id, decision, deadline, lambda: self._broker.submit_order(order)
             )
 
     async def _gather_entry(
         self, symbol: str, now: datetime, deadline: float
-    ) -> tuple[ControlStatus, PortfolioState, MarketSnapshot]:
+    ) -> tuple[ControlStatus, PortfolioState, MarketSnapshot, tuple[str, ...]]:
         """Only the network/gate awaits are budgeted; a timeout raises out of here and
-        `check()` turns it into the persisted `state unavailable` rejection."""
+        `check()` turns it into the persisted `state unavailable` rejection. The health
+        faults are read first, before the order sync; the gather runs fully either way."""
+        faults = self.health_faults()
         # Book our own orders BEFORE reading positions: a fill the sync observed is then in
         # the journal and in the positions read below (never neither position nor entry).
         synced = await self._sync(deadline)
@@ -230,6 +308,8 @@ class RiskEngine:
         control = await self._within(deadline, lambda: self._gate.status(now))
         async with self._sessions() as session:
             open_rows = await repo.open_entry_orders(session)
+            # A sell (own or external) whose effects are not booked yet blocks its symbol.
+            unsettled_sells = frozenset(await repo.unsettled_sell_symbols(session))
             # One open journal trade per symbol (PR #25 review): a trade stays open (e.g.
             # an exit whose status lags) even when the broker holds only dust, which
             # check 5 ignores.
@@ -239,14 +319,17 @@ class RiskEngine:
         # leaves the row behind the broker, and a final order never fills its remainder.
         status = {u.order_row_id: u.status for u in synced.updates}
         account = await self._within(deadline, self._broker.get_account)
-        # Persist a new peak (or the first-ever baseline) right after the account read,
+        observed = self._clock()  # receipt time: the row's stamp (spec 2026-11-09 3.1)
+        # Persist a new peak (or the first-ever snapshot) right after the account read,
         # before anything else here can fail: otherwise a spike seen by a check that then
         # rejects or fails would be forgotten and never bound drawdown. Exposure is
-        # unknown at this point (NULL).
+        # unknown at this point (NULL). Stamped at receipt, not at the gather's `now`, so
+        # a read that crosses 00:00 never passes as a pre-boundary baseline. It does not
+        # refresh `last_snapshot_at` (only the snapshot loop does).
         async with self._sessions() as session:
             stored_hwm = await repo.max_hwm(session)
         if stored_hwm is None or account.equity > stored_hwm:
-            await self._write_snapshot(now, account.equity, account.cash, None)
+            await self._write_snapshot(observed, account.equity, account.cash, None)
         held = await self._held_positions(deadline)
         rules = await self._within(deadline, lambda: self._broker.asset_rules(symbol))
         fees = self._broker.fee_schedule()
@@ -255,7 +338,13 @@ class RiskEngine:
             entries_day = await repo.count_entry_orders(
                 session, day_start(now, self._tz), inclusive=True
             )
-            baseline = await repo.day_start_equity(session, day_start(now, self._tz))
+            # Only a snapshot observed in the 2 x interval before the day start is a baseline
+            # (D19); None rejects in check 3. Never `repo.day_start_equity` (informational).
+            baseline = await repo.trusted_day_start_equity(
+                session,
+                day_start(now, self._tz),
+                timedelta(seconds=2 * self._snapshot_interval_s),
+            )
             # Re-read: the snapshot loop may have committed a higher peak while this check
             # awaited positions/rules; the decision uses the max of both durable reads.
             late_hwm = await repo.max_hwm(session)
@@ -264,7 +353,7 @@ class RiskEngine:
         portfolio = PortfolioState(
             equity=account.equity,
             cash=account.cash,
-            day_start_equity=baseline if baseline is not None else account.equity,
+            day_start_equity=baseline,
             hwm=hwm,
             positions=held,
             open_entries=tuple(
@@ -289,6 +378,7 @@ class RiskEngine:
             entries_today=entries_day,
             strategy_trades_n=trades_n,
             strategy_win_rate=Decimal(wins) / Decimal(trades_n) if trades_n else None,
+            unsettled_sells=unsettled_sells,
         )
         quote = self._market.quote(symbol)
         features = compute_features(
@@ -305,7 +395,7 @@ class RiskEngine:
             rules=rules,
             fees=fees,
         )
-        return control, portfolio, market
+        return control, portfolio, market, faults
 
     async def sync_orders(self) -> SyncResult:
         """Read-only broker view of every unsettled order for the ledger (spec 4.2). Takes
@@ -541,10 +631,10 @@ class RiskEngine:
                         deadline, partial(self._broker.cancel_order, row.broker_order_id)
                     )
                 except Exception:
-                    log.exception("risk.cancel_failed", order_id=row.id, symbol=row.symbol)
+                    log.exception("risk.cancel_failed", order_row=row.id, symbol=row.symbol)
                     failed.append(row.id)
                 else:
-                    log.info("risk.entry_cancel_requested", order_id=row.id, symbol=row.symbol)
+                    log.info("risk.entry_cancel_requested", order_row=row.id, symbol=row.symbol)
                     requested.append(row.id)
             return CancelResult(
                 requested=tuple(requested), failed=tuple(failed), unresolved=tuple(unresolved)
@@ -559,25 +649,29 @@ class RiskEngine:
     # --- equity snapshots ------------------------------------------------------------
 
     async def snapshot_equity(self) -> Account:
-        """Called every 60 s by `run core`'s supervised `risk.snapshot` loop. Its broker calls
-        have their own `io_timeout_s` budget; journal writes are never cancelled.
-        Lock-free on purpose: it must never delay an exit. Returns the account it read, so a
-        caller can feed the ledger's cash check (1.5d) without a second broker call."""
+        """Called every `snapshot_interval_s` by `run core`'s supervised `risk.snapshot` loop. Its
+        broker calls have their own `io_timeout_s` budget; journal writes are never cancelled.
+        Lock-free on purpose: it must never delay an exit. Returns the account it read, so
+        `run core` can feed it to the ledger's cash check without a second broker call."""
         deadline = self._monotonic() + self._io_timeout  # its own budget; no lock shared
-        now = self._clock()
         account = await self._within(deadline, self._broker.get_account)
+        now = self._clock()  # receipt time stamps the row (spec 2026-11-09 3.1)
         try:
             held = await self._held_positions(deadline)
         except Exception:  # the equity (and a peak) is still recorded, exposure unknown
             await self._write_snapshot(now, account.equity, account.cash, None)
+            self.last_snapshot_at = self._monotonic()
             raise
         await self._write_snapshot(now, account.equity, account.cash, held)
+        self.last_snapshot_at = self._monotonic()
         return account
 
     async def _write_snapshot(
         self, now: datetime, equity: Decimal, cash: Decimal, held: tuple[HeldPosition, ...] | None
     ) -> None:
-        """Append one row; `held=None` (positions not read) stores exposure NULL."""
+        """Append one row stamped `now` (the caller's receipt time of the account read);
+        `held=None` (positions not read) stores exposure NULL. `daily_pnl` is informational
+        (`repo.day_start_equity`, with its fallback); no limit reads it."""
         async with self._sessions() as session:
             stored_hwm = await repo.max_hwm(session)
             baseline = await repo.day_start_equity(session, day_start(now, self._tz))
@@ -601,4 +695,3 @@ class RiskEngine:
                 hwm=hwm,
                 daily_pnl=equity - (baseline if baseline is not None else equity),
             )
-            self.last_snapshot_at = self._monotonic()

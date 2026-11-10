@@ -172,6 +172,7 @@ class PositionManager:
         self._stale_held: set[str] = set()
         self._cannot_trade_logged = False
         self._cancel_requested: set[int] = set()  # entry rows whose cancel was accepted
+        self._cancel_backoff: dict[int, Backoff] = {}  # entry rows whose cancel keeps failing
         self._entry_unresolved: set[int] = set()  # id-less entry rows already logged
         self._last_pending: tuple[str, datetime] | None = None  # (request ts, last refresh)
 
@@ -209,7 +210,7 @@ class PositionManager:
             latest = self._controls.latest
             killed = latest is not None and latest.killed
             if (killed or request is not None) and can_trade:
-                await self._cancel_entries()
+                await self._cancel_entries(now)
             reason: ExitReason | None = None
             if killed and self._config.kill_flatten:
                 reason = "kill"
@@ -223,13 +224,26 @@ class PositionManager:
             log.exception("positions.control_failed")
         return request
 
-    async def _cancel_entries(self) -> None:
+    async def _cancel_entries(self, now: datetime) -> None:
+        exclude = self._cancel_requested | {
+            rid for rid, backoff in self._cancel_backoff.items() if not backoff.due(now)
+        }
         try:
-            result = await self._risk.cancel_open_entries(exclude=self._cancel_requested)
+            result = await self._risk.cancel_open_entries(exclude=exclude)
         except Exception:
             log.exception("positions.control_failed", action="cancel_open_entries")
             return
         self._cancel_requested.update(result.requested)
+        for row_id in result.requested:
+            self._cancel_backoff.pop(row_id, None)
+        for row_id in result.failed:
+            backoff = self._cancel_backoff.setdefault(row_id, Backoff())
+            if backoff.fail(now):
+                log.error(
+                    "positions.cancel_failed_repeatedly",
+                    order_row=row_id,
+                    failures=backoff.failures,
+                )
         for row_id in result.unresolved:
             if row_id not in self._entry_unresolved:
                 self._entry_unresolved.add(row_id)
@@ -314,7 +328,7 @@ class PositionManager:
                 if row.external and row.side == "sell" and row.symbol:
                     by_symbol.setdefault(row.symbol, []).append(row)
             for symbol, rows in by_symbol.items():
-                self._alert_unsettled(("ext", symbol), rows, now, external=True)
+                self._alert_unsettled(("ext", symbol), rows, now)
             for key in [k for k, ids in self._pending.items() if isinstance(k, tuple) and ids]:
                 await self._judge_outcomes(key, self._backoff.setdefault(key, Backoff()), now)
         except Exception:
@@ -524,7 +538,7 @@ class PositionManager:
         await self._judge_outcomes(pos.id, backoff, now)
         state = classify_sells(sells)
         if state in ("unresolved", "in_flight"):
-            self._alert_unsettled(pos.id, sells, now, external=False)
+            self._alert_unsettled(pos.id, sells, now)
             return
         if state == "settling":
             return
@@ -590,18 +604,14 @@ class PositionManager:
                     **_key_fields(key),
                 )
 
-    def _alert_unsettled(
-        self, key: Key, sells: Sequence[Order], now: datetime, *, external: bool
-    ) -> None:
+    def _alert_unsettled(self, key: Key, sells: Sequence[Order], now: datetime) -> None:
         unresolved = [
             r.id
             for r in sells
             if r.broker_order_id is None and r.status not in ("not_submitted", "rejected")
         ]
         if unresolved and self._due(self._last_unresolved_log, key, now):
-            log.error(
-                "positions.exit_unresolved", key=str(key), order_rows=unresolved, external=external
-            )
+            log.error("positions.exit_unresolved", order_rows=unresolved, **_key_fields(key))
         in_flight = [r for r in sells if r.broker_order_id is not None and r.status not in FINAL]
         if (
             in_flight
@@ -610,9 +620,8 @@ class PositionManager:
         ):
             log.error(
                 "positions.exit_stuck",
-                key=str(key),
                 order_rows=[r.id for r in in_flight],
-                external=external,
+                **_key_fields(key),
             )
 
     @staticmethod

@@ -21,24 +21,24 @@ from autotrader.core.shutdown import (
 )
 
 
-class FakeTimer:
-    def __init__(self, seconds: float, fn: Callable[[], None]) -> None:
-        self.seconds, self.fn = seconds, fn
+class FakeThread:
+    def __init__(self, target: Callable[[], None]) -> None:
+        self.target = target
         self.daemon = False
         self.started = False
 
     def start(self) -> None:
-        self.started = True
+        self.started = True  # never runs the target: tests drive poll()
 
 
-class Timers:
+class Threads:
     def __init__(self) -> None:
-        self.made: list[FakeTimer] = []
+        self.made: list[FakeThread] = []
 
-    def __call__(self, seconds: float, fn: Callable[[], None]) -> FakeTimer:
-        timer = FakeTimer(seconds, fn)
-        self.made.append(timer)
-        return timer
+    def __call__(self, target: Callable[[], None]) -> FakeThread:
+        thread = FakeThread(target)
+        self.made.append(thread)
+        return thread
 
 
 class Clock:
@@ -49,19 +49,100 @@ class Clock:
         return self.now
 
 
-def test_watchdog_arms_once_as_a_daemon_and_exits_70_with_a_stderr_line() -> None:
-    timers, err = Timers(), io.StringIO()
+def test_watchdog_arms_once_and_exits_70_with_a_stderr_line() -> None:
+    clock, threads, err = Clock(), Threads(), io.StringIO()
     exits: list[int] = []
-    dog = Watchdog(timer_factory=timers, exit=exits.append, stderr=err)
+    dog = Watchdog(thread_factory=threads, clock=clock, exit=exits.append, stderr=err)
+    dog.start()
 
     dog.arm(35)
     dog.arm(99)  # a second arm is a no-op
 
-    (timer,) = timers.made
-    assert (timer.seconds, timer.daemon, timer.started) == (34.5, True, True)  # 35 - log wait
-    timer.fn()
+    (thread,) = threads.made
+    assert (thread.daemon, thread.started, dog.armed) == (True, True, True)
+    clock.now = 134.4
+    assert dog.poll() is False and exits == []
+    clock.now = 134.5  # 35 - log wait
+    assert dog.poll() is True
     assert exits == [EXIT_WATCHDOG]
     assert json.loads(err.getvalue())["event"] == "core.watchdog_exit"
+
+
+def test_arm_assigns_a_deadline_without_starting_a_thread() -> None:
+    clock, threads = Clock(), Threads()
+    exits: list[int] = []
+    dog = Watchdog(thread_factory=threads, clock=clock, exit=exits.append, stderr=io.StringIO())
+    dog.start()
+    assert not dog.armed and dog.poll() is False
+
+    dog.arm(35)
+
+    assert len(threads.made) == 1  # only start() made one
+    assert dog.armed
+    clock.now = 134.0
+    assert dog.poll() is False
+    clock.now = 134.5
+    assert dog.poll() is True
+    assert exits == [EXIT_WATCHDOG]
+
+
+def test_start_is_idempotent() -> None:
+    threads = Threads()
+    dog = Watchdog(thread_factory=threads)
+    assert not dog.started
+
+    dog.start()
+    dog.start()
+
+    assert dog.started and len(threads.made) == 1
+
+
+def test_arm_keeps_the_first_deadline() -> None:
+    clock, threads = Clock(), Threads()
+    exits: list[int] = []
+    dog = Watchdog(thread_factory=threads, clock=clock, exit=exits.append, stderr=io.StringIO())
+    dog.start()
+    dog.arm(35)
+    clock.now = 120.0
+    dog.arm(35)  # would be 154.5 if it replaced the first
+
+    clock.now = 134.5
+    assert dog.poll() is True
+
+
+def test_arm_on_an_unstarted_watchdog_starts_it_and_says_so() -> None:
+    threads, err = Threads(), io.StringIO()
+    dog = Watchdog(thread_factory=threads, exit=lambda code: None, stderr=err)
+
+    dog.arm(35)
+
+    assert dog.started and dog.armed
+    assert len(threads.made) == 1 and threads.made[0].started
+    assert json.loads(err.getvalue().splitlines()[0])["event"] == "core.watchdog_late_start"
+
+
+def test_the_thread_target_polls_until_the_deadline_passes() -> None:
+    clock, threads = Clock(), Threads()
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock.now += 50.0
+
+    dog = Watchdog(
+        thread_factory=threads,
+        clock=clock,
+        exit=lambda code: None,
+        stderr=io.StringIO(),
+        sleep=sleep,
+        poll_s=0.1,
+    )
+    dog.start()
+    dog.arm(75)  # deadline 174.5
+
+    threads.made[0].target()  # not armed-time dependent: loops until poll() fires
+
+    assert sleeps == [0.1, 0.1]  # 150.0 -> not yet; 200.0 -> fired
 
 
 class RaisingStream(io.StringIO):
@@ -80,31 +161,49 @@ class BlockingStream(io.StringIO):
 
 
 def test_watchdog_exit_including_the_log_wait_stays_within_the_armed_bound() -> None:
-    timers = Timers()
-    Watchdog(timer_factory=timers, exit=lambda code: None, log_wait_s=2.0).arm(35)
+    clock = Clock()
+    exits: list[int] = []
+    dog = Watchdog(
+        thread_factory=Threads(),
+        clock=clock,
+        exit=exits.append,
+        log_wait_s=2.0,
+        stderr=io.StringIO(),
+    )
+    dog.start()
+    dog.arm(35)
 
-    (timer,) = timers.made
-    assert timer.seconds + 2.0 == 35  # fires at 33, the log wait ends by 35
+    clock.now = 132.9
+    assert dog.poll() is False
+    clock.now = 133.0  # fires at 33, the log wait ends by 35
+    assert dog.poll() is True
 
 
 def test_watchdog_exits_70_even_if_stderr_raises() -> None:
-    timers = Timers()
+    clock = Clock()
     exits: list[int] = []
-    Watchdog(timer_factory=timers, exit=exits.append, stderr=RaisingStream()).arm(35)
+    dog = Watchdog(thread_factory=Threads(), clock=clock, exit=exits.append, stderr=RaisingStream())
+    dog.start()
+    dog.arm(35)
 
-    timers.made[0].fn()
+    clock.now = 135.0
+    assert dog.poll() is True
 
     assert exits == [EXIT_WATCHDOG]
 
 
 def test_watchdog_exits_70_even_if_stderr_blocks() -> None:
-    timers, stream = Timers(), BlockingStream()
+    clock, stream = Clock(), BlockingStream()
     exits: list[int] = []
-    dog = Watchdog(timer_factory=timers, exit=exits.append, stderr=stream, log_wait_s=0.01)
+    dog = Watchdog(
+        thread_factory=Threads(), clock=clock, exit=exits.append, stderr=stream, log_wait_s=0.01
+    )
+    dog.start()
     dog.arm(35)
+    clock.now = 135.0
 
     try:
-        timers.made[0].fn()  # returns after the bounded wait, not when the write ends
+        dog.poll()  # returns after the bounded wait, not when the write ends
         assert exits == [EXIT_WATCHDOG]
     finally:
         stream.release.set()
@@ -137,16 +236,17 @@ def test_begin_is_idempotent_and_never_rearms() -> None:
 
 
 async def test_first_signal_arms_the_watchdog_while_the_loop_is_blocked() -> None:
-    clock, timers = Clock(), Timers()
+    clock, threads = Clock(), Threads()
     exits: list[int] = []
-    dog = Watchdog(timer_factory=timers, exit=exits.append)
+    dog = Watchdog(thread_factory=threads, clock=clock, exit=exits.append)
+    dog.start()
     control = ShutdownControl(30, arm_watchdog=dog.arm, monotonic=clock)
     wakeup = control.attach()
     handler = make_signal_handler(control, exit=exits.append)
 
     # This coroutine doesn't yield between here and the asserts: the loop is "blocked".
     handler(signal.SIGINT, None)
-    assert timers.made and timers.made[0].started  # armed in the handler itself
+    assert dog.armed and len(threads.made) == 1  # deadline set; no thread started in the handler
     assert control.deadline == 130.0  # measured from the signal
     assert not wakeup.is_set()  # the queued wake-up hasn't run: no loop callback yet
 

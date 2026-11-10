@@ -74,6 +74,7 @@ addopts = "-ra --strict-markers -m 'not smoke'"
 asyncio_mode = "auto"
 markers = [
     "smoke: hits real external APIs (Alpaca, Anthropic); opt-in via `-m smoke`",
+    "no_baseline: the test builds its own equity snapshots (no seeded day-start baseline)",
 ]
 filterwarnings = [
     "error",  # warnings fail the run (locally and in CI)
