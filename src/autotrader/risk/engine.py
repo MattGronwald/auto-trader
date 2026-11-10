@@ -172,7 +172,7 @@ class RiskEngine:
         # Cash-reconciliation fault (spec 2026-11-09 5.2): in memory, per process. Set until
         # the cash step has reconciled once; sticky (CommitUncertain) holds until restart.
         self.cash_fault: str | None = "not yet reconciled"
-        self._cash_fault_sticky = False
+        self.cash_fault_sticky = False
         self._entry_lock = asyncio.Lock()  # check(): two entries never pass check 5 together
         self._exit_lock = asyncio.Lock()  # exit(): never waits for an entry
 
@@ -182,16 +182,16 @@ class RiskEngine:
         """Fail entries closed until `cash_reconciled()`. Stickiness only ever goes from
         false to true: a later plain fault replaces the reason of a non-sticky one but never
         downgrades a sticky one. Logged on transitions only (clear -> set, or becoming sticky)."""
-        was_set, was_sticky = self.cash_fault is not None, self._cash_fault_sticky
+        was_set, was_sticky = self.cash_fault is not None, self.cash_fault_sticky
         if not was_sticky:
             self.cash_fault = reason
-        self._cash_fault_sticky = was_sticky or sticky
-        if not was_set or (self._cash_fault_sticky and not was_sticky):
+        self.cash_fault_sticky = was_sticky or sticky
+        if not was_set or (self.cash_fault_sticky and not was_sticky):
             log.warning("risk.cash_fault_set", reason=self.cash_fault, sticky=sticky)
 
     def cash_reconciled(self) -> None:
         """Clear the cash fault; a no-op while it is sticky."""
-        if self._cash_fault_sticky or self.cash_fault is None:
+        if self.cash_fault_sticky or self.cash_fault is None:
             return
         self.cash_fault = None
         log.info("risk.cash_fault_cleared")

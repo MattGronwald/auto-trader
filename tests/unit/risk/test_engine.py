@@ -2065,7 +2065,7 @@ async def test_sticky_cash_fault_survives_reconciliation(
     engine.last_snapshot_at = time.monotonic()
     engine.set_cash_fault("CommitUncertain", sticky=True)
     engine.cash_reconciled()
-    assert engine.cash_fault == "CommitUncertain"
+    assert engine.cash_fault == "CommitUncertain" and engine.cash_fault_sticky
     assert await reasons_of(engine, cycle_id) == ("cash reconciliation failed",)
 
     other = make_engine_(sim, sessions, gate, healthy=False)
@@ -2085,6 +2085,7 @@ async def test_plain_fault_never_downgrades_a_sticky_one(
     engine.set_cash_fault("a", sticky=True)
     engine.set_cash_fault("b")
     engine.cash_reconciled()
+    assert engine.cash_fault == "a" and engine.cash_fault_sticky
     assert await reasons_of(engine, cycle_id) == ("cash reconciliation failed",)
 
 
