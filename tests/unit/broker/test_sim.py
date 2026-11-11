@@ -10,6 +10,7 @@ from autotrader.broker.base import (
     AssetRules,
     Broker,
     BrokerOrder,
+    BrokerOrderView,
     DustRemainder,
     FeeSchedule,
     Fill,
@@ -955,7 +956,7 @@ async def test_close_sells_an_off_increment_holding_exactly() -> None:
     assert pos.qty == D("0.99779925")  # not a multiple of the 0.0001 increment
 
     with pytest.raises(OrderRejected, match="not a multiple"):
-        await sim.submit_order(market("sell", "0.99779925"))  # ordinary orders still checked
+        await sim.submit_order(market("sell", "0.99779924"))  # ordinary orders still checked
     ack = await sim.close_position(BTC)
     sim.process_bar(bar(2, 100.0))
 
@@ -1168,3 +1169,160 @@ async def test_dust_close_raises_the_typed_dust_signal() -> None:
 
 def test_sim_can_place_orders() -> None:
     assert make_sim().can_place_orders() is True
+
+
+# --- order view, free qty, lost-order hooks (WP 1.5d-2 task 2) ---------------------------
+
+
+def cid_market(side: str, qty: str, cid: str) -> BrokerOrder:
+    return market(side, qty).model_copy(update={"client_order_id": cid})
+
+
+async def test_qty_available_excludes_pending_sells() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(1, 100.0))
+    await sim.submit_order(limit("sell", "0.4", "500"))  # stays open
+
+    (pos,) = await sim.get_positions()
+
+    assert (pos.qty, pos.qty_available) == (D("1"), D("0.6"))
+
+
+async def test_full_free_sell_off_increment_is_accepted_after_coin_fee_buy() -> None:
+    sim = make_sim(fees=BASE)
+    sim.process_bar(bar(0, 100.0))
+    await sim.submit_order(market("buy", "1.0003"))
+    sim.process_bar(bar(1, 100.0))
+    (pos,) = await sim.get_positions()
+    assert pos.qty_available == D("0.99779925")  # off the 0.0001 increment
+
+    with pytest.raises(OrderRejected, match="not a multiple"):
+        await sim.submit_order(market("sell", "0.99779924"))  # another off-increment qty
+    ack = await sim.submit_order(market("sell", str(pos.qty_available)))
+    sim.process_bar(bar(2, 100.0))
+
+    assert (await sim.get_order(ack.order_id)).filled_qty == D("0.99779925")
+    assert await sim.get_positions() == []
+
+
+async def test_full_free_sell_below_min_qty_is_dust() -> None:
+    sim = make_sim(fees=BASE)
+    sim.process_bar(bar(0, 20000.0))
+    await sim.submit_order(market("buy", "0.0001"))
+    sim.process_bar(bar(1, 20000.0))
+    (pos,) = await sim.get_positions()
+    assert pos.qty_available == D("0.00009975")
+
+    with pytest.raises(DustRemainder):
+        await sim.submit_order(market("sell", str(pos.qty_available)))
+
+
+async def test_get_order_by_client_id_returns_view_or_none() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    ack = await sim.submit_order(cid_market("buy", "1", "at-ab12cd34-c1-e"))
+
+    view = await sim.get_order_by_client_id("at-ab12cd34-c1-e")
+
+    assert view == BrokerOrderView(
+        order_id=ack.order_id,
+        client_order_id="at-ab12cd34-c1-e",
+        symbol=BTC,
+        side="buy",
+        qty=D("1"),
+        status="new",
+        filled_qty=D("0"),
+        created_at=ack.submitted_at,
+    )
+    assert await sim.get_order_by_client_id("nope") is None
+    sim.process_bar(bar(1, 100.0))
+    filled = await sim.get_order_by_client_id("at-ab12cd34-c1-e")
+    assert filled is not None
+    assert (filled.status, filled.filled_qty) == ("filled", D("1"))
+
+
+async def test_duplicate_client_id_rejected() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    await sim.submit_order(cid_market("buy", "1", "dup"))
+
+    with pytest.raises(OrderRejected, match="duplicate client_order_id"):
+        await sim.submit_order(cid_market("buy", "1", "dup"))
+    await sim.submit_order(market("buy", "1"))  # None ids never collide
+    await sim.submit_order(market("buy", "1"))
+
+
+async def test_hide_until_visible() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    ack = await sim.submit_order(cid_market("buy", "1", "c1"))
+    visible = False
+    sim.hide("c1", lambda: visible)
+
+    with pytest.raises(OrderNotFound):
+        await sim.get_order(ack.order_id)
+    with pytest.raises(OrderNotFound):
+        await sim.order_fills(ack.order_id)
+    assert await sim.get_order_by_client_id("c1") is None
+
+    visible = True
+    assert (await sim.get_order(ack.order_id)).status == "new"
+    assert await sim.order_fills(ack.order_id) == []
+    assert (await sim.get_order_by_client_id("c1")) is not None
+
+
+async def test_fail_submit_after_accept_stores_the_order() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    sim.fail_submit_after_accept()
+
+    with pytest.raises(ConnectionError, match="response lost"):
+        await sim.submit_order(cid_market("buy", "1", "c1"))
+
+    view = await sim.get_order_by_client_id("c1")
+    assert view is not None
+    assert view.status == "new"
+    sim.process_bar(bar(1, 100.0))  # the lost order still fills
+    assert (await sim.get_order(view.order_id)).status == "filled"
+    ack = await sim.submit_order(cid_market("buy", "1", "c2"))  # one-shot hook
+    assert ack.order_id != view.order_id
+
+
+async def test_forget_keeps_client_lookup() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    ack = await sim.submit_order(cid_market("buy", "1", "c1"))
+    sim.forget(ack.order_id)
+
+    with pytest.raises(OrderNotFound):
+        await sim.get_order(ack.order_id)
+    with pytest.raises(OrderNotFound):
+        await sim.order_fills(ack.order_id)
+    view = await sim.get_order_by_client_id("c1")
+    assert view is not None
+    assert view.order_id == ack.order_id
+
+    sim.unforget(ack.order_id)
+    assert (await sim.get_order(ack.order_id)).status == "new"
+    assert await sim.order_fills(ack.order_id) == []
+
+
+async def test_rekey_moves_the_order() -> None:
+    sim = make_sim()
+    sim.process_bar(bar(0, 100.0))
+    ack = await sim.submit_order(cid_market("buy", "1", "c1"))
+    new_id = sim.rekey(ack.order_id)
+
+    assert new_id != ack.order_id
+    with pytest.raises(OrderNotFound):
+        await sim.get_order(ack.order_id)
+    view = await sim.get_order_by_client_id("c1")
+    assert view is not None
+    assert view.order_id == new_id
+    assert (await sim.get_order(new_id)).order_id == new_id
+    sim.process_bar(bar(1, 100.0))
+    (fill,) = await sim.order_fills(new_id)
+    assert fill.order_id == new_id
+    assert fill.fill_id.startswith(f"{ack.order_id}:")  # fill ids keep the old prefix

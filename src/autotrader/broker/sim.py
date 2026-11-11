@@ -28,6 +28,15 @@ Fill model, driven by `process_bar()`:
   is not a multiple of `qty_increment` (Alpaca accepted the exact net qty on paper); a
   remainder below `min_qty` is dust and is rejected with `DustRemainder` (spec section 4).
   Whether Alpaca rejects a sell below `min_order_size` is unverified (WP 1.6).
+  A `submit_order` sell whose qty equals the free qty (`Position.qty_available`) behaves
+  the same way: a full close, increment check skipped, `DustRemainder` below `min_qty`.
+  Any other off-increment sell is still rejected.
+- Client order ids: `submit_order` rejects an id already used by a stored order, so
+  `get_order_by_client_id` is unambiguous.
+- Test hooks for lost-order scenarios (order resolver): `hide()` (invisible until a
+  predicate holds), `fail_submit_after_accept()` (order stored, response lost),
+  `forget()` / `unforget()` (reads by broker id miss, lookup by client id still works),
+  `rekey()` (the order moves to a new broker id).
 
 Cash is checked at submit (reserving pending buys) and again at fill, because the price
 can gap; a buy that no longer fits is rejected at fill. Bar floats are converted via
@@ -36,7 +45,7 @@ can gap; a buy that no longer fits is rejected at fill. Bar floats are converted
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -48,6 +57,7 @@ from autotrader.broker.base import (
     Account,
     AssetRules,
     BrokerOrder,
+    BrokerOrderView,
     DustRemainder,
     FeeSchedule,
     Fill,
@@ -115,6 +125,10 @@ class _Order:
     reason: str | None = None
     steps: deque[FillStep] = field(default_factory=deque)
     full_close: bool = False  # close_position: may be off-increment (spec section 4)
+    fill_prefix: str = ""  # fill ids use the id the order was created with, even after rekey()
+
+    def __post_init__(self) -> None:
+        self.fill_prefix = self.fill_prefix or self.id
 
     @property
     def remaining(self) -> Decimal:
@@ -179,6 +193,9 @@ class SimBroker:
         self._fills: asyncio.Queue[Fill] = asyncio.Queue()
         self._fill_log: dict[str, Fill] = {}  # every emitted fill by id, for redeliver()
         self._scripts: dict[tuple[str, str], deque[FillPlan]] = {}
+        self._hidden: dict[str, Callable[[], bool]] = {}  # client id -> visible predicate
+        self._forgotten: set[str] = set()  # broker ids whose reads miss
+        self._fail_next_submit = False
 
     # --- Broker protocol -------------------------------------------------------------
 
@@ -188,15 +205,37 @@ class SimBroker:
 
     async def get_positions(self) -> list[Position]:
         return [
-            Position(symbol=s, qty=h.qty, avg_entry_price=h.avg_entry_price)
+            Position(
+                symbol=s,
+                qty=h.qty,
+                qty_available=h.qty - self._pending_qty(s, "sell"),
+                avg_entry_price=h.avg_entry_price,
+            )
             for s, h in sorted(self._holdings.items())
         ]
 
     async def submit_order(self, order: BrokerOrder) -> OrderAck:
-        return await self._submit(order, full_close=False)
+        full_close = False
+        held = self._holdings.get(order.symbol)
+        if order.side == "sell" and held is not None:
+            free = held.qty - self._pending_qty(order.symbol, "sell")
+            if order.qty == free:  # a full free sell is a full close (spec 2.2)
+                rules = self.asset_rules_by_symbol[order.symbol]
+                if free < rules.min_qty:
+                    raise DustRemainder(order.symbol, free, rules.min_qty)
+                full_close = True
+        ack = await self._submit(order, full_close=full_close)
+        if self._fail_next_submit:
+            self._fail_next_submit = False
+            raise ConnectionError("response lost")
+        return ack
 
     async def _submit(self, order: BrokerOrder, *, full_close: bool) -> OrderAck:
         self._validate(order, full_close=full_close)
+        if order.client_order_id is not None and any(
+            o.order.client_order_id == order.client_order_id for o in self._orders.values()
+        ):
+            raise OrderRejected("duplicate client_order_id")
         self._seq += 1
         oid = f"sim-{self._seq}"
         submitted_at = self._now or datetime.now(UTC)
@@ -220,6 +259,23 @@ class SimBroker:
         if not o.is_open:
             raise OrderRejected(f"order {order_id} is not open ({o.status})")
         o.status = "canceled"  # final; filled_qty is kept, the remainder is released
+
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        for o in self._orders.values():
+            if o.order.client_order_id == client_order_id:
+                if not self._is_visible(o):
+                    return None
+                return BrokerOrderView(
+                    order_id=o.id,
+                    client_order_id=client_order_id,
+                    symbol=o.order.symbol,
+                    side=o.order.side,
+                    qty=o.order.qty,
+                    status=o.status,
+                    filled_qty=o.filled_qty,
+                    created_at=o.submitted_at,
+                )
+        return None
 
     async def get_order(self, order_id: str) -> OrderStatus:
         o = self._get(order_id)
@@ -264,6 +320,38 @@ class SimBroker:
     async def stream_fills(self) -> AsyncIterator[Fill]:
         while True:
             yield await self._fills.get()
+
+    # --- test hooks (lost-order scenarios) ------------------------------------------
+
+    def hide(self, client_order_id: str, visible: Callable[[], bool]) -> None:
+        """While `visible()` is false the order is invisible to `get_order`, `order_fills`
+        (`OrderNotFound`) and `get_order_by_client_id` (None). Drive it with the test Clock."""
+        self._hidden[client_order_id] = visible
+
+    def fail_submit_after_accept(self) -> None:
+        """The next `submit_order` stores the order, then raises `ConnectionError`."""
+        self._fail_next_submit = True
+
+    def forget(self, order_id: str) -> None:
+        """`get_order` / `order_fills` raise `OrderNotFound` for `order_id`; the lookup by
+        client id still returns the order under the same id."""
+        self._forgotten.add(order_id)
+
+    def unforget(self, order_id: str) -> None:
+        self._forgotten.discard(order_id)
+
+    def rekey(self, order_id: str) -> str:
+        """Move the order to a new broker id (same seq counter); the old id raises
+        `OrderNotFound`. Fill ids keep the old prefix. Returns the new id."""
+        o = self._orders.pop(order_id)  # unknown id: KeyError, a test bug
+        self._seq += 1
+        o.id = f"sim-{self._seq}"
+        self._orders[o.id] = o
+        for fill_id, fill in self._fill_log.items():
+            if fill.order_id == order_id:
+                self._fill_log[fill_id] = fill.model_copy(update={"order_id": o.id})
+        self._forgotten.discard(order_id)
+        return o.id
 
     def redeliver(self, fill_id: str) -> None:
         """Put an already emitted fill on the stream again (same `fill_id`), for duplicate
@@ -391,7 +479,7 @@ class SimBroker:
         o.status = "filled" if o.remaining == 0 else "partially_filled"
         o.fills += 1
         fill = Fill(
-            fill_id=f"{o.id}:{o.fills}",
+            fill_id=f"{o.fill_prefix}:{o.fills}",
             order_id=o.id,
             symbol=order.symbol,
             side=order.side,
@@ -463,8 +551,13 @@ class SimBroker:
             Decimal(0),
         )
 
+    def _is_visible(self, o: _Order) -> bool:
+        cid = o.order.client_order_id
+        gate = None if cid is None else self._hidden.get(cid)
+        return gate is None or gate()
+
     def _get(self, order_id: str) -> _Order:
-        try:
-            return self._orders[order_id]
-        except KeyError:
-            raise OrderNotFound(order_id) from None
+        o = self._orders.get(order_id)
+        if o is None or order_id in self._forgotten or not self._is_visible(o):
+            raise OrderNotFound(order_id)
+        return o
