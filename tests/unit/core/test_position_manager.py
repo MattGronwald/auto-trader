@@ -493,6 +493,35 @@ async def test_an_in_flight_exit_alerts_when_stuck(
     assert len(await h.sells()) == 1
 
 
+async def test_an_incident_exit_is_unresolved_not_stuck(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    # A type (b) incident keeps its broker id and a non-final status, but it waits for the
+    # operator, not the sync loop: report it as unresolved, never as stuck in flight.
+    h = Harness(sessions, bus)
+    pid = await h.open_position()
+    h.quote(BTC, 95.0)
+    await h.pm.step()
+    (sell,) = await h.sells()
+    assert sell.broker_order_id is not None
+    async with sessions() as s:
+        await s.execute(
+            update(m.Order)
+            .where(m.Order.id == sell.id)
+            .values(incident="lookup_inconsistent", incident_at=T0)
+        )
+        await s.commit()
+    with capture_logs() as logs:
+        for t in (1, 30, 61):  # unresolved alerts at +1 and +61; stuck would fire at +61
+            h.clock.now = T0 + timedelta(seconds=t)
+            await h.pm.step()
+    assert not named(logs, "positions.exit_stuck")
+    lines = named(logs, "positions.exit_unresolved")
+    assert [line["order_rows"] for line in lines] == [[sell.id], [sell.id]]
+    assert all(line["position_id"] == pid for line in lines)
+    assert len(await h.sells()) == 1  # never retried
+
+
 async def test_dust_holds_back_until_a_late_fill_rearms_the_latched_exit(
     sessions: async_sessionmaker[AsyncSession], bus: EventBus
 ) -> None:

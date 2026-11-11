@@ -22,7 +22,9 @@ After that sync, a symbol with any unsettled sell row (own or external) rejects 
 
 Order resolver (WP 1.5d-2, spec 2026-11-10 3): only `sync_orders()` (the ledger's sync loop)
 resolves, after the same read step and under the same budget; `check()` only reads. Candidates
-are (a) `pending`/`unknown` rows without a broker id that are not in flight and (b) rows whose
+are (a) rows without a broker id that are not locally final (`rejected` / `not_submitted`) and
+not in flight, which in practice means `pending`/`unknown` (no other status is written without a
+broker id; the ledger's type (a) writes require it), and (b) rows whose
 `get_order` raised `OrderNotFound` (clock `resolve_since`, persisted at the first miss and kept
 until a successful read). A row is looked up by its own journal-namespaced client id: a match
 links a type (a) row; a row without ownership proof or with a mismatching hit becomes an
@@ -513,7 +515,7 @@ class RiskEngine:
                     read.updates.append(
                         OrderUpdate(order_row_id=row.id, status=row.status, filled_qty=Decimal(0))
                     )
-                else:  # pending / unknown without an id: the resolver's type (a)
+                else:  # not locally final, no id (in practice pending / unknown): type (a)
                     read.candidates.append((row, "a"))
                 continue
             try:

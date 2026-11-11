@@ -275,7 +275,7 @@ restarts.
 ```python
 class BrokerOrderView(_Frozen):
     order_id: str
-    client_order_id: str | None
+    client_order_id: str  # the lookup is by this id, so the broker's order always has one
     symbol: str
     side: Side
     qty: Dec

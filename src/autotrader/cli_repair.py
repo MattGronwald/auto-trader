@@ -6,7 +6,9 @@ schema is not at head (it never migrates: run `autotrader db upgrade` first), pr
 repair, shows the row, the change and (for `link`) the broker order, asks for confirmation,
 commits and prints the exit hint. For `link` the CLI connects the broker
 and hands it straight to `risk.engine.read_order_by_client_id` (SPEC 0.1); `core/repair.py`
-only receives the lookup callable. The lock is held for the whole run: process exit releases
+only receives the lookup callable. The broker is not closed: the `Broker` protocol has no close
+(the Alpaca REST client holds only an HTTP session) and the process exits right after, as
+`run core` does. The lock is held for the whole run: process exit releases
 it (tests call `release()`).
 """
 
@@ -109,6 +111,11 @@ def _run_repair(
     if not evidence.strip():
         typer.echo("--evidence must not be blank", err=True)
         return 2
+    try:  # before anything is read: the audit needs it, and a failure after confirm is late
+        who = operator()
+    except Exception as e:  # getpass.getuser() raises when no user name can be found
+        typer.echo(f"cannot determine the operator (OS user name): {e}", err=True)
+        return 1
     try:
         _, db_path = journal_lock.canonical_journal(cfg.database.url)
         if not db_path.is_file():  # a wrong --config or path: never create a journal
@@ -145,7 +152,7 @@ def _run_repair(
                 if not yes and not confirm("Apply?"):
                     typer.echo("not applied", err=True)
                     return 1
-                await repair.commit(bus, plan, evidence=evidence, operator=operator(), now=clock())
+                await repair.commit(bus, plan, evidence=evidence, operator=who, now=clock())
             except RepairRefused as e:
                 typer.echo(f"refused: {e}", err=True)
                 return 1

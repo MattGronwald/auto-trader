@@ -45,6 +45,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Dropping `journal_id` is irreversible in effect: a later upgrade generates a NEW id, so
+    # every client id written under the old one (`at-<old jid>-...`) loses its ownership
+    # proof (resolver incidents `no_ownership_proof`, `repair link` refuses). Downgrade only a
+    # journal with no unsettled order rows, or restore the old `journal_id` row by hand after
+    # upgrading again.
     op.execute("DELETE FROM control_state WHERE key = 'journal_id'")
     with op.batch_alter_table("fills") as batch:
         batch.drop_column("external_qty")

@@ -211,6 +211,31 @@ def test_journal_behind_head_is_refused_and_not_migrated(
     assert db.current_revision(rig.cfg.database.url) == behind  # repair never migrates
 
 
+def test_unknown_operator_is_refused_before_anything_is_read(
+    rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    row = rig.insert(cid=None)
+
+    def nobody() -> str:
+        raise OSError("No username set in the environment")
+
+    code = _run_repair(
+        rig.cfg,
+        SETTINGS,
+        "not_submitted",
+        row,
+        broker_order_id=None,
+        evidence=EVIDENCE,
+        yes=True,
+        acquire=lambda *a, **kw: pytest.fail("lock must not be taken"),
+        operator=nobody,
+    )
+
+    assert code == 1
+    assert "cannot determine the operator" in capsys.readouterr().err
+    assert rig.rows() == [] and rig.order(row).status == "pending"
+
+
 def test_blank_evidence_exits_2(rig: Rig) -> None:
     row = rig.insert(cid=None)
 
