@@ -37,7 +37,10 @@ class ExitRequest(_Frozen):
 
 class HeldPosition(_Frozen):
     symbol: str
-    qty: Dec
+    qty: Dec  # held: exposure and dust use it
+    # Free to sell: held minus the remainders of open sells. Exits size from it; a holding
+    # whose open sells reserve it all is not dust, the exit is refused instead.
+    qty_available: Dec
     # qty x the feed's last price; None when the feed has no price or the symbol is stale,
     # and always None for exits, which read the broker only. Entries fail closed (check 8).
     market_value: Dec | None

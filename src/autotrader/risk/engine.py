@@ -178,6 +178,14 @@ class RiskEngine:
         self.cash_fault_sticky = False
         self._entry_lock = asyncio.Lock()  # check(): two entries never pass check 5 together
         self._exit_lock = asyncio.Lock()  # exit(): never waits for an entry
+        self._cached_journal_id: str | None = None
+
+    async def _journal_id(self) -> str | None:
+        """The journal's id (client ids embed it), read once and cached when found."""
+        if self._cached_journal_id is None:
+            async with self._sessions() as session:
+                self._cached_journal_id = await repo.journal_id(session)
+        return self._cached_journal_id
 
     # --- health: entry faults (spec 2026-11-09 4, 5.2, 6) ------------------------------
 
@@ -220,7 +228,7 @@ class RiskEngine:
             deadline = self._monotonic() + self._io_timeout
             now = self._clock()
             try:
-                control, portfolio, market, faults = await self._gather_entry(
+                control, portfolio, market, faults, jid = await self._gather_entry(
                     intent.symbol, now, deadline
                 )
             except Exception as e:  # fail closed: unknown state must not allow an entry
@@ -238,6 +246,7 @@ class RiskEngine:
                 control=control,
                 mode_matches=self._mode == self._broker.mode(),
                 faults=faults,
+                journal_id=jid,
             )
             await self._persist(intent.cycle_id, "entry", decision, now)
             if not decision.approved or decision.order is None:
@@ -290,11 +299,14 @@ class RiskEngine:
 
     async def _gather_entry(
         self, symbol: str, now: datetime, deadline: float
-    ) -> tuple[ControlStatus, PortfolioState, MarketSnapshot, tuple[str, ...]]:
+    ) -> tuple[ControlStatus, PortfolioState, MarketSnapshot, tuple[str, ...], str]:
         """Only the network/gate awaits are budgeted; a timeout raises out of here and
         `check()` turns it into the persisted `state unavailable` rejection. The health
         faults are read first, before the order sync; the gather runs fully either way."""
         faults = self.health_faults()
+        jid = await self._journal_id()
+        if jid is None:  # entries fail closed without the id their client ids embed
+            raise RuntimeError("journal has no journal_id")
         # Book our own orders BEFORE reading positions: a fill the sync observed is then in
         # the journal and in the positions read below (never neither position nor entry).
         synced = await self._sync(deadline)
@@ -395,7 +407,7 @@ class RiskEngine:
             rules=rules,
             fees=fees,
         )
-        return control, portfolio, market, faults
+        return control, portfolio, market, faults, jid
 
     async def sync_orders(self) -> SyncResult:
         """Read-only broker view of every unsettled order for the ledger (spec 4.2). Takes
@@ -462,6 +474,7 @@ class RiskEngine:
                 HeldPosition(
                     symbol=p.symbol,
                     qty=p.qty,
+                    qty_available=p.qty_available,
                     market_value=None,
                     avg_entry_price=p.avg_entry_price,
                     min_qty=rules.min_qty,
@@ -586,6 +599,8 @@ class RiskEngine:
                     return OrderResult(decision)
                 if position is None:
                     return OrderResult(decision, no_position=True)
+                if not position.is_dust:  # open sells reserve the whole holding: a failure
+                    return OrderResult(decision)
                 return OrderResult(decision, dust=True, min_qty=position.min_qty)
             async with self._sessions() as session:
                 row = await repo.insert_order(

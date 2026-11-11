@@ -67,6 +67,7 @@ def run(
     mode_matches: bool = True,
     risk: dict[str, Any] | None = None,
     faults: tuple[str, ...] = (),
+    journal_id: str = "0123abcd",
 ) -> RiskDecision:
     profile = PROFILE.model_copy(update={"risk": PROFILE.risk.model_copy(update=risk or {})})
     return check_entry(
@@ -77,13 +78,17 @@ def run(
         control=control,
         mode_matches=mode_matches,
         faults=faults,
+        journal_id=journal_id,
     )
 
 
-def held(symbol: str, qty: str = "1", value: str | None = "100") -> HeldPosition:
+def held(
+    symbol: str, qty: str = "1", value: str | None = "100", available: str | None = None
+) -> HeldPosition:
     return HeldPosition(
         symbol=symbol,
         qty=D(qty),
+        qty_available=D(qty if available is None else available),
         market_value=None if value is None else D(value),
         avg_entry_price=D("100"),
         min_qty=D("0.001"),
@@ -106,7 +111,11 @@ def test_base_case_is_approved_as_marketable_ioc_limit() -> None:
         "ioc",
         D("100.10"),
     )
-    assert (d.order.side, d.order.qty, d.order.client_order_id) == ("buy", D("2.997"), "at-c7-e")
+    assert (d.order.side, d.order.qty, d.order.client_order_id) == (
+        "buy",
+        D("2.997"),
+        "at-0123abcd-c7-e",
+    )
 
 
 @pytest.mark.parametrize(
@@ -247,6 +256,29 @@ def test_quote_fee_entry_is_not_reduced_by_a_coin_fee() -> None:
 
 
 # --- exit ----------------------------------------------------------------------------
+
+
+def test_exit_sizes_from_free_qty() -> None:
+    d = check_exit(
+        ExitRequest(symbol=BTC, reason="stop"),
+        [held(BTC, qty="3", available="2.5")],
+        mode_matches=True,
+    )
+    assert d.approved and d.qty == D("2.5")
+
+
+def test_fully_reserved_exit_rejects_without_dust() -> None:
+    position = held(BTC, qty="1", available="0")
+    assert not position.is_dust
+    d = check_exit(ExitRequest(symbol=BTC, reason="stop"), [position], mode_matches=True)
+    assert not d.approved and d.qty is None
+    assert d.reasons == ("reserved by pending sells in BTC/USD",)
+
+
+def test_exposure_counts_the_full_qty_of_a_reserved_holding() -> None:
+    # 300.01 + 2.997 x 100.1 = 600.0097 > 600 even though nothing of ETH is free to sell
+    d = run(portfolio={"positions": (held(ETH, value="300.01", available="0"),)})
+    assert not d.approved and "exposure" in d.reasons[0]
 
 
 def test_exit_approved_for_held_position_with_broker_qty() -> None:

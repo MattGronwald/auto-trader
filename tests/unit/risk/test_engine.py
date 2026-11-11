@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, NoReturn, TypeVar
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
@@ -241,6 +241,37 @@ def gate(tmp_path: Path, sessions: async_sessionmaker[AsyncSession]) -> ControlG
     return ControlGate(tmp_path / "KILL", sessions)
 
 
+async def _jid(sessions: async_sessionmaker[AsyncSession]) -> str:
+    async with sessions() as s:
+        jid = await repo.journal_id(s)
+    assert jid is not None
+    return jid
+
+
+async def test_entry_client_id_carries_the_journal_id(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    jid = await _jid(sessions)
+    assert len(jid) == 8
+    first = make_engine_(sim, sessions, gate)
+    assert (await first.check(intent(cycle_id))).decision.approved
+    (row,) = await orders(sessions)
+    assert row.client_order_id == f"at-{jid}-c{cycle_id}-e"
+    second = make_engine_(_sim(), sessions, gate)  # a restart on the same journal
+    assert await second._journal_id() == jid
+
+
+async def test_missing_journal_id_rejects_entries(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    async with sessions() as s:
+        await s.execute(delete(m.ControlState).where(m.ControlState.key == repo.JOURNAL_ID_KEY))
+        await s.commit()
+    result = await make_engine_(sim, sessions, gate).check(intent(cycle_id))
+    assert result.decision.reasons == ("state unavailable: RuntimeError",)
+    assert await orders(sessions) == []
+
+
 async def test_approved_entry_is_persisted_and_submitted(
     sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
 ) -> None:
@@ -248,7 +279,7 @@ async def test_approved_entry_is_persisted_and_submitted(
     assert result.decision.approved and result.status == "new"
     (row,) = await orders(sessions)
     assert (row.client_order_id, row.status, row.broker_order_id) == (
-        f"at-c{cycle_id}-e",
+        f"at-{await _jid(sessions)}-c{cycle_id}-e",
         "new",
         "sim-1",
     )
@@ -996,6 +1027,30 @@ async def test_held_position_without_current_price_fails_entries_closed_not_exit
     assert exited.decision.approved and exited.status == "new"
 
 
+async def test_exit_on_a_fully_reserved_holding_is_a_plain_failure(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    await _held_btc(sim)
+    await sim.close_position(BTC)  # an open sell (not ours) reserves the whole holding
+    result = await make_engine_(sim, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert not result.decision.approved
+    assert result.decision.reasons == ("reserved by pending sells in BTC/USD",)
+    assert (result.dust, result.no_position, result.order_row_id) == (False, False, None)
+    assert await orders(sessions) == []
+
+
+async def test_entry_exposure_counts_reserved_qty(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    broker = await _holding_eth()  # 1 ETH
+    await broker.close_position(ETH)  # a pending sell reserves all of it
+    (pos,) = [p for p in await broker.get_positions() if p.symbol == ETH]
+    assert pos.qty_available == 0
+    view = FakeView(prices={ETH: 400.0})  # at its free qty ETH would count 0: entry fits
+    result = await make_engine_(broker, sessions, gate, view=view).check(intent(cycle_id))
+    assert not result.decision.approved and "exposure" in result.decision.reasons[0]
+
+
 # --- ambiguous exits: a retry re-reads the position and cannot oversell -----------------
 
 
@@ -1011,7 +1066,7 @@ def sells(broker: SimBroker) -> list[str]:
     return [o.id for o in broker._orders.values() if o.order.side == "sell"]
 
 
-@pytest.mark.parametrize(("filled", "retry_status"), [(True, None), (False, "rejected")])
+@pytest.mark.parametrize(("filled", "retry_status"), [(True, None), (False, None)])
 async def test_retried_unknown_exit_never_sells_twice(
     filled: bool,
     retry_status: str | None,
@@ -1029,12 +1084,12 @@ async def test_retried_unknown_exit_never_sells_twice(
     retry = await engine.exit(request)
     if filled:  # the retry re-reads the position and finds nothing to sell
         assert not retry.decision.approved and "no position" in retry.decision.reasons[0]
-    else:  # still held, but the broker refuses to sell more than the free qty
-        assert retry.decision.approved
+    else:  # still held, but the lost sell reserves it all: refused before any row
+        assert retry.decision.reasons == ("reserved by pending sells in BTC/USD",)
     assert retry.status == retry_status
     assert len(sells(broker)) == 1
     rows = [o.status for o in await orders(sessions)]
-    assert rows == (["unknown"] if filled else ["unknown", "rejected"])
+    assert rows == ["unknown"]
 
 
 # --- one shared deadline per locked section ---------------------------------------------
@@ -1287,8 +1342,12 @@ async def test_concurrent_exits_on_one_symbol_sell_once(
     engine = make_engine_(sim, sessions, gate)
     request = ExitRequest(symbol=BTC, reason="stop")
     results = await asyncio.gather(engine.exit(request), engine.exit(request))
-    assert sorted(str(r.status) for r in results) == ["new", "rejected"]
+    # the first sell reserves the holding: the second exit is refused before any row
+    assert sorted(str(r.status) for r in results) == ["None", "new"]
+    (lost,) = [r for r in results if r.status is None]
+    assert lost.decision.reasons == ("reserved by pending sells in BTC/USD",)
     assert len(sells(sim)) == 1
+    assert len(await orders(sessions)) == 1
 
 
 class AccountDown(SimBroker):
