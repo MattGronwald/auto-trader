@@ -11,16 +11,27 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
 import tests.unit.risk.test_engine as te
-from autotrader.broker.base import Account, AssetRules, BrokerError, FeeSchedule, Position
+from autotrader.broker.base import (
+    Account,
+    AssetRules,
+    BrokerError,
+    BrokerOrder,
+    FeeSchedule,
+    OrderAck,
+    Position,
+)
 from autotrader.broker.sim import SimBroker
 from autotrader.core import runtime
+from autotrader.core.admission import AdmissionReadiness
 from autotrader.core.bus import CommitUncertain, EventBus
 from autotrader.core.config import AppConfig, Settings, load_config, load_profile
+from autotrader.core.cycle import CloseReport, CycleRunner
 from autotrader.core.feed import Latest, MarketFeed
 from autotrader.core.flatten import request_flatten
 from autotrader.core.kill import PAUSED_KEY, ControlGate, ControlStatus
@@ -28,7 +39,9 @@ from autotrader.core.ledger import CashGuard, CashResult, Ledger
 from autotrader.core.lock import JournalLock, acquire
 from autotrader.core.logging import configure_logging
 from autotrader.core.runtime import ControlPoller, _snapshot_step, _sync_step, run_core
+from autotrader.core.scanner import CandidateSignal
 from autotrader.core.shutdown import EXIT_CLEAN, EXIT_FAILED, ShutdownControl
+from autotrader.core.supervise import Supervisor
 from autotrader.core.types import Bar, Quote
 from autotrader.journal import models as m
 from autotrader.journal import repo
@@ -36,6 +49,7 @@ from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
 from autotrader.risk.engine import RiskEngine
 from tests.dbhooks import CommitHook, hooked_sessionmaker
 from tests.health import seed_baseline
+from tests.pm_harness import Harness, make_sim
 
 REPO = Path(__file__).resolve().parents[3]
 
@@ -279,18 +293,19 @@ async def test_startup_raising_after_the_stop_won_the_race(
         teardown_began.set()
         return await real_teardown(*args, **kwargs)
 
-    async def backfill(self: Any) -> None:
+    # A failed backfill no longer fails startup (WP 1.5d-3); a failing broker check still does.
+    async def check_broker(*args: Any) -> Any:
         control.begin("signal")  # the stop request wins the race against the startup
         if order == "after_teardown_began":
             await teardown_began.wait()
-        raise RuntimeError("backfill broke")
+        raise RuntimeError("startup broke")
 
     monkeypatch.setattr("autotrader.core.runtime._teardown", teardown)
-    monkeypatch.setattr("autotrader.core.runtime.MarketFeed.backfill", backfill)
+    monkeypatch.setattr("autotrader.core.runtime._check_broker", check_broker)
     with capture_logs() as logs:
         if order == "before_run_core_saw_the_stop":
             # The startup task is done (raised) by the time run_core looks: a startup failure.
-            with pytest.raises(RuntimeError, match="backfill broke"):
+            with pytest.raises(RuntimeError, match="startup broke"):
                 await asyncio.wait_for(start_core(cfg, lock, control), timeout=5)
         else:
             # Teardown awaits the unfinished startup as its first step: that step failed.
@@ -301,12 +316,12 @@ async def test_startup_raising_after_the_stop_won_the_race(
     assert teardown_began.is_set() and control.cause == "signal"
     if order == "before_run_core_saw_the_stop":
         (failed,) = [e for e in logs if e["event"] == "core.failed"]
-        assert failed["cause"] == "signal" and str(failed["exc_info"]) == "backfill broke"
+        assert failed["cause"] == "signal" and str(failed["exc_info"]) == "startup broke"
         assert control.failure_logged  # so the CLI (exit 1) does not log it again
         assert "core.shutdown_step_failed" not in events
     else:
         (step,) = [e for e in logs if e["event"] == "core.shutdown_step_failed"]
-        assert step["step"] == "startup" and "backfill broke" in step["error"]
+        assert step["step"] == "startup" and "startup broke" in step["error"]
         assert "core.failed" not in events and not control.failure_logged
         (shutdown_failed,) = [e for e in logs if e["event"] == "core.shutdown_failed"]
         assert shutdown_failed["steps"] == ["startup"]
@@ -1259,3 +1274,765 @@ async def test_sync_step_logs_a_failure_and_never_raises() -> None:
     await _sync_step(FailingSync(), NoLedger())  # type: ignore[arg-type]
     failed = next(ln for ln in _log_lines(buf) if ln["event"] == "ledger.sync_failed")
     assert "broker down" in failed["exception"]
+
+
+# --- WP 1.5d-3: startup wiring and admission readiness ----------------------------------
+
+
+class QuotingSource(StreamingSource):
+    """Delivers a quote per scripted symbol (bid, ask = bid + 0.01) at stream start, then the
+    two live bars (at the symbol's bid, else 1) and idles. `fail_history` makes the backfill
+    raise (a market-data REST outage); `warm` returns three hours of 1m bars around 100 with a
+    range, so the 5m ATR exists. `streamed` is set once `stream()` is entered."""
+
+    def __init__(
+        self,
+        bids: dict[str, float] | None = None,
+        *,
+        fail_history: bool = False,
+        warm: bool = False,
+    ) -> None:
+        super().__init__()
+        self.bids = bids or {}
+        self.fail_history = fail_history
+        self.warm = warm
+        self.streamed = False
+
+    async def history(self, symbols: Sequence[str], start: datetime, end: datetime) -> list[Bar]:
+        if self.fail_history:
+            raise ConnectionError("data API down")
+        if not self.warm:
+            return []
+        bars: list[Bar] = []
+        ts = max(start, end - timedelta(hours=3))
+        while ts < end:
+            for symbol in symbols:
+                bars.append(
+                    Bar(
+                        symbol=symbol,
+                        timeframe="1m",
+                        ts=ts,
+                        open=100,
+                        high=101,
+                        low=99,
+                        close=100,
+                        volume=1,
+                    )
+                )
+            ts += timedelta(minutes=1)
+        return bars
+
+    async def stream(
+        self, on_bar: Callable[[Bar], Awaitable[None]], on_quote: Callable[[Quote], Awaitable[None]]
+    ) -> None:
+        self.streamed = True
+        now = datetime.now(UTC)
+        for symbol, bid in self.bids.items():
+            await on_quote(Quote(symbol=symbol, ts=now, bid=bid, ask=bid + 0.01))
+        ts = now.replace(second=0, microsecond=0)
+        for symbol in ("BTC/USD", "ETH/USD"):
+            price = self.bids.get(symbol, 1.0)
+            await on_bar(
+                Bar(
+                    symbol=symbol,
+                    timeframe="1m",
+                    ts=ts,
+                    open=price,
+                    high=price,
+                    low=price,
+                    close=price,
+                    volume=1,
+                )
+            )
+        await self.stopped.wait()
+
+
+def sim_connect(broker: object) -> Callable[[Settings], Awaitable[Any]]:
+    """An async broker connect returning `broker` (a `SimBroker` or a fake)."""
+
+    async def connect(_: Settings) -> Any:
+        return broker
+
+    return connect
+
+
+async def seed_position(
+    cfg: AppConfig, sim: SimBroker, *, stop: str = "95", opened_at: datetime | None = None
+) -> int:
+    """A booked BTC position on the cfg journal with a filled `sim` holding (Harness). With
+    `opened_at`, the row is reopened then with no time limit; otherwise it keeps the Harness's
+    2026-10-19 open, so its time exit is overdue."""
+    engine = make_engine(cfg.database.url)
+    sessions = make_sessionmaker(engine)
+    bus = EventBus(sessions)
+    try:
+        pid = await Harness(sessions, bus, sim=sim).open_position(stop=stop)
+        if opened_at is not None:
+            async with sessions() as s:
+                await s.execute(
+                    update(m.Position)
+                    .where(m.Position.id == pid)
+                    .values(opened_at=opened_at, time_limit_at=None)
+                )
+                await s.commit()
+        return pid
+    finally:
+        await bus.close()
+        await engine.dispose()  # before run_core opens the journal
+
+
+async def _count(cfg: AppConfig, model: Any, *where: Any) -> int:
+    engine = make_engine(cfg.database.url)
+    try:
+        async with make_sessionmaker(engine)() as s:
+            return int(await s.scalar(select(func.count()).select_from(model).where(*where)) or 0)
+    finally:
+        await engine.dispose()
+
+
+def _record_bus(monkeypatch: pytest.MonkeyPatch) -> list[EventBus]:
+    """The core's bus, to publish candidates on it."""
+    buses: list[EventBus] = []
+
+    class RecordingBus(EventBus):
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            super().__init__(*a, **kw)
+            buses.append(self)
+
+    monkeypatch.setattr(runtime, "EventBus", RecordingBus)
+    return buses
+
+
+def _candidate(symbol: str = "BTC/USD", score: float = 0.8) -> CandidateSignal:
+    now = datetime.now(UTC)
+    return CandidateSignal(
+        ts=now,
+        symbol=symbol,
+        direction="long",
+        rule_id="r1",
+        score=score,
+        timeframe="5m",
+        bar_ts=now.replace(second=0, microsecond=0) - timedelta(minutes=5),  # fresh
+        features={},
+    )
+
+
+def _named(buf: io.StringIO, event: str) -> list[dict[str, Any]]:
+    return [ln for ln in _log_lines(buf) if ln["event"] == event]
+
+
+def _spy(monkeypatch: pytest.MonkeyPatch, name: str) -> list[int]:
+    """Counts the calls of a module-level step in `runtime` (successful steps log nothing)."""
+    calls: list[int] = []
+    real = getattr(runtime, name)
+
+    async def spy(*a: Any) -> None:
+        calls.append(1)
+        await real(*a)
+
+    monkeypatch.setattr(runtime, name, spy)
+    return calls
+
+
+class LiveBroker(FakeBroker):
+    def mode(self) -> str:
+        return "live"
+
+
+async def test_mode_mismatch_fails_startup(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    source = QuotingSource()
+    supervised: list[int] = []
+    monkeypatch.setattr(Supervisor, "start", lambda self: supervised.append(1))
+    control, _ = make_control()
+    with pytest.raises(RuntimeError) as raised:
+        await asyncio.wait_for(
+            start_core(cfg, lock, control, source=source, connect_broker=sim_connect(LiveBroker())),
+            timeout=5,
+        )
+    # Both modes, never a setting value.
+    assert str(raised.value) == "broker mode 'live' does not match config mode 'paper'"
+    assert control.cause == "startup_failure"
+    events = [ln["event"] for ln in _log_lines(buf)]
+    assert "core.failed" in events and "core.started" not in events
+    assert supervised == [] and not source.streamed
+
+
+class CountingBroker(FakeBroker):
+    """Cannot place orders; counts the calls (the Position Manager asks every step)."""
+
+    def __init__(self) -> None:
+        self.can_calls = 0
+
+    def can_place_orders(self) -> bool:
+        self.can_calls += 1
+        return False
+
+
+async def test_broker_that_cannot_trade_keeps_admission_disabled(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    buses = _record_bus(monkeypatch)
+    admits = _spy(monkeypatch, "_admission_step")
+    syncs = _spy(monkeypatch, "_sync_step")
+    broker = CountingBroker()
+    control, _ = make_control()
+    task = start_core(
+        cfg,
+        lock,
+        control,
+        connect_broker=sim_connect(broker),
+        snapshot_s=0.01,
+        sync_s=0.01,
+        manage_s=0.01,
+    )
+    try:
+        await _wait_for(lambda: bool(_named(buf, "core.started")))
+        seen = broker.can_calls
+        await _wait_for(lambda: broker.can_calls >= seen + 3)  # positions.manage steps
+        await _wait_for(lambda: len(syncs) >= 3 and len(admits) >= 3)
+        await buses[0].publish(_candidate())
+        await _wait_for(lambda: bool(_named(buf, "cycle.dropped")))
+    finally:
+        control.begin("stop")
+        assert await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN
+    (disabled,) = _named(buf, "cycle.admission_disabled")
+    assert (disabled["reason"], disabled["level"]) == ("broker cannot place orders", "warning")
+    assert _named(buf, "cycle.admission_open") == []
+    assert [d["reason"] for d in _named(buf, "cycle.dropped")] == [
+        "admission disabled: broker cannot place orders"
+    ]
+
+
+async def _wait_for_sell(cfg: AppConfig) -> None:
+    engine = make_engine(cfg.database.url)
+    try:
+        sessions = make_sessionmaker(engine)
+        async with asyncio.timeout(5):
+            while True:
+                async with sessions() as s:
+                    sells = await s.scalar(
+                        select(func.count()).select_from(m.Order).where(m.Order.side == "sell")
+                    )
+                if sells:
+                    return
+                await asyncio.sleep(0.01)
+    finally:
+        await engine.dispose()
+
+
+async def test_recover_failure_keeps_exits_running(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sim = make_sim()
+    await seed_position(cfg, sim, stop="95", opened_at=datetime.now(UTC))
+    cycles, entries = await _count(cfg, m.Cycle), await _count(cfg, m.Order, m.Order.side == "buy")
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    buses = _record_bus(monkeypatch)
+
+    async def broken(self: CycleRunner) -> None:
+        raise OperationalError("SELECT cycles", None, Exception("database is locked"))
+
+    monkeypatch.setattr(CycleRunner, "recover", broken)
+    control, _ = make_control()
+    task = start_core(
+        cfg,
+        lock,
+        control,
+        source=QuotingSource({"BTC/USD": 90.0}),  # below the stop
+        connect_broker=sim_connect(sim),
+        sync_s=0.01,
+        manage_s=0.01,
+    )
+    try:
+        await _wait_for(lambda: bool(_named(buf, "core.started")))
+        await _wait_for_sell(cfg)
+        await buses[0].publish(_candidate())
+        await _wait_for(lambda: bool(_named(buf, "cycle.dropped")))
+    finally:
+        control.begin("stop")
+        assert await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN
+    (disabled,) = _named(buf, "cycle.admission_disabled")
+    assert (disabled["reason"], disabled["level"]) == ("recover failed", "error")
+    assert "database is locked" in disabled["exception"]
+    (triggered,) = _named(buf, "positions.exit_triggered")
+    assert triggered["reason"] == "stop"
+    assert [d["reason"] for d in _named(buf, "cycle.dropped")] == [
+        "admission disabled: recover failed"
+    ]
+    assert await _count(cfg, m.Cycle) == cycles
+    assert await _count(cfg, m.Order, m.Order.side == "buy") == entries
+
+
+async def test_backfill_failure_disables_admission_and_keeps_exits(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sim = make_sim()
+    await seed_position(cfg, sim)  # opened 2026-10-19: the time exit is overdue
+    cycles = await _count(cfg, m.Cycle)
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    ticks: list[int] = []
+    real_tick = MarketFeed.tick
+
+    async def tick(self: MarketFeed) -> None:
+        ticks.append(1)
+        await real_tick(self)
+
+    monkeypatch.setattr(MarketFeed, "tick", tick)
+    control, _ = make_control()
+    task = start_core(
+        cfg,
+        lock,
+        control,
+        source=QuotingSource(fail_history=True),
+        connect_broker=sim_connect(sim),
+        sync_s=0.01,
+        manage_s=0.01,
+    )
+    try:
+        await _wait_for(lambda: bool(_named(buf, "core.started")))
+        await _wait_for_sell(cfg)
+        seen = len(ticks)
+        await _wait_for(lambda: len(ticks) >= seen + 3)  # feed.tick keeps beating
+    finally:
+        control.begin("stop")
+        assert await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN
+    (failed,) = _named(buf, "feed.backfill_failed")
+    assert failed["level"] == "error" and "data API down" in failed["exception"]
+    (disabled,) = _named(buf, "cycle.admission_disabled")
+    assert (disabled["reason"], disabled["level"]) == ("backfill failed", "error")
+    assert _named(buf, "scanner.subscribed") == []
+    assert _named(buf, "feed.tick.task_died") == []
+    (triggered,) = _named(buf, "positions.exit_triggered")
+    assert triggered["reason"] == "time"
+    assert await _count(cfg, m.Order, m.Order.side == "sell") == 1
+    assert await _count(cfg, m.BarRow) == 2  # the live bars persist on an empty history
+    assert await _count(cfg, m.Cycle) == cycles
+
+
+UNIVERSE_BIDS = {"BTC/USD": 100.0, "ETH/USD": 100.0, "SOL/USD": 100.0}
+
+
+def _hold_first_snapshot(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    """The cash check waits for the returned event: readiness cannot open before it."""
+    hold = asyncio.Event()
+    real_snapshot = runtime._snapshot_step
+
+    async def held_snapshot(*a: Any) -> None:
+        await hold.wait()
+        await real_snapshot(*a)
+
+    monkeypatch.setattr(runtime, "_snapshot_step", held_snapshot)
+    return hold
+
+
+async def test_candidate_before_readiness_is_dropped_and_after_is_admitted(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    buses = _record_bus(monkeypatch)
+    hold = _hold_first_snapshot(monkeypatch)
+    control, _ = make_control()
+    task = start_core(
+        cfg,
+        lock,
+        control,
+        source=QuotingSource(UNIVERSE_BIDS),
+        connect_broker=sim_connect(make_sim()),
+        snapshot_s=0.05,
+        sync_s=0.01,
+        manage_s=0.01,
+    )
+    try:
+        await _wait_for(lambda: bool(_named(buf, "core.started")))
+        await buses[0].publish(_candidate())
+        await _wait_for(lambda: bool(_named(buf, "cycle.dropped")))
+        hold.set()
+        await _wait_for(lambda: bool(_named(buf, "cycle.admission_open")))
+        await buses[0].publish(_candidate())
+        await _wait_for(lambda: bool(_named(buf, "cycle.admitted")))
+    finally:
+        control.begin("stop")
+        assert await asyncio.wait_for(task, timeout=5) in (EXIT_CLEAN, EXIT_FAILED)
+    assert [d["reason"] for d in _named(buf, "cycle.dropped")] == ["startup reconciliation pending"]
+    assert _named(buf, "cycle.admission_disabled") == []
+    assert await _count(cfg, m.Cycle) == 1  # only its admission is asserted (it expires)
+
+
+async def test_held_symbol_outside_the_universe_is_logged(
+    cfg: AppConfig, lock: JournalLock
+) -> None:
+    engine = make_engine(cfg.database.url)
+    try:
+        async with make_sessionmaker(engine)() as s:
+            s.add(
+                m.Position(
+                    symbol="DOGE/USD",
+                    side="long",
+                    qty=Decimal("10"),
+                    entry_price=Decimal("0.1"),
+                    opened_at=datetime.now(UTC),
+                    fees=Decimal(0),
+                    dust_consumed=Decimal(0),
+                )
+            )
+            await s.commit()
+    finally:
+        await engine.dispose()
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    control, _ = make_control()
+    task = start_core(cfg, lock, control)
+    try:
+        await _wait_for(lambda: bool(_named(buf, "core.started")))
+    finally:
+        control.begin("stop")
+        assert await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN
+    (unquoted,) = _named(buf, "admission.unquoted_holdings")
+    assert (unquoted["symbols"], unquoted["level"]) == (["DOGE/USD"], "warning")
+
+
+class BrokenSessions:
+    def __call__(self) -> Any:
+        raise OperationalError("SELECT positions", None, Exception("database is locked"))
+
+
+async def test_unquoted_holdings_read_failure_is_logged_not_raised() -> None:
+    with capture_logs() as logs:
+        await runtime._unquoted_holdings(BrokenSessions(), ["BTC/USD"])  # type: ignore[arg-type]
+    (failed,) = logs
+    assert (failed["event"], failed["log_level"]) == (
+        "admission.unquoted_holdings_failed",
+        "warning",
+    )
+    assert failed["exc_info"]
+
+
+async def test_dropping_handler_logs_the_reason_only() -> None:
+    with capture_logs() as logs:
+        await runtime._dropping("recover failed")(_candidate())
+    assert logs == [
+        {
+            "event": "cycle.dropped",
+            "log_level": "info",
+            "symbol": "BTC/USD",
+            "rule_id": "r1",
+            "reason": "admission disabled: recover failed",
+        }
+    ]
+
+
+class FakeAdmissionRunner:
+    def __init__(self, open_: bool) -> None:
+        self.admission_open = open_
+        self.opened = 0
+
+    def open_admission(self) -> None:
+        self.opened += 1
+
+
+class FakeReadiness:
+    def __init__(self, ready: bool) -> None:
+        self.result = ready
+        self.calls = 0
+
+    async def ready(self) -> bool:
+        self.calls += 1
+        return self.result
+
+
+@pytest.mark.parametrize(
+    ("already_open", "ready", "calls", "opened"),
+    [(True, True, 0, 0), (False, False, 1, 0), (False, True, 1, 1)],
+)
+async def test_admission_step_opens_only_when_ready(
+    already_open: bool, ready: bool, calls: int, opened: int
+) -> None:
+    runner, readiness = FakeAdmissionRunner(already_open), FakeReadiness(ready)
+    await runtime._admission_step(readiness, runner)  # type: ignore[arg-type]
+    assert (readiness.calls, runner.opened) == (calls, opened)
+
+
+# --- WP 1.5d-3: teardown closes the runner first ---------------------------------------
+
+
+def _record_close(
+    monkeypatch: pytest.MonkeyPatch,
+    order: list[str],
+    report: CloseReport | None = None,
+    began: Callable[[], None] | None = None,
+) -> list[float]:
+    """Wraps `CycleRunner.close`: records the call in `order` and returns the budgets it got;
+    `began` runs once `closing` is set; `report` replaces the real report."""
+    budgets: list[float] = []
+    real = CycleRunner.close
+
+    async def close(self: CycleRunner, budget_s: float = 20.0, cancel_wait_s: float = 3.0) -> Any:
+        order.append("runner.close")
+        budgets.append(budget_s)
+        closing = asyncio.ensure_future(real(self, budget_s, cancel_wait_s))
+        await asyncio.sleep(0)  # `closing` is set before close()'s first await
+        if began is not None:
+            began()
+        result = await closing
+        return result if report is None else report
+
+    monkeypatch.setattr(CycleRunner, "close", close)
+    return budgets
+
+
+async def test_teardown_closes_the_runner_before_flatten_and_source_stop(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    order: list[str] = []
+    budgets = _record_close(monkeypatch, order)
+    real_request = request_flatten
+
+    async def request(*a: Any, **kw: Any) -> Any:
+        result = await real_request(*a, **kw)
+        order.append("flatten.request")  # the request row is written
+        return result
+
+    monkeypatch.setattr(runtime, "request_flatten", request)
+    source = StreamingSource()
+    real_stop = source.stop
+
+    async def stop() -> None:
+        order.append("source.stop")
+        await real_stop()
+
+    source.stop = stop  # type: ignore[method-assign]
+    control, _ = make_control()
+    task = start_core(
+        _with_shutdown_flatten(cfg), lock, control, source=source, sync_s=0.01, manage_s=0.01
+    )
+    await _wait_for(lambda: bool(_named(buf, "core.started")))
+    control.begin("stop")
+    assert await asyncio.wait_for(task, timeout=10) == EXIT_CLEAN
+    assert order == ["runner.close", "flatten.request", "source.stop"]
+    (budget,) = budgets
+    assert 0.0 <= budget <= 5.0 - runtime.CLOSE_MARGIN_S  # below what was left
+
+
+async def test_abandoned_cycle_makes_the_exit_unclean(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    _record_close(monkeypatch, [], report=CloseReport((42,)))
+    control, _ = make_control()
+    task = start_core(cfg, lock, control)
+    await _wait_for(lambda: bool(_named(buf, "core.started")))
+    control.begin("stop")
+    assert await asyncio.wait_for(task, timeout=5) == EXIT_FAILED
+    (forced,) = _named(buf, "core.shutdown_forced")
+    assert "cycle:42" in forced["steps"]
+    (abandoned,) = _named(buf, "core.shutdown_abandoned")
+    assert "cycle:42" in abandoned["steps"]
+    assert abandoned["note"] == "left for the startup sequence; not proof that broker work stopped"
+
+
+class StubbornSubmit(SimBroker):
+    """`submit_order` ignores cancellation until `stubborn.release` is set."""
+
+    stubborn: Stubborn
+    entered: asyncio.Event
+
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "buy":
+            self.entered.set()
+            await self.stubborn.wait()
+        return await super().submit_order(order)
+
+
+class CooperativeSubmit(te.HangingSubmit):
+    entered: asyncio.Event
+
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        self.entered.set()
+        return await super().submit_order(order)
+
+
+async def _hang_a_check_and_stop(
+    cfg: AppConfig,
+    lock: JournalLock,
+    monkeypatch: pytest.MonkeyPatch,
+    sim: SimBroker,
+    entered: asyncio.Event,
+    buf: io.StringIO,
+) -> int:
+    """Admission opens for real, one candidate is admitted and hangs in `check()`'s submit,
+    then the stop is requested with a 3 s shutdown budget. Returns the exit code."""
+    engine = make_engine(cfg.database.url)
+    try:  # a trusted day-start baseline, so check() approves the entry
+        await seed_baseline(make_sessionmaker(engine), datetime.now(UTC))
+    finally:
+        await engine.dispose()
+    buses = _record_bus(monkeypatch)
+    control, _ = make_control(timeout_s=3.0)
+    task = start_core(
+        cfg,
+        lock,
+        control,
+        source=QuotingSource(UNIVERSE_BIDS, warm=True),
+        connect_broker=sim_connect(sim),
+        sync_s=0.01,
+        manage_s=0.01,
+    )
+    try:
+        await _wait_for(lambda: bool(_named(buf, "cycle.admission_open")))
+        await buses[0].publish(_candidate())
+        await asyncio.wait_for(entered.wait(), timeout=5)
+    finally:
+        control.begin("stop")
+        code = await asyncio.wait_for(task, timeout=10)
+    return code
+
+
+def _record_engines(monkeypatch: pytest.MonkeyPatch) -> list[AsyncEngine]:
+    """The core's journal engine, to dispose it again after left-behind work ran on it."""
+    engines: list[AsyncEngine] = []
+
+    def recording(url: str) -> AsyncEngine:
+        engines.append(make_engine(url))
+        return engines[-1]
+
+    monkeypatch.setattr(runtime, "make_engine", recording)
+    return engines
+
+
+async def _drain_left_behind(engines: list[AsyncEngine]) -> None:
+    """Let the work `runner.close` left behind finish, then close the connections it opened
+    after teardown disposed the journal engine."""
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if pending:
+        await asyncio.wait(pending, timeout=5)
+    for engine in engines:
+        await engine.dispose()
+
+
+async def test_abandoned_cycle_is_reported_with_a_short_shutdown_budget(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    sim = make_sim(cls=StubbornSubmit)
+    assert isinstance(sim, StubbornSubmit)
+    sim.stubborn, sim.entered = Stubborn(), asyncio.Event()
+    engines = _record_engines(monkeypatch)
+    try:
+        assert await _hang_a_check_and_stop(cfg, lock, monkeypatch, sim, sim.entered, buf) == (
+            EXIT_FAILED
+        )
+    finally:
+        sim.stubborn.release.set()
+        await _drain_left_behind(engines)
+    (admitted,) = _named(buf, "cycle.admitted")
+    (forced,) = _named(buf, "core.shutdown_forced")
+    assert f"cycle:{admitted['cycle_id']}" in forced["steps"]  # not only "runner.close"
+    assert "runner.close" not in forced["steps"]  # close() returned its report in time
+    (abandoned,) = _named(buf, "cycle.task_abandoned")
+    assert abandoned["cycle_id"] == admitted["cycle_id"]
+
+
+async def test_cooperative_hung_check_is_not_abandoned(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    sim = make_sim(cls=CooperativeSubmit)
+    assert isinstance(sim, CooperativeSubmit)
+    sim.entered = asyncio.Event()
+    engines = _record_engines(monkeypatch)
+    try:
+        await _hang_a_check_and_stop(cfg, lock, monkeypatch, sim, sim.entered, buf)
+    finally:
+        await _drain_left_behind(engines)
+    (admitted,) = _named(buf, "cycle.admitted")
+    (cancelled,) = _named(buf, "cycle.forced_cancel")
+    assert cancelled["cycle_id"] == admitted["cycle_id"]
+    assert _named(buf, "cycle.task_abandoned") == []
+    for forced in _named(buf, "core.shutdown_forced"):
+        assert not any(step.startswith("cycle:") for step in forced["steps"])
+
+
+async def test_runner_close_is_skipped_when_startup_failed(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    _record_close(monkeypatch, order)
+
+    async def failing(_: Settings) -> Any:
+        raise BrokerError("auth failed")
+
+    control, _ = make_control()
+    with pytest.raises(BrokerError, match="auth failed"):
+        await start_core(cfg, lock, control, connect_broker=failing)
+    assert order == []
+
+
+async def test_stop_during_recover_skips_runner_close(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    order: list[str] = []
+    _record_close(monkeypatch, order)
+    in_recover, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_recover(self: CycleRunner) -> None:
+        in_recover.set()
+        await release.wait()
+
+    monkeypatch.setattr(CycleRunner, "recover", slow_recover)
+    control, _ = make_control()
+    task = start_core(cfg, lock, control)
+    await asyncio.wait_for(in_recover.wait(), timeout=5)
+    control.begin("signal")
+    await asyncio.sleep(0)
+    release.set()  # recover() finishes within the budget, after the stop request
+    assert await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN
+    assert order == []
+    events = [ln["event"] for ln in _log_lines(buf)]
+    assert "core.started" not in events and "core.stopped" in events
+
+
+async def test_readiness_cannot_open_admission_after_close_began(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    in_ready, release = asyncio.Event(), asyncio.Event()
+    opened: list[int] = []
+
+    async def late_ready(self: AdmissionReadiness) -> bool:
+        in_ready.set()
+        await release.wait()
+        return True
+
+    real_open = CycleRunner.open_admission
+
+    def open_admission(self: CycleRunner) -> None:
+        opened.append(1)
+        real_open(self)
+
+    monkeypatch.setattr(AdmissionReadiness, "ready", late_ready)
+    monkeypatch.setattr(CycleRunner, "open_admission", open_admission)
+    _record_close(monkeypatch, [], began=release.set)
+    control, _ = make_control()
+    task = start_core(cfg, lock, control, connect_broker=sim_connect(make_sim()))
+    await asyncio.wait_for(in_ready.wait(), timeout=5)
+    control.begin("stop")
+    assert await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN
+    assert opened == [1]  # the late tick reached open_admission() ...
+    assert _named(buf, "cycle.admission_open") == []  # ... which was a no-op
