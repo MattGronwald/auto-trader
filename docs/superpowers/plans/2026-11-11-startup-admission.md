@@ -329,8 +329,8 @@ text:
   1. `disabled` non-empty: return `False` and log nothing.
   2. `now = clock()` (waiting log only). If `risk.cash_fault is not None`, forget `T_b` and any
      passed holdings result. Else, if `T_b` is unset, set `T_b = self._next_seq()`.
-  3. (c) is evaluated in step 5, after the awaits of step 4, on the latest report: it holds if
-     that report exists with `started > T_b` and `report.complete`.
+  3. (c) is evaluated in step 5, after the last await, on the latest report: it holds if that
+     report exists with `started > T_b` and `report.complete`.
   4. (d): only when `T_b` is set and the holdings check has not passed yet:
      `g1 = await ledger.cash_guard()`, `broker = await risk.broker_holdings()`,
      `journal = await journal()`, `g2 = await ledger.cash_guard()`. If `g1.unsettled`,
@@ -344,13 +344,20 @@ text:
      broker or journal read logs `admission.holdings_read_failed` (warning, with the exception)
      once per failure streak. Any read that completes, including one whose result is discarded,
      ends the streak.
-  5. If (b), (c) and (d) hold and `risk.cash_fault is None` (re-read after the awaits), read
-     `g3 = await ledger.cash_guard()` once more (Codex review of 95d350c: a cached pass must not
-     let admission open past an exit the Position Manager placed after it). `g3.unsettled`: not
-     ready (`unmet` gets `"unsettled order rows"`). `g3.generation` differs from the pass's
-     generation: drop the cached pass (the holdings check runs again on the next tick) and return
-     `False`. Otherwise return `True`. A raising `g3` read counts as a failed holdings read
-     (step 4's streak rule) and returns `False`.
+  5. If `T_b` is set and the holdings check has passed, read `g3 = await ledger.cash_guard()`
+     (Codex review of 95d350c: a cached pass must not let admission open past an exit the
+     Position Manager placed after it). A raising `g3` read counts as a failed holdings read
+     (step 4's streak rule) and returns `False`. After `g3`, decide **synchronously, with no
+     await until the return** (Codex review of 9b0003f: the fault or the report can change while
+     `g3` awaits, without moving the generation), in this order:
+     - `risk.cash_fault is not None`: forget `T_b` and the cached pass (the step 2 reset), return
+       `False`;
+     - (c) does not hold on the latest report: return `False`;
+     - `g3.unsettled`: return `False` (`unmet` gets `"unsettled order rows"`);
+     - `g3.generation` differs from the pass's generation: drop the cached pass (the holdings
+       check runs again on the next tick), return `False`;
+     - otherwise return `True`.
+     When `T_b` is unset or the holdings check has not passed, return `False` without `g3`.
   6. Else, once `now - created >= waiting_after_s`, log `cycle.admission_waiting` (warning), then
      again every `WAITING_REPEAT_S = 600.0` (module constant) while admission stays closed (D21
      note 2026-11-11, plan review: one line is not enough for a cause that persists or appears
@@ -397,6 +404,13 @@ text:
     `CashGuard(G+1, unsettled=True)` (the exit it placed): `ready()` is `False`. The exit
     settles (`CashGuard(G+2, unsettled=False)`): the next `ready()` drops the stale pass and is
     `False`; the one after re-runs the holdings check, passes on G+2 and returns `True`.
+  - `test_final_guard_rechecks_the_fault_and_report_after_its_await` (Codex review of 9b0003f),
+    two cases on a tracker that has `T_b`, a passed holdings check on generation G and a
+    complete eligible report; the fake ledger's next `cash_guard()` waits on an event
+    (barrier). (1) While it waits, set `risk.cash_fault`; release with `CashGuard(G, False)`:
+    `False`, and after clearing the fault the old report and pass no longer count. (2) While it
+    waits, finish a `manage()` whose report has one position `failed`; release with
+    `CashGuard(G, False)`: `False`.
   - `test_broker_read_failure_logs_once_per_streak`: two failing ticks give one warning; a
     success, then a failure, gives a second warning.
   - `test_waiting_logged_after_three_snapshot_intervals_and_repeated`: `waiting_after_s=180`.
