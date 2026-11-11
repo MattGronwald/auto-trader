@@ -369,7 +369,9 @@ class PositionManager:
                     "side": o.side,
                     "status": o.status,
                     "age_s": (now - o.submitted_at).total_seconds(),
-                    "unresolved": o.broker_order_id is None and o.status in ("pending", "unknown"),
+                    "unresolved": o.incident is not None
+                    or (o.broker_order_id is None and o.status in ("pending", "unknown")),
+                    "incident": o.incident,
                     "anomaly": anomalies.get(o.id),
                 }
                 for o in unsettled

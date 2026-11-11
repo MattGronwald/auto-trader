@@ -685,6 +685,33 @@ async def test_flat_is_not_reported_while_an_entry_is_unsettled_or_an_exit_unres
     assert await pending_request(h) is not None
 
 
+async def test_flatten_result_reports_incident_rows(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    h = Harness(sessions, bus, sim=make_sim(cls=BtcAckLost))
+    await h.open_position(BTC)
+    entry_row, _ = await h.submit_entry(ETH)  # an ordinary open (resting) row
+    await ask_flatten(h)
+    await h.pm.step()
+    (btc_sell,) = await h.sells(BTC)
+    async with sessions() as session, session.begin():
+        await session.execute(
+            update(m.Order)
+            .where(m.Order.id == btc_sell.id)
+            .values(broker_order_id="b-gone", incident="not_found")
+        )
+    h.clock.advance(10)
+    await h.pm.step()
+    result = await result_of(h)
+    assert result is not None
+    orders = {o["order_row_id"]: o for o in result["remaining"]["orders"]}
+    assert (orders[btc_sell.id]["incident"], orders[btc_sell.id]["unresolved"]) == (
+        "not_found",
+        True,
+    )
+    assert (orders[entry_row]["incident"], orders[entry_row]["unresolved"]) == (None, False)
+
+
 async def test_a_fill_landing_between_the_flat_check_reads_delays_completion(
     sessions: async_sessionmaker[AsyncSession], bus: EventBus
 ) -> None:
