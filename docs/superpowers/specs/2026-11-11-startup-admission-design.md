@@ -12,6 +12,10 @@ Position Manager step reports per position what it evaluated (3.2, 5); a failing
 longer stops the core (D21.4 reversed, section 2); a one-sided holdings check joins readiness
 (D21.8, 3.3); the mode check is a backstop, not an account check (section 2); readiness is a
 small clock-injected class (3.2, 6).
+Revised 2026-11-11 after the Codex review of e31ce0c (PR #37), owner go: a failed history backfill
+no longer stops the core; it disables admission until a restart, no retry (D21.9, section 2); a
+drop-only `CandidateSignal` handler replaces the runner when it is not subscribed, so no candidate
+is dropped without a log line (D21.4, section 2).
 
 ## 1. Scope and intent
 
@@ -54,14 +58,15 @@ been reconciled with the broker, and before which no cycle can start.
 - a cycle admitted before a completed cash check (which proves no order row is unsettled), a later
   Position Manager step that evaluated every held position with a trusted bid, and a holdings check
   have run in this process;
-- admission opening with a broker that cannot place orders, or after a failed `recover()`;
+- admission opening with a broker that cannot place orders, after a failed history backfill, or
+  after a failed `recover()`;
 - `recover()` running after any admission (it could move a live cycle's `RISK_CHECK` to `ERROR`);
 - a candidate dropped during startup without a log line saying why;
-- the exits (Position Manager, flatten) depending on admission or on `recover()`: they run whether
-  or not admission ever opens. The only startup failure that stops them is one where they could
+- the exits (Position Manager, flatten) depending on admission, on the history backfill or on
+  `recover()`: they run whether or not admission ever opens. The only startup failure that stops them is one where they could
   not work anyway (a mode mismatch, section 2).
 
-## 2. Startup order (D21.1, D21.4, D21.6)
+## 2. Startup order (D21.1, D21.4, D21.6, D21.9)
 
 Inside `run_core`'s `start()`, in this order (new steps in bold):
 
@@ -76,22 +81,40 @@ Inside `run_core`'s `start()`, in this order (new steps in bold):
    then ([engine.py `exit()`](../../../src/autotrader/risk/engine.py), `check_exit(...,
    mode_matches=...)`), so a running core would protect nothing. It runs before the backfill, so
    no loop and no stream start;
-2. build the feed and backfill it;
-3. build the gate and the scanner, subscribe the scanner to `BarClosed`;
+2. build the feed and backfill it. **If `backfill()` raises** (D21.9; a market-data REST outage,
+   `feed.py` `backfill()` lets the history source's error through): log `feed.backfill_failed`
+   (error, with the exception), record `admission disabled: backfill failed`, and continue startup.
+   No automatic retry: admission stays disabled until a restart (owner, 2026-11-11). Reason: exits
+   need no bar history (the Position Manager uses quotes, `exit()` reads the broker only), so a
+   history outage must not take the stops down (PLAN 3.2 item 1); only entries (`check()` reads
+   `market.history`) and the scanner need it. Recovery: restart once the data API is back;
+3. build the gate and the scanner; subscribe the scanner to `BarClosed` **only if the backfill
+   succeeded** (no candidates on a cold, gappy history);
 4. build the ledger and the engine;
 5. **build the `CycleRunner`** (profile, strategy id, `market=feed`, `gate`, `risk=engine`, bus,
    sessions, `trading_day_tz`), with admission closed (section 3.1);
-6. **`await runner.recover()`.** If it raises (D21.4, revised): log `cycle.admission_disabled
-   reason="recover failed"` (error, with the exception), do **not** subscribe the runner, and
-   continue startup; readiness then never opens admission (`open_admission()` refuses, 3.1). The
+6. **`await runner.recover()`** (also after a failed backfill: it repairs cycle bookkeeping the
+   ledger and the Position Manager rely on). If it raises (D21.4, revised): log
+   `cycle.admission_disabled reason="recover failed"` (error, with the exception), do **not**
+   subscribe the runner, and continue startup; readiness then never opens admission (`open_admission()` refuses, 3.1). The
    loops, and with them every exit, still start. Reason: PLAN 3.2 item 1 ("failure keeps entries
    disabled; protective exits remain available"); one bad cycle row or a transient SQLite lock
    while the operator runs `kill`/`flatten` must not take the stops down. Recovery: fix the cause
    and restart;
-7. **subscribe `runner.on_candidate` to `CandidateSignal`** (only after a clean `recover()`);
+7. **subscribe to `CandidateSignal`:** `runner.on_candidate` after a clean `recover()`; otherwise a
+   **drop-only handler** (D21.4, Codex review of e31ce0c) that logs `cycle.dropped` with
+   `reason="admission disabled: recover failed"` (symbol, rule id) per candidate and touches no
+   journal state, so no candidate is persisted without a drop line. The failed runner itself stays
+   unsubscribed. (After a failed backfill the scanner is not subscribed, so no candidate is
+   produced; the runner is subscribed as usual and disabled, 3.1.)
 8. the existing stop-request check (`control.requested` -> return `None`);
 9. build the poller, the Position Manager and the readiness tracker; start the supervisor (with
    the new `admission.ready` loop, 3.2) and the stream; log `core.started`.
+
+After a failed backfill the feed's `tick()` and the stream run with an empty warm-up: they must
+keep running as supervised loops (a raising step is logged, never stops the other loops), and the
+quotes they deliver are what the Position Manager needs. The plan verifies this against
+`MarketFeed` **(builder call: any feed change this needs stays inside the feed)**.
 
 Steps 5-7 run before the stream starts, so no `BarClosed`, hence no `CandidateSignal`, can reach
 the runner before `recover()` has finished. A stop request during step 6 is handled like one during
@@ -118,7 +141,8 @@ The runner gets an admission flag that starts **closed**, and a disabled reason:
   is checked today (before the gate read, inside the admission lock, inside the `publish_tx`
   build), so a closed runner drops the candidate with `cycle.dropped` and that reason. The
   candidate event is already persisted by the scanner, so the drop is auditable.
-- New `disable_admission(reason)`: records the reason, logs nothing itself (the caller logs
+- New `disable_admission(reason)`: records the reason (several calls keep every reason; the drop
+  reason names them all), logs nothing itself (the caller logs
   `cycle.admission_disabled`). New `open_admission()`: raises `RuntimeError` unless `recover()`
   completed without raising in this runner instance; is a no-op while closing (after `close()`
   began) or disabled; otherwise sets the flag and logs `cycle.admission_open` once. Idempotent.
@@ -142,7 +166,7 @@ that the step does nothing.
 
 | | Condition | How it is known | If it fails |
 |---|---|---|---|
-| a | admission not disabled: the broker can place orders and `recover()` succeeded | `risk.can_place_orders()` read once in `start()`; step 6 | permanent for this process |
+| a | admission not disabled: the broker can place orders, the backfill succeeded and `recover()` succeeded | `risk.can_place_orders()` read once in `start()`; steps 2 and 6 | permanent for this process |
 | b | the cash fault is clear | `risk.cash_fault is None`, observed by the tracker; the first observation time `T_b` is recorded | retried every tick |
 | c | a Position Manager step that **started after `T_b`** evaluated every open position with a trusted bid, or found it already latched | the step's report (below) | retried every tick |
 | d | the holdings check passed, taken after `T_b` (3.3) | the readiness step runs it | retried every tick; a shortfall is logged |
@@ -185,9 +209,10 @@ Order and why (finding of the PR #37 review, owner go): (b), then (c) and (d).
   close and restart).
 - **(d)** is section 3.3.
 - (a) is static for the process. If it fails, `start()` logs `cycle.admission_disabled` once
-  (`reason="broker cannot place orders"` at warning level, `reason="recover failed"` at error
-  level) and calls `runner.disable_admission(reason)`; the readiness step never opens admission.
-  No retry: neither can change without a restart.
+  per reason (`reason="broker cannot place orders"` at warning level; `reason="backfill failed"`
+  and `reason="recover failed"` at error level) and calls `runner.disable_admission(reason)`; the
+  readiness step never opens admission. No retry (D21.9 for the backfill): none can change
+  without a restart.
 - While (b)-(d) are not yet met, the step logs nothing per tick. After the tracker has been waiting
   longer than 3 x `snapshot_s` (so an ordinary restart that waits one snapshot interval does not
   warn), it logs `cycle.admission_waiting` (warning) once, with the unmet conditions (for (c), the
@@ -316,7 +341,14 @@ events where needed):
     Manager and sync loops still run.
 11. `recover()` raising: the runner is not subscribed, `cycle.admission_disabled reason="recover
     failed"` is logged, the core keeps running, and an overdue stop on a held position is still
-    exited by the Position Manager.
+    exited by the Position Manager. A `CandidateSignal` published afterwards is logged by the
+    drop-only handler as `cycle.dropped reason="admission disabled: recover failed"`, and no cycle
+    or order row is created (Codex review of e31ce0c).
+11a. History backfill raising (healthy, trade-capable `SimBroker`, a booked position with an
+    overdue time exit): startup completes, `feed.backfill_failed` and `cycle.admission_disabled
+    reason="backfill failed"` are logged, the scanner is not subscribed, no cycle is admitted, and
+    the time exit is submitted; `feed.tick` and the stream keep running (Codex review of
+    e31ce0c).
 12. A candidate published before readiness is dropped and logged; one published after it is
     admitted (end to end: `BarClosed` -> scanner -> `CandidateSignal` -> cycle).
 13. Teardown: `runner.close` runs before `flatten` and before `source.stop`; an abandoned cycle is
@@ -384,7 +416,8 @@ New surface in `docs/runbook.md`, a "Startup and admission" section:
   bid needs its feed back, or, if it is outside the universe, a universe fix or a manual close; a
   holdings shortfall needs investigation of the missing coins (journal correction by hand, as for
   other anomalies); a sticky cash fault or a failed `recover()` needs its cause fixed and a
-  restart;
+  restart; a failed history backfill (`feed.backfill_failed`) needs a restart once the market-data
+  API answers again (no automatic retry);
 - a mode mismatch stops the core at startup: check `mode` in `config.yaml` against
   `ALPACA_PAPER` in `.env` (normally `check-config` and `load_config` already catch it).
 
