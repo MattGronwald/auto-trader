@@ -85,8 +85,13 @@ exit. Check `mode` against `ALPACA_PAPER` in `.env`; nothing runs until they agr
 - **`positions not evaluated`** (`positions` lists each position with `no_bid` or `failed`):
   - `no_bid`: no trusted bid for a held symbol. If the feed is down or stale, wait for it to
     return. A symbol outside the profile's universe is never quoted; `admission.unquoted_holdings`
-    (warning, at startup) names such symbols. Add the symbol to the universe and restart, or
-    close the position by hand and let the journal follow.
+    (warning, at startup) names such symbols. The clean fix is to add the symbol to the universe
+    and restart. Without a bid only the time exit (`max_hold_min`) and, when enabled, the stale
+    exit can fire; they latch without a price, and a latched position counts as evaluated, so
+    the blocker clears on its own once that exit latches (it still has to be sent and settled,
+    which `unsettled order rows` below covers). Closing the position by hand is not enough: the
+    ledger books only sells the journal placed, so the position stays open and the next holdings
+    check reports `holdings short`; that needs the manual journal correction described there.
   - `failed`: the position's step raised (`positions.step_failed`, with the traceback) or its
     trigger could not be latched. A position whose exit keeps raising stays `failed` and keeps
     admission closed until it is exited or the cause is fixed.
