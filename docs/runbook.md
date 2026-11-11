@@ -225,6 +225,13 @@ can never be accepted or become visible (PLAN.md section 3.2 item 4).
 | `lookup_failed` | The lookups raised until the bound (or the budget ran out), so nothing was learned. | Same as `not_found`. |
 | `lookup_inconsistent` | (b) only: `get_order` says not found while the client-id lookup finds the order, until the bound. | `repair link` with the broker id the lookup reports. |
 
+The reason is not always the result of a final lookup. A row past its bound whose lookup the
+pass budget (10 s, shared by every unsettled row) did not reach becomes an incident in that
+pass anyway, with the outcome of its last lookup in this process, or `lookup_failed` if there
+was none (e.g. the first pass after a restart). So with many unsettled rows or a slow broker a
+`not_found` or `lookup_failed` incident may be stale: always check at the broker before
+`repair not-submitted`; `repair link` does its own fresh lookup.
+
 An open incident keeps the row's reservation and blocks flat. The ledger books nothing on the
 incident row itself, even fills the broker reported before the incident was written
 (`ledger.exit_deferred` names the row), and it holds back every later booking on its symbol
