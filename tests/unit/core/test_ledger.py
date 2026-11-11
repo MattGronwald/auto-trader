@@ -1648,6 +1648,7 @@ async def bare_row(
     incident: str | None = None,
     resolve_since: datetime | None = None,
     symbol: str = BTC,
+    status: str = "pending",
 ) -> int:
     """An unsettled sell row like the engine journals one, with resolver fields set."""
     async with sessions() as s:
@@ -1663,7 +1664,7 @@ async def bare_row(
             limit_price=None,
             stop_price=None,
             tp_price=None,
-            status="pending",
+            status=status,
             now=T0,
             client_order_id_for=lambda i: f"at-deadbeef-o{i}",
         )
@@ -1827,6 +1828,31 @@ async def test_type_a_incident_never_marks_a_row_with_a_broker_id(
     o = await order_row(sessions, acked)
     assert (o.incident, o.incident_at) == (None, None)
     assert "OrderIncident" not in await event_types(sessions)
+
+
+@pytest.mark.parametrize("final", ["rejected", "not_submitted"])
+async def test_type_a_write_never_lands_on_a_locally_final_row(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger, final: str
+) -> None:
+    # The resolver read the row as pending; the submit path set it locally final before
+    # the write. An incident there could not be repaired (`repair` takes pending/unknown
+    # only), and a link would attach a broker id to a row the submit path closed.
+    to_mark = await bare_row(sessions, status=final)
+    to_link = await bare_row(sessions, status=final)
+    unknown = await bare_row(sessions, status="unknown")
+
+    with capture_logs() as logs:
+        await ledger.apply_resolutions(
+            [incident(to_mark, "not_found"), link(to_link, "b-1"), incident(unknown)]
+        )
+
+    assert unit_failures(logs) == []
+    o = await order_row(sessions, to_mark)
+    assert (o.status, o.incident, o.incident_at) == (final, None, None)
+    assert (await order_row(sessions, to_link)).broker_order_id is None
+    assert (await order_row(sessions, unknown)).incident == "not_found"  # unknown still eligible
+    events = [e for e in await event_rows(sessions) if e.type in ("OrderIncident", "OrderResolved")]
+    assert [(e.type, e.payload["order_row_id"]) for e in events] == [("OrderIncident", unknown)]
 
 
 async def test_clear_committed_inside_the_incident_unit_wins(

@@ -34,10 +34,10 @@ absorbs the whole sell books like any sell, with no external part and no event.
 Order resolver decisions (WP 1.5d-2, spec 2026-11-10 3.5-3.7) arrive with the sync pass as
 `SyncResult.resolutions`; `apply_all` applies them first, each in its own unit, then books.
 Each is a conditional `UPDATE` whose guard lives in its `WHERE` clause (never a Python check
-before the write: another session may commit between the two): a link only on a row with no
-broker id, no incident and no settlement (`OrderResolved`); an incident only once
-(`OrderIncident`), a type (a) incident only while the row still has no broker id, and a
-type (b) incident only while `resolve_since` still holds the clock its decision observed; a
+before the write: another session may commit between the two): a link only on a
+`pending`/`unknown` row with no broker id, no incident and no settlement (`OrderResolved`); an
+incident only once (`OrderIncident`), a type (a) incident only while the row is still
+`pending`/`unknown` with no broker id, and a type (b) incident only while `resolve_since` still holds the clock its decision observed; a
 clock start never moves an existing clock, and a clear only erases the clock it observed. A
 write that matched no row writes nothing and publishes nothing.
 
@@ -74,6 +74,9 @@ from autotrader.risk.types import FINAL, OrderResolution, OrderUpdate, SyncResul
 log = structlog.get_logger(__name__)
 
 _RANK = {"new": 1, "partially_filled": 2}  # pending / unknown: 0, final: 3
+# Statuses a type (a) resolver write (link, incident) may still find; the same set
+# `core/repair.py` accepts for `link` / `not-submitted`.
+_TYPE_A_STATUSES = ("pending", "unknown")
 _D0 = Decimal(0)
 CASH_CHECK_KEY = "cash_check"
 CENT = Decimal("0.01")
@@ -405,6 +408,7 @@ class Ledger:
                     .where(
                         Order.id == r.order_row_id,
                         Order.broker_order_id.is_(None),
+                        Order.status.in_(_TYPE_A_STATUSES),
                         Order.settled_at.is_(None),
                         Order.incident.is_(None),
                     )
@@ -436,7 +440,10 @@ class Ledger:
         if r.clock is not None:  # type (b): only while the clock it observed still holds
             guard.append(Order.resolve_since == r.clock)
         else:  # type (a): only while the row still has no broker id (not acked since the read)
+            # and is not locally final since the read (rejected / not_submitted): an incident
+            # there could not be repaired, `repair` accepts only pending / unknown rows.
             guard.append(Order.broker_order_id.is_(None))
+            guard.append(Order.status.in_(_TYPE_A_STATUSES))
 
         async def build(session: AsyncSession) -> DomainEvent | None:
             result = cast(
