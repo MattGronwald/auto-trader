@@ -1,4 +1,5 @@
 import asyncio
+import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
@@ -14,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.schema import CreateTable
 
 from autotrader.journal import models as m
+from autotrader.journal import repo
 from autotrader.journal.db import (
     current_revision,
     downgrade,
@@ -360,3 +362,48 @@ def test_0005_marks_existing_orders_not_external(db_url: str) -> None:
             await engine.dispose()
 
     assert asyncio.run(external()) == [False]
+
+
+def _journal_id(url: str) -> str | None:
+    async def read() -> str | None:
+        engine = make_engine(url)
+        try:
+            async with make_sessionmaker(engine)() as s:
+                return await repo.journal_id(s)
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read())
+
+
+def test_migration_writes_a_journal_id_once(db_url: str, tmp_path: Path) -> None:
+    jid = _journal_id(db_url)
+    assert jid is not None
+    assert re.fullmatch(r"[0-9a-f]{8}", jid)
+
+    other = f"sqlite+aiosqlite:///{tmp_path / 'other.db'}"
+    upgrade(other)
+    assert _journal_id(other) != jid
+
+    # The NOT EXISTS guard: a key written by hand survives a re-run of 0007.
+    downgrade(db_url, "0006")
+    _run_sql(db_url, "INSERT INTO control_state (key, value) VALUES ('journal_id', '\"cafef00d\"')")
+    upgrade(db_url)
+    assert _journal_id(db_url) == "cafef00d"
+
+
+def test_0007_columns_default_for_existing_rows(db_url: str) -> None:
+    downgrade(db_url, "0006")
+    _run_sql(db_url, _ORDER_0003.format(id=1, broker="'b-1'", status="filled"))
+    upgrade(db_url)
+
+    async def read() -> tuple[bool, str | None, object, object]:
+        engine = make_engine(db_url)
+        try:
+            async with make_sessionmaker(engine)() as s:
+                o = (await s.scalars(select(m.Order))).one()
+                return o.excess_external, o.incident, o.incident_at, o.resolve_since
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(read()) == (False, None, None, None)

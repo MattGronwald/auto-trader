@@ -345,6 +345,15 @@ async def get_control(session: AsyncSession, key: str) -> Any:
     return None if row is None else row.value
 
 
+JOURNAL_ID_KEY = "journal_id"
+
+
+async def journal_id(session: AsyncSession) -> str | None:
+    """The per-journal id (migration 0007); None if the row was deleted by hand."""
+    value = await get_control(session, JOURNAL_ID_KEY)
+    return value if isinstance(value, str) else None
+
+
 async def set_control(session: AsyncSession, key: str, value: Any) -> None:
     await session.merge(ControlState(key=key, value=value))
     await session.commit()
