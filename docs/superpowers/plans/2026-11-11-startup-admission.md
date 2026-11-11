@@ -68,10 +68,14 @@ text:
 - `broker_holdings()` reads `get_positions` once and sums `qty` per symbol. It does not go
   through `_broker_positions`, which also calls `asset_rules` for each symbol, a call the
   holdings check does not need.
+- **Plan additions (Fable review), beyond spec 3.3:** a raising guard or journal read in the
+  holdings check is handled like a raising broker read (retry, `admission.holdings_read_failed`).
 - Tracker log prefix: `admission.` for the tracker's own lines; `cycle.admission_*` for the
   admission state lines (spec section 6 names kept).
 - Readiness runs as a supervised `Loop` (`admission.ready`, `tick_s`, stall after
-  `CONTROL_STALL_S`, level `warning`).
+  `SYNC_STALL_S` (30 s), level `warning`). It makes the same kind of broker read as `ledger.sync`:
+  `CONTROL_STALL_S` (10 s) equals `io_timeout_s`, so a hung holdings read would make the stall
+  log flap (Fable review).
 - **(Claude's call, beyond the spec):** if the cash fault is seen set again after `T_b` and before
   admission opens, the tracker forgets `T_b` and the holdings result; (c) and (d) must then hold
   again after the next clear observation. Reason: `T_b` is the proof that the journal was caught
@@ -101,11 +105,12 @@ text:
   broker to the engine (as `_check_broker` already does).
 - Exact values: block reasons `startup reconciliation pending`, `admission disabled: <reason>`;
   disable reasons `broker cannot place orders`, `backfill failed`, `recover failed`; waiting log
-  after `3 * snapshot_s` on the tracker's clock; runner close budget
-  `min(CLOSE_BUDGET_S, control.remaining())`; abandoned cycles reported as `cycle:<id>`.
+  after `3 * snapshot_s` on the tracker's clock, then every `WAITING_REPEAT_S = 600.0`; runner
+  close budget `max(0.0, min(CLOSE_BUDGET_S, control.remaining() - CLOSE_MARGIN_S))` with
+  `CLOSE_MARGIN_S = 1.0`; abandoned cycles reported as `cycle:<id>`.
 - Log names: `cycle.admission_open` (info, runner), `cycle.admission_disabled` (warning for
   `broker cannot place orders`, error otherwise; runtime), `cycle.admission_waiting` (warning,
-  once), `cycle.dropped` (info, existing), `admission.holdings_short` (error),
+  every 10 min while closed), `cycle.dropped` (info, existing), `admission.holdings_short` (error),
   `admission.holdings_read_failed` (warning, once per failure streak),
   `admission.unquoted_holdings` (warning, startup), `admission.unquoted_holdings_failed`
   (warning, startup), `feed.backfill_failed` (error, startup).
@@ -124,11 +129,12 @@ text:
    journal by hand. Test in Task 3 (`test_dust_only_symbol_without_broker_holding_is_short`).
 3. **Stop request while `recover()` runs:** the unfinished startup is teardown step 0. It returns
    `None` at the stop check, so no runner is returned, `runner.close` is skipped and the exit is
-   clean. Test in Task 6 (`test_stop_during_recover_skips_runner_close`).
+   clean. Test in Task 5 (`test_stop_during_recover_skips_runner_close`).
 4. **A readiness tick racing teardown:** `runner.close()` has begun, and the next `admission.ready`
    step finds the tracker ready. `open_admission()` must stay a no-op, so no candidate is ever
    admitted during the flatten. Tests in Task 1
-   (`test_open_admission_after_close_is_a_noop`) and Task 6.
+   (`test_open_admission_after_close_is_a_noop`) and Task 5
+   (`test_readiness_cannot_open_admission_after_close_began`).
 5. **A held symbol outside the universe:** it is never quoted, so its report stays `no_bid`. The
    waiting log must name it with `no_bid` so the operator can act. Test in Task 3
    (`test_waiting_log_names_positions_and_short_symbols`).
@@ -311,6 +317,8 @@ text:
         ) -> None: ...
         async def manage(self, step: Callable[[], Awaitable[StepReport]]) -> None: ...
         async def ready(self) -> bool: ...
+        @property
+        def last_report(self) -> StepReport | None: ...  # tests and the waiting log
     ```
 - Ordering uses a private counter `self._seq` (an int, incremented before each use), not the
   clock (dry-run finding: with a clock that does not move, a step start equals `T_b`).
@@ -321,7 +329,8 @@ text:
   1. `disabled` non-empty: return `False` and log nothing.
   2. `now = clock()` (waiting log only). If `risk.cash_fault is not None`, forget `T_b` and any
      passed holdings result. Else, if `T_b` is unset, set `T_b = self._next_seq()`.
-  3. (c) holds if a last report exists with `started > T_b` and `report.complete`.
+  3. (c) is evaluated in step 5, after the awaits of step 4, on the latest report: it holds if
+     that report exists with `started > T_b` and `report.complete`.
   4. (d): only when `T_b` is set and the holdings check has not passed yet:
      `g1 = await ledger.cash_guard()`, `broker = await risk.broker_holdings()`,
      `journal = await journal()`, `g2 = await ledger.cash_guard()`. If `g1.unsettled`,
@@ -336,15 +345,21 @@ text:
      ends the streak.
   5. If (b), (c) and (d) hold and `risk.cash_fault is None` (re-read after the awaits), return
      `True`.
-  6. Else, once `now - created >= waiting_after_s` and the waiting line has not been logged yet,
-     log `cycle.admission_waiting` (warning) with `unmet: list[str]`. While the fault is set, the
-     only entry is `"cash check not completed: <fault>"`. Once `T_b` is set, the entries come
+  6. Else, once `now - created >= waiting_after_s`, log `cycle.admission_waiting` (warning), then
+     again every `WAITING_REPEAT_S = 600.0` (module constant) while admission stays closed (D21
+     note 2026-11-11, plan review: one line is not enough for a cause that persists or appears
+     later). The line carries `unmet: list[str]`. While the fault is set, the entries are
+     `"cash check not completed: <fault>"` plus, if a `ledger.cash_guard()` read made for this
+     line shows `unsettled`, `"unsettled order rows"` (the usual cause after a restart with an
+     incident; the fault text then stays `not yet reconciled`). A raising guard read here only
+     omits that entry. Once `T_b` is set, the entries come
      from `"no position manager step since the cash check"`, `"positions not evaluated"`,
      `"holdings short"` and `"holdings check not completed"`; the last covers a discarded or
      failed read without a shortfall. The threshold is `>=`. Also log `positions`, a list of
      `{position_id, symbol, outcome}` for every non-evaluated/latched position in the last report,
      and `short: list[str]`. Return `False`.
-- Test doubles in `test_admission.py`: a `Mono` clock (float, `advance()`); `FakeRisk` with a
+- Test doubles in `test_admission.py` (define the journal fixtures locally; `db_url`/`sessions`
+  live per module, not in a conftest): a `Mono` clock (float, `advance()`); `FakeRisk` with a
   settable `cash_fault` and `holdings`, `holdings_error`; `FakeLedger` returning a queue of
   `CashGuard`s; an async `journal` callable returning a settable mapping.
 
@@ -372,9 +387,12 @@ text:
     clean tick passes.
   - `test_broker_read_failure_logs_once_per_streak`: two failing ticks give one warning; a
     success, then a failure, gives a second warning.
-  - `test_waiting_logged_once_after_three_snapshot_intervals`: `waiting_after_s=180`.
-    `advance(179)` and `ready()`: no log. `advance(1)`: one `cycle.admission_waiting`. Further
-    ticks: no more.
+  - `test_waiting_logged_after_three_snapshot_intervals_and_repeated`: `waiting_after_s=180`.
+    `advance(179)` and `ready()`: no log. `advance(1)`: one `cycle.admission_waiting`.
+    `advance(599)`: no more. `advance(1)`: a second one.
+  - `test_waiting_names_unsettled_rows_while_the_fault_is_set`: fault `not yet reconciled`, the
+    guard shows `unsettled=True`: `unmet == ["cash check not completed: not yet reconciled",
+    "unsettled order rows"]`.
   - `test_waiting_not_logged_when_ready_earlier`.
   - `test_waiting_log_names_positions_and_short_symbols` (Review Focus 5): a report with
     `PositionCheck(7, "DOGE/USD", "no_bid")` and a BTC shortfall. The log has
@@ -516,11 +534,11 @@ text:
   tests that break on the new logs or the `_Started` return. Do not weaken their assertions;
   extend expected log sets where a new line is now correct.
 - [ ] **Step 4: Run** `uv run pytest tests/unit/core/test_runtime.py -v`. Expected: PASS.
-- [ ] **Step 5: Full check and commit**
-  `git add src/autotrader/core/runtime.py tests/unit/core/test_runtime.py`,
-  `git commit -m "feat: run core wires the cycle runner behind admission readiness"`.
+- [ ] **Step 5: Full check, no commit.** Tasks 4 and 5 land as ONE commit (Task 5 Step 5):
+  without Task 5 the core would admit cycles and never close the runner at shutdown (Fable
+  review). Reviewers gate Tasks 4 and 5 together.
 
-### Task 5: Teardown closes the runner first
+### Task 5: Teardown closes the runner first (same commit as Task 4)
 
 **Files:**
 - Modify: `src/autotrader/core/runtime.py` (`run_core` teardown call, `_teardown`, the
@@ -532,10 +550,14 @@ text:
   if `runner is not None`, run
   `await bounded("runner.close", _close_runner(runner, control, forced))`. 2 flatten. 3 onwards
   unchanged.
-- `async def _close_runner(runner: CycleRunner, control: ShutdownControl, forced: list[str]) -> None`:
-  `report = await runner.close(budget_s=min(CLOSE_BUDGET_S, control.remaining()))`, then
+- `CLOSE_MARGIN_S = 1.0` in `runtime.py`. `async def _close_runner(runner: CycleRunner, control: ShutdownControl, forced: list[str]) -> None`:
+  `report = await runner.close(budget_s=max(0.0, min(CLOSE_BUDGET_S, control.remaining() - CLOSE_MARGIN_S)))`,
+  then
   `forced.extend(f"cycle:{cid}" for cid in report.abandoned)`. `bounded` is a closure inside
   `_teardown`, so define `_close_runner` there or pass `forced` in.
+- Why the margin (D21 note 2026-11-11, plan review): `bounded` waits `control.remaining()`; with
+  `close()`'s budget equal to it, both expire together and `bounded` can cancel `close()` before
+  it returns its report, losing the `cycle:<id>` entries and `cycle.task_abandoned`.
 - The WP 1.5c paragraph of the module docstring says the flatten step runs "after the startup
   step". It now runs after `runner.close`: fix that sentence too.
 - `core.shutdown_abandoned` note becomes `"left for the startup sequence; not proof that broker work stopped"`.
@@ -550,6 +572,11 @@ text:
   - `test_abandoned_cycle_makes_the_exit_unclean`: monkeypatch `CycleRunner.close` to return
     `CloseReport((42,))`. Result `EXIT_FAILED`, `core.shutdown_forced.steps` contains
     `"cycle:42"` and so does `core.shutdown_abandoned`.
+  - `test_abandoned_cycle_is_reported_with_a_short_shutdown_budget`: no monkeypatched `close`.
+    `shutdown.timeout_s = 3`, a `SimBroker` whose `submit_order` hangs (as
+    `te.HangingSubmit`), admission opened, one candidate admitted and inside `check()`. Request
+    the stop: `core.shutdown_forced.steps` contains `"cycle:<id>"` (not only `"runner.close"`),
+    and `cycle.task_abandoned` is logged.
   - `test_runner_close_is_skipped_when_startup_failed`: broker connect fails. No
     `CycleRunner.close` call.
   - `test_stop_during_recover_skips_runner_close` (Review Focus 3): `CycleRunner.recover` awaits
@@ -564,9 +591,9 @@ text:
 - [ ] **Step 3: Implement** the teardown change and the docstring/comment fixes (`rg -n "1.5d" src/autotrader/core/runtime.py`
   must return only the WP 1.5d-1/1.5d-2/1.5d-3 history paragraphs).
 - [ ] **Step 4: Run** `uv run pytest tests/unit/core/test_runtime.py -v`. Expected: PASS.
-- [ ] **Step 5: Full check and commit**
+- [ ] **Step 5: Full check and commit** (Tasks 4 and 5 together)
   `git add src/autotrader/core/runtime.py tests/unit/core/test_runtime.py`,
-  `git commit -m "feat: teardown closes the cycle runner before the shutdown flatten"`.
+  `git commit -m "feat: run core wires the cycle runner behind admission readiness"`.
 
 ### Task 6: Restart scenarios on the real components
 
@@ -591,6 +618,9 @@ text:
   - `"manage"`: `readiness.manage(pm.step)`;
   - `"admit"`: `_admission_step(readiness, runner)`.
 - No `seed_baseline` is needed: the first cash check after the restart writes the baseline.
+- Define the `db_url` / `sessions` / `bus` fixtures locally (they are per module in
+  `tests/integration/test_cycle_runner.py` and `tests/unit/core/test_cycle.py`, not in a
+  conftest). The same applies in Task 7.
 - Exits placed after `T_b` must settle before admission can open (Known costs). A test that
   expects admission to open fills the exit with `h.bar(symbol, price)` once the sell row exists.
 
@@ -614,20 +644,27 @@ text:
     resubmit the same `BrokerOrder` with that client id, then fill it with `h.bar(BTC, 100)` and
     advance the clock past the visibility allowance. Restart without a BTC quote and run in this
     order:
-    `sync` (links), `manage` (no position yet), `sync` (books), `snapshot` (sets `T_b`),
-    `manage` (`no_bid`), `admit` (still closed). Then quote bid 90, `manage` (latched, sell
-    placed), `h.bar(BTC, 90)`, `sync`, `snapshot`, `manage` and `admit`: open. A sell order row
-    exists before `cycle.admission_open`.
+    `sync` (links), `manage` (no position yet), `sync` (books), `snapshot` (clears the fault),
+    `admit` (sets `T_b`; closed), `manage`, `admit` (still closed). Assert that the last report
+    (`readiness` keeps it; expose it read-only as `last_report` for tests) has this position as
+    `no_bid`: `T_b` is taken only inside `ready()`, so without the `admit` before `manage` the
+    test would pass on ordering alone (Fable review). Then quote bid 90, `manage` (latched,
+    sell placed), `h.bar(BTC, 90)`, `sync`, `snapshot`, `admit`, `manage`, `admit`: open. A sell
+    order row exists before `cycle.admission_open`.
   - `test_swallowed_evaluation_failure_keeps_admission_closed` (17): two positions. Monkeypatch
     `repo.update_trailing`, or the position's `_evaluate`, to raise for one position id for the
-    first two `manage` calls. `admit` stays closed through those, and opens after the next clean
-    `manage`.
-  - `test_holdings_shortfall_keeps_admission_closed` (18): `h.open_position(BTC, qty="1")`, then
-    sell 0.5 BTC at the broker outside the journal (`h.sim.submit_order(BrokerOrder(BTC, "sell", 0.5, "market"))`,
-    `h.bar(BTC, 100)`). Restart with a fresh BTC quote inside stop/tp. Several `sync, snapshot,
-    manage, admit` rounds keep it closed, with one `admission.holdings_short`
-    (`journal_qty="1"`, `broker_qty="0.5"`), and no manual pause is written
-    (`control_state` `PAUSED_KEY` absent).
+    first two `manage` calls. Run `sync, snapshot, admit` first so `T_b` is set before them
+    (same reason as test 16), assert the last report has that position `failed`, `admit` stays
+    closed through those, and opens after the next clean `manage` and `admit`.
+  - `test_holdings_shortfall_keeps_admission_closed` (18): `h.open_position(BTC, qty="1",
+    stop="95")`, then sell the whole holding at the broker outside the journal
+    (`h.sim.submit_order(BrokerOrder(BTC, "sell", 1, "market"))`, `h.bar(BTC, 100)`). Restart
+    with a fresh BTC quote at bid 90 (below the stop). Run `sync, snapshot, admit, manage,
+    admit` rounds, advancing `h.clock` past the exit backoff between rounds. Assert: the
+    position is latched (`stop`), `h.engine.exit` (spy) is called again in a later round (the
+    exit attempts continue as today, whatever each result), exactly one
+    `admission.holdings_short` (`journal_qty="1"`, `broker_qty="0"`), admission stays closed,
+    and no manual pause is written (`control_state` `PAUSED_KEY` absent).
 - [ ] **Step 2: Run** `uv run pytest tests/integration/test_startup_admission.py -v`. Expected:
   PASS. These tests pin behaviour that Tasks 1-5 implement. A failure here is a defect in those
   tasks: fix it there and say so in the commit message.
@@ -719,8 +756,10 @@ text:
     keeps admission closed until it settles or is repaired;
   - a latched position whose exit attempts keep raising reports `failed` and keeps admission
     closed;
-  - `cycle.admission_waiting` is logged once, so a cause that appears later is not named; read
-    the per-cause lines (`admission.holdings_short`, `positions.*`, `risk.cash_fault_set`). Replace "Current limits (WP 1.5d-2)": with `SimBroker` the
+  - `cycle.admission_waiting` repeats every 10 min while admission is closed and names the
+    current causes, including unsettled order rows; the per-cause lines
+    (`admission.holdings_short`, `positions.*`, `risk.cash_fault_set`) give the details.
+- [ ] Replace "Current limits (WP 1.5d-2)": with `SimBroker` the
   runner places entries, and with Alpaca admission stays disabled until 1.6.
 - [ ] **Step 3: PLAN.md:** the "Current repo state" line (1.5d-3 done on the branch, not yet
   merged; adjust on merge) and a dated 1.5 row note naming spec, plan and the two Claude's calls

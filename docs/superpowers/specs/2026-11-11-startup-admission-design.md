@@ -16,6 +16,9 @@ Revised 2026-11-11 after the Codex review of e31ce0c (PR #37), owner go: a faile
 no longer stops the core; it disables admission until a restart, no retry (D21.9, section 2); a
 drop-only `CandidateSignal` handler replaces the runner when it is not subscribed, so no candidate
 is dropped without a log line (D21.4, section 2).
+Revised 2026-11-11 after the Fable review of the plan (PR #38), owner go: `cycle.admission_waiting`
+repeats every 10 min while admission stays closed and names unsettled order rows (3.2, 6, test 7);
+`runner.close` gets its budget 1 s below what is left, so its report is not cut off (section 4).
 
 ## 1. Scope and intent
 
@@ -215,7 +218,9 @@ Order and why (finding of the PR #37 review, owner go): (b), then (c) and (d).
   without a restart.
 - While (b)-(d) are not yet met, the step logs nothing per tick. After the tracker has been waiting
   longer than 3 x `snapshot_s` (so an ordinary restart that waits one snapshot interval does not
-  warn), it logs `cycle.admission_waiting` (warning) once, with the unmet conditions (for (c), the
+  warn), it logs `cycle.admission_waiting` (warning), repeated every 10 min while admission stays
+  closed (revised after the plan review; was "once"), with the unmet conditions (while the cash
+  fault is set: the fault, and `unsettled order rows` when the ledger's guard shows one; for (c), the
   positions not `evaluated`/`latched` and why; for (d), the short symbols), and
   `cycle.admission_open` when it opens. The thresholds and the transitions are unit-tested on the
   tracker with an injected clock (section 7).
@@ -268,8 +273,10 @@ The placeholder step 1 becomes **`runner.close`**, and it moves before the `shut
 step, so no entry can start while a flatten is running:
 
 0. an unfinished startup (unchanged);
-1. **`runner.close`:** `bounded("runner.close", runner.close(budget_s=min(CLOSE_BUDGET_S,
-   control.remaining())))`, only if `start()` returned a runner (it did not if startup failed or
+1. **`runner.close`:** `bounded("runner.close", runner.close(budget_s=max(0, min(CLOSE_BUDGET_S,
+   control.remaining() - 1 s))))` (revised after the plan review: with the full remaining budget
+   both timers expire together and `bounded` can cancel `close()` before it returns its
+   report), only if `start()` returned a runner (it did not if startup failed or
    was still running). `close()` sets `closing` (admission is closed for good, and
    `open_admission()` becomes a no-op, 3.1), cancels cycles before `check()`, drains `check()`
    calls, and returns the abandoned cycle ids. Each abandoned id is added to the forced list as
@@ -300,7 +307,7 @@ validation (the default 30 s stays above `CLOSE_BUDGET_S`; a smaller value just 
 
 ## 6. Logs
 
-New: `cycle.admission_open` (info), `cycle.admission_waiting` (warning, once),
+New: `cycle.admission_open` (info), `cycle.admission_waiting` (warning, every 10 min while closed),
 `cycle.admission_disabled` (warning or error, once), `cycle.dropped` with the new reasons,
 `admission.holdings_short` (error), `admission.unquoted_holdings` (warning, startup),
 `feed.backfill_failed` (error, startup). Names of the
@@ -326,7 +333,8 @@ Readiness tracker unit tests (injected clock and inputs, no loops):
 6. Holdings check: a shortfall keeps it closed and logs once per symbol (again only when the
    figures change); a broker holding above the journal passes; dust counts on the journal side; a
    guard showing an unsettled row or a moved generation discards the result silently.
-7. `cycle.admission_waiting` is logged once after 3 x `snapshot_s` on the injected clock, with the
+7. `cycle.admission_waiting` is logged after 3 x `snapshot_s` on the injected clock, then every
+   10 min (and names unsettled order rows while the fault is set), with the
    unmet conditions; not logged when the tracker opens earlier.
 
 Position Manager unit tests:
