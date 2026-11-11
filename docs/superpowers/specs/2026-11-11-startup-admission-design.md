@@ -256,7 +256,8 @@ catches a missing holding only indirectly. 1.5d-3 adds a **one-sided** check to 
 
 Nothing changes for the order-sync loop, the resolver, `flatten` or `shutdown.flatten`, and the
 Position Manager only gains its report: they start as today, before and independently of
-admission. If admission never opens (Alpaca until 1.6, a failed `recover()`, a sticky cash fault,
+admission. If admission never opens (Alpaca until 1.6, a failed history backfill, a failed
+`recover()`, a sticky cash fault,
 an incident, a held symbol without a trusted bid, a holdings shortfall), protective exits keep
 running (PLAN 3.2 item 1). A mode mismatch is the exception: there the engine rejects exits too, so
 the core does not start at all (section 2).
@@ -301,7 +302,8 @@ validation (the default 30 s stays above `CLOSE_BUDGET_S`; a smaller value just 
 
 New: `cycle.admission_open` (info), `cycle.admission_waiting` (warning, once),
 `cycle.admission_disabled` (warning or error, once), `cycle.dropped` with the new reasons,
-`admission.holdings_short` (error), `admission.unquoted_holdings` (warning, startup). Names of the
+`admission.holdings_short` (error), `admission.unquoted_holdings` (warning, startup),
+`feed.backfill_failed` (error, startup). Names of the
 logger prefix for the tracker (`admission.` vs `cycle.`) are a **builder call** as long as the
 runbook lists the final names.
 
