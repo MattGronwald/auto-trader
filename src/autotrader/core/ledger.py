@@ -22,6 +22,15 @@ written-off dust (`symbol_dust`); the remainder is external and reported in
 `ExternalHoldingSold`. A marked sell that finds an open position books through the normal
 sell path, `oversell` included.
 
+An operator-marked oversell (`repair oversell` sets `orders.excess_external`, WP 1.5d-2,
+spec 2026-11-10 5.4) is split per fill, in booking order, when the fill is booked: the
+position absorbs up to its open qty plus the carried dust (consumed as for any sell), and
+the rest of that fill, and every later fill of the row, is external, persisted in
+`fills.external_qty` (0 on every ordinary fill). Position fees and realized P&L take only
+each fill's position share; at the row's settlement `ExternalHoldingSold` reports the
+external shares from the stored split (`dust_consumed` 0). A marked row whose position
+absorbs the whole sell books like any sell, with no external part and no event.
+
 Order resolver decisions (WP 1.5d-2, spec 2026-11-10 3.5-3.7) arrive with the sync pass as
 `SyncResult.resolutions`; `apply_all` applies them first, each in its own unit, then books.
 Each is a conditional `UPDATE` whose guard lives in its `WHERE` clause (never a Python check
@@ -225,6 +234,18 @@ def _cash_effect(row: FillRow) -> Decimal:
     if row.side == "buy":
         return -notional - (row.fee if row.fee_asset == "quote" else _D0)
     return notional - row.fee
+
+
+def _split(amount: Decimal, qty: Decimal, external_qty: Decimal) -> tuple[Decimal, Decimal]:
+    """`(position_part, external_part)` of a fill's amount by its persisted external qty
+    (spec 2026-11-10 5.4). An ordinary fill (`external_qty == 0`) returns `amount` itself:
+    at 28-digit precision `a * q / q != a` for some values, so the arithmetic would leave a
+    rounding residue in ordinary trades. The parts sum to `amount` exactly; any residue
+    lands in the external part."""
+    if external_qty == 0:
+        return amount, _D0
+    position_part = amount * (qty - external_qty) / qty
+    return position_part, amount - position_part
 
 
 def _same(row: FillRow, fill: Fill) -> bool:
@@ -523,22 +544,22 @@ class Ledger:
             None if order.position_id is None else await session.get(Position, order.position_id)
         )
         for fill in new:
-            session.add(
-                FillRow(
-                    order_id=order.id,
-                    broker_fill_id=fill.fill_id,
-                    side=fill.side,
-                    fee_asset=fill.fee_asset,
-                    qty=_norm(fill.qty),
-                    price=_norm(fill.price),
-                    fee=_norm(fill.fee),
-                    ts=fill.ts,
-                )
+            fill_row = FillRow(
+                order_id=order.id,
+                broker_fill_id=fill.fill_id,
+                side=fill.side,
+                fee_asset=fill.fee_asset,
+                qty=_norm(fill.qty),
+                price=_norm(fill.price),
+                fee=_norm(fill.fee),
+                ts=fill.ts,
+                external_qty=_D0,
             )
+            session.add(fill_row)
             if order.side == "buy":
                 position = await self._buy(session, order, position, fill)
             else:
-                position = await self._sell(session, order, position, fill, now)
+                position = await self._sell(session, order, position, fill, fill_row, now)
         changed = bool(new)
         if new:
             order.filled_qty = _norm(applied)
@@ -560,10 +581,12 @@ class Ledger:
                 dust = await self._maybe_close(session, position, u.min_qty, now)
                 if dust is not None:
                     extra.append(dust)
-            if order.side == "sell" and order.external and order.position_id is None:
+            if order.side == "sell" and order.excess_external:
+                unit.external = await self._excess_sale(session, order, now)
+            elif order.side == "sell" and order.external and order.position_id is None:
                 unit.external = await self._external_sale(session, order, now)
-                if unit.external is not None:
-                    extra.append(unit.external)
+            if unit.external is not None:
+                extra.append(unit.external)
         if not changed:
             return None
         order.updated_at = now
@@ -613,12 +636,18 @@ class Ledger:
         order: Order,
         position: Position | None,
         fill: Fill,
+        fill_row: FillRow,
         now: datetime,
     ) -> Position | None:
         """Reduce the symbol's open position. A sell beyond the open qty is carried dust of
         earlier trades, resolved only once every earlier order on the symbol is settled
         (spec 4.3): until then the whole update is deferred, never an anomaly. A marked
-        external sell with no open position books no position (None, spec 4.4.1)."""
+        external sell with no open position books no position (None, spec 4.4.1).
+
+        Beyond the open qty and the carried dust, an unmarked row is an `oversell`; a row
+        marked `excess_external` (spec 2026-11-10 5.4) consumes the dust, empties the
+        position and persists the rest of the fill in `fill_row.external_qty`. The position
+        is charged only the position's share of the fill's fee."""
         if position is None:
             # Never "the oldest open one": check() keeps one open journal trade per symbol,
             # so more than one is a contradiction, not a choice (PR #25 review).
@@ -643,26 +672,64 @@ class Ledger:
                     "sell_without_position", f"sell fill {fill.fill_id}: no open {order.symbol}"
                 )
             order.position_id = position.id
-        position.fees = _norm(
-            (position.fees or _D0) + _fee_usd(fill.fee, fill.fee_asset, fill.price)
-        )
+        external = _D0
         excess = fill.qty - position.qty
         if excess <= 0:
             position.qty = _norm(position.qty - fill.qty)
-            return position
-        if await _earlier_unsettled(session, order):
-            raise _Deferred(f"sells {excess} beyond the open qty; an earlier order is unsettled")
-        dust = await session.get(SymbolDust, position.symbol)
-        available = _D0 if dust is None else dust.qty
-        if dust is None or excess > available:
-            raise _Anomaly(
-                "oversell", f"sells {excess} beyond the open qty, carried dust {available}"
-            )
-        dust.qty = _norm(available - excess)
-        dust.updated_at = now
-        position.dust_consumed = _norm(position.dust_consumed + excess)
-        position.qty = _D0
+        else:
+            if await _earlier_unsettled(session, order):
+                raise _Deferred(
+                    f"sells {excess} beyond the open qty; an earlier order is unsettled"
+                )
+            dust = await session.get(SymbolDust, position.symbol)
+            available = _D0 if dust is None else dust.qty
+            if order.excess_external:
+                consumed = min(excess, available)
+                external = excess - consumed
+            elif dust is None or excess > available:
+                raise _Anomaly(
+                    "oversell", f"sells {excess} beyond the open qty, carried dust {available}"
+                )
+            else:
+                consumed = excess
+            if dust is not None and consumed > 0:
+                dust.qty = _norm(available - consumed)
+                dust.updated_at = now
+            position.dust_consumed = _norm(position.dust_consumed + consumed)
+            position.qty = _D0
+            fill_row.external_qty = _norm(external)
+        fee_usd = _fee_usd(fill.fee, fill.fee_asset, fill.price)
+        position.fees = _norm((position.fees or _D0) + _split(fee_usd, fill.qty, external)[0])
         return position
+
+    async def _excess_sale(
+        self, session: AsyncSession, order: Order, now: datetime
+    ) -> ExternalHoldingSold | None:
+        """The external part of a settled `excess_external` row (spec 2026-11-10 5.4), from
+        the split `_sell` persisted per fill (never recomputed). Its dust went to the
+        position, so `dust_consumed` is 0 and `SymbolDust` is not touched again (never
+        `_external_sale`). None when no fill had an external part."""
+        await session.flush()
+        rows = list(await session.scalars(select(FillRow).where(FillRow.order_id == order.id)))
+        external = sum((r.external_qty for r in rows), _D0)
+        if external == 0:
+            return None
+        proceeds = sum((_split(r.qty * r.price, r.qty, r.external_qty)[1] for r in rows), _D0)
+        fees = sum(
+            (_split(_fee_usd(r.fee, r.fee_asset, r.price), r.qty, r.external_qty)[1] for r in rows),
+            _D0,
+        )
+        return ExternalHoldingSold(
+            ts=now,
+            cycle_id=order.cycle_id,
+            order_row_id=order.id,
+            symbol=order.symbol or "",
+            qty=_norm(external),
+            dust_consumed=_D0,
+            external_qty=_norm(external),
+            proceeds_usd=_norm(proceeds),
+            fees_usd=_norm(fees),
+        )
 
     async def _external_sale(
         self, session: AsyncSession, order: Order, now: datetime
@@ -744,7 +811,8 @@ class Ledger:
     ) -> DustLeft | None:
         """Close once every order of the position is settled and less than `min_qty` is
         left (spec 4.3/4.4; stricter than "entry settled", see the plan's clarification 1).
-        Realized P&L is cash in minus cash out, so dust is written off (D17)."""
+        Realized P&L is cash in minus cash out, so dust is written off (D17); a fill's
+        external part (`excess_external`, spec 2026-11-10 5.4) is not the trade's."""
         if position.closed_at is not None or min_qty is None or position.qty >= min_qty:
             return None
         await session.flush()
@@ -763,7 +831,9 @@ class Ledger:
         exits = [o for o in linked if o.side == "sell"]
         position.closed_at = max(r.ts for r in rows)
         position.exit_reason = (exits[-1].exit_reason or "exit") if exits else "dust"
-        position.realized_pnl = _norm(sum((_cash_effect(r) for r in rows), _D0))
+        position.realized_pnl = _norm(
+            sum((_split(_cash_effect(r), r.qty, r.external_qty)[0] for r in rows), _D0)
+        )
         position.dust_qty = position.qty
         log.info(
             "ledger.position_closed",

@@ -29,7 +29,7 @@ from autotrader.broker.sim import FillPlan, SimBroker
 from autotrader.core.bus import CommitUncertain, DomainEvent, EventBus
 from autotrader.core.config import load_profile
 from autotrader.core.kill import PAUSED_KEY
-from autotrader.core.ledger import CASH_CHECK_KEY, Ledger, _cash_effect
+from autotrader.core.ledger import CASH_CHECK_KEY, Ledger, _cash_effect, _split
 from autotrader.core.types import Bar
 from autotrader.journal import models as m
 from autotrader.journal import repo
@@ -1265,6 +1265,160 @@ async def test_a_marked_sell_against_an_open_position_books_normally_and_oversel
     assert anomaly_kind(await event_rows(sessions)) == "oversell"
     (pos,) = await positions(sessions)
     assert pos.realized_pnl is None  # no external proceeds in a trade's P&L
+
+
+# --- operator-marked oversell (WP 1.5d-2, spec 2026-11-10 5.4) ---------------------------
+
+
+async def _marked_sell(sessions: async_sessionmaker[AsyncSession], qty: str) -> int:
+    """A sell row `repair oversell` marked `excess_external`, with entries paused."""
+    async with sessions() as s:
+        row = await repo.insert_order(
+            s,
+            cycle_id=None,
+            client_order_id=None,
+            symbol=BTC,
+            mode="paper",
+            type_="market",
+            side="sell",
+            qty=D(qty),
+            limit_price=None,
+            stop_price=None,
+            tp_price=None,
+            status="new",
+            now=T0,
+            exit_reason="flatten",
+        )
+        row.excess_external = True
+        row.broker_order_id = "b-sell"
+        s.add(m.ControlState(key=PAUSED_KEY, value=True))
+        await s.commit()
+        return row.id
+
+
+def _sf(fill_id: str, qty: str, price: str, fee: str, minute: int) -> Fill:
+    return Fill(
+        fill_id=fill_id,
+        order_id="b-sell",
+        symbol=BTC,
+        side="sell",
+        qty=D(qty),
+        price=D(price),
+        fee=D(fee),
+        fee_asset="quote",
+        ts=T0 + timedelta(minutes=minute),
+    )
+
+
+def _sell_update(row: int, status: str, filled: str, *fs: Fill) -> OrderUpdate:
+    return OrderUpdate(
+        order_row_id=row, status=status, filled_qty=D(filled), fills=fs, min_qty=RULES.min_qty
+    )
+
+
+F1 = _sf("s:1", "1", "100", "0.25", 3)
+F2 = _sf("s:2", "1", "200", "0.5", 4)
+
+
+async def _assert_split_booked(sessions: async_sessionmaker[AsyncSession]) -> None:
+    (pos,) = await positions(sessions)
+    # buy 1 @ 100, quote fee 0.25; the position's sell is F1 only: 100 - 0.25
+    assert pos.closed_at is not None
+    assert (pos.qty, pos.fees, pos.realized_pnl, pos.dust_consumed) == (
+        D(0),
+        D("0.5"),
+        D("-0.5"),
+        D(0),
+    )
+    assert [f.external_qty for f in await fills(sessions)] == [D(0), D(0), D(1)]
+    rows = await event_rows(sessions)
+    (sold,) = [e.payload for e in rows if e.type == "ExternalHoldingSold"]
+    assert (D(sold["qty"]), D(sold["external_qty"]), D(sold["dust_consumed"])) == (
+        D(1),
+        D(1),
+        D(0),
+    )
+    assert (D(sold["proceeds_usd"]), D(sold["fees_usd"])) == (D("200"), D("0.5"))
+    assert "LedgerAnomaly" not in [e.type for e in rows]
+    assert await paused(sessions)
+    assert all(o.settled_at is not None for o in await orders(sessions))
+
+
+async def test_marked_oversell_splits_per_fill(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await settle_entry(sessions, ledger, sim, 1)
+    row = await _marked_sell(sessions, "2")
+
+    assert await ledger.apply(_sell_update(row, "partially_filled", "1", F1)) == "applied"
+    assert await ledger.apply(_sell_update(row, "filled", "2", F1, F2)) == "applied"
+    await _assert_split_booked(sessions)
+
+
+async def test_marked_oversell_is_restart_safe(
+    bus: EventBus, sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await settle_entry(sessions, ledger, sim, 1)
+    row = await _marked_sell(sessions, "2")
+
+    assert await ledger.apply(_sell_update(row, "partially_filled", "1", F1)) == "applied"
+    restarted = Ledger(bus, sessions, clock=lambda: T0)
+    assert await restarted.apply(_sell_update(row, "filled", "2", F1, F2)) == "applied"
+    await _assert_split_booked(sessions)
+
+
+async def test_marked_oversell_consumes_carried_dust_once(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await settle_entry(sessions, ledger, sim, 1)
+    await set_dust(sessions, "0.3")
+    row = await _marked_sell(sessions, "1.5")
+
+    one = _sf("s:1", "1.5", "100", "0.3", 3)
+    assert await ledger.apply(_sell_update(row, "filled", "1.5", one)) == "applied"
+    (pos,) = await positions(sessions)
+    assert (pos.dust_consumed, pos.closed_at is not None) == (D("0.3"), True)
+    # the position's share is 1.3 / 1.5 of the fill: fee 0.26, cash in 130 - 0.26
+    assert (pos.fees, pos.realized_pnl) == (D("0.51"), D("29.49"))
+    assert [f.external_qty for f in await fills(sessions)] == [D(0), D("0.2")]
+    assert await dust_balance(sessions) == D(0)
+    (sold,) = [e.payload for e in await event_rows(sessions) if e.type == "ExternalHoldingSold"]
+    assert (D(sold["qty"]), D(sold["external_qty"]), D(sold["dust_consumed"])) == (
+        D("0.2"),
+        D("0.2"),
+        D(0),
+    )
+    assert (D(sold["proceeds_usd"]), D(sold["fees_usd"])) == (D("20"), D("0.04"))
+
+
+async def test_mark_without_excess_books_normally(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    sim = make_sim()
+    await settle_entry(sessions, ledger, sim, 1)
+    row = await _marked_sell(sessions, "1")
+
+    sale = _sf("s:1", "1", "110", "0.275", 3)
+    assert await ledger.apply(_sell_update(row, "filled", "1", sale)) == "applied"
+    (pos,) = await positions(sessions)
+    # as test_a_full_exit_closes_with_exact_pnl_on_quote_fees
+    assert (pos.realized_pnl, pos.fees, pos.dust_qty) == (D("9.475"), D("0.525"), D(0))
+    assert [f.external_qty for f in await fills(sessions)] == [D(0), D(0)]
+    types = await event_types(sessions)
+    assert "ExternalHoldingSold" not in types and "LedgerAnomaly" not in types
+
+
+def test_split_is_exact() -> None:
+    pos, ext = _split(D("1"), D("3"), D("1"))
+    assert pos + ext == D("1")
+    assert ext > 0
+    a, q = D(1) / D(11), D("3")  # 0.0909...091: 28 significant digits
+    assert a * q / q != a  # 28-digit rounding: an ordinary fill must skip the arithmetic
+    part, zero = _split(a, q, D(0))
+    assert (part, zero) == (a, D(0)) and part is a
 
 
 # --- cash check (D17, spec 4.6) -----------------------------------------------------------
