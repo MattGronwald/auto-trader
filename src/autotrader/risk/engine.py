@@ -15,10 +15,22 @@ rejects or over-counts it (conservative), and a late IOC fill after a kill-flatt
 happen with or without a shared lock (fills are broker-side); the ledger books it (WP 1.5b)
 and the Position Manager manages it (WP 1.5c).
 
-`check()` first syncs every unsettled order (`sync_orders`) and books it through the ledger
-(`core/ledger.py`, WP 1.5b); an unreadable order, or a symbol whose booking raised in the
-ledger, rejects every entry (`state unavailable: SyncIncomplete`). Exits never sync.
+`check()` first reads every unsettled order (the read step of the sync) and books it through
+the ledger (`core/ledger.py`, WP 1.5b); an unreadable order, or a symbol whose booking raised in
+the ledger, rejects every entry (`state unavailable: SyncIncomplete`). Exits never sync.
 After that sync, a symbol with any unsettled sell row (own or external) rejects its entries.
+
+Order resolver (WP 1.5d-2, spec 2026-11-10 3): only `sync_orders()` (the ledger's sync loop)
+resolves, after the same read step and under the same budget; `check()` only reads. Candidates
+are (a) `pending`/`unknown` rows without a broker id that are not in flight and (b) rows whose
+`get_order` raised `OrderNotFound` (clock `resolve_since`, persisted at the first miss and kept
+until a successful read). A row is looked up by its own journal-namespaced client id: a match
+links a type (a) row; a row without ownership proof or with a mismatching hit becomes an
+incident at once; otherwise the row becomes an incident once `order_resolution_timeout_s` has
+passed since `submitted_at` (a) or `resolve_since` (b). A lookup the budget did not reach is
+"not looked up", never a zero match. Incident rows are skipped by the read and by the resolver
+until an operator repairs them; `risk.order_incident_open` reminds every 60 s. The resolver
+never marks a row `not_submitted` (D20.2): a zero match is no proof that an order cannot exist.
 
 Daily-loss baseline (D19, spec 2026-11-09 3): the equity of the latest snapshot observed in
 the `2 x snapshot_interval_s` before the trading-day start; without one, entries are rejected
@@ -56,11 +68,11 @@ import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable, Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
-from typing import Protocol, TypeVar
+from typing import Literal, Protocol, TypeVar
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -74,6 +86,7 @@ from autotrader.broker.base import (
     Mode,
     OrderAck,
     OrderMethodsUnavailable,
+    OrderNotFound,
     OrderRejected,
 )
 from autotrader.core.config import StrategyProfile
@@ -84,7 +97,7 @@ from autotrader.core.types import Bar, Quote
 from autotrader.journal import repo
 from autotrader.journal.models import Order
 from autotrader.risk.checks import check_entry, check_exit
-from autotrader.risk.resolve import exit_client_id
+from autotrader.risk.resolve import IncidentReason, exit_client_id, mismatches, owns
 from autotrader.risk.types import (
     FINAL,
     CancelResult,
@@ -93,6 +106,7 @@ from autotrader.risk.types import (
     HeldPosition,
     MarketSnapshot,
     OpenEntry,
+    OrderResolution,
     OrderUpdate,
     Pause,
     PortfolioState,
@@ -107,6 +121,27 @@ T = TypeVar("T")
 
 # Final rows that never reached the broker: nothing to read, the ledger settles them.
 _LOCAL_FINAL = ("not_submitted", "rejected")
+# How often `risk.order_incident_open` repeats while any incident row is unsettled.
+_INCIDENT_REMINDER_S = 60.0
+
+
+@dataclass
+class _Read:
+    """The read step of one sync pass: the ledger's `SyncResult` parts plus the resolver's
+    candidates, in row order (`b` = `get_order` raised `OrderNotFound`)."""
+
+    updates: list[OrderUpdate] = field(default_factory=list)
+    failed: list[int] = field(default_factory=list)
+    resolutions: list[OrderResolution] = field(default_factory=list)
+    candidates: list[tuple[Order, Literal["a", "b"]]] = field(default_factory=list)
+    incidents: dict[int, str] = field(default_factory=dict)  # unsettled rows already marked
+
+    def result(self) -> SyncResult:
+        return SyncResult(
+            updates=tuple(self.updates),
+            failed=tuple(self.failed),
+            resolutions=tuple(self.resolutions),
+        )
 
 
 class Accounting(Protocol):
@@ -158,6 +193,8 @@ class RiskEngine:
         io_timeout_s: float = 10.0,
         monotonic: Callable[[], float] = time.monotonic,
         snapshot_interval_s: float = 60.0,
+        order_visibility_allowance_s: float = 60.0,
+        order_resolution_timeout_s: float = 80.0,
     ) -> None:
         self._broker = broker
         self._profile = profile
@@ -188,6 +225,14 @@ class RiskEngine:
         # inserted, dropped when the call returns. The order resolver (spec 2026-11-10) skips
         # these rows; it never links a row whose submit is still in progress.
         self._in_flight: set[int] = set()
+        # Order resolver bounds (spec 2026-11-10 3.5): a miss before submit + io timeout +
+        # allowance is expected (debug); an unlinked row becomes an incident at the timeout.
+        self._visibility_allowance = timedelta(seconds=order_visibility_allowance_s)
+        self._resolution_timeout = timedelta(seconds=order_resolution_timeout_s)
+        # Last lookup outcome per candidate row, for the incident reason when a later pass
+        # cannot look it up (spent budget). Per process: after a restart the reason defaults.
+        self._last_outcome: dict[int, IncidentReason] = {}
+        self._incident_logged_at: float | None = None  # monotonic time of the last reminder
 
     async def _journal_id(self) -> str | None:
         """The journal's id (client ids embed it), read once and cached when found."""
@@ -425,32 +470,175 @@ class RiskEngine:
         return control, portfolio, market, faults, jid
 
     async def sync_orders(self) -> SyncResult:
-        """Read-only broker view of every unsettled order for the ledger (spec 4.2). Takes
-        no lock (never delays an exit) and has its own `io_timeout_s` budget."""
-        return await self._sync(self._monotonic() + self._io_timeout)
+        """Broker view of every unsettled order for the ledger (spec 4.2), then the order
+        resolver's decisions (spec 2026-11-10 3), under ONE `io_timeout_s` budget. Takes no
+        lock (never delays an exit)."""
+        deadline = self._monotonic() + self._io_timeout
+        return await self._resolve(await self._read(deadline), deadline)
 
     async def _sync(self, deadline: float) -> SyncResult:
+        """The read step alone (`check()`): it never spends an entry's budget on lookups."""
+        return (await self._read(deadline)).result()
+
+    async def _read(self, deadline: float) -> _Read:
         """Per-order failures (incl. `OrderNotFound` and a spent budget) are collected,
-        never raised: the caller decides, and `check()` then fails closed."""
+        never raised: the caller decides, and `check()` then fails closed. Incident rows are
+        not read (the operator has them); a successful read of a row with a type (b) clock
+        clears exactly the clock it observed."""
+        now = self._clock()
         async with self._sessions() as session:
             rows = await repo.unsettled_orders(session)
-        updates: list[OrderUpdate] = []
-        failed: list[int] = []
+        read = _Read()
         min_qty: dict[str, Decimal] = {}
         for row in rows:
+            if row.incident is not None:
+                read.incidents[row.id] = row.incident
+                continue
             broker_id = row.broker_order_id
             if broker_id is None:
                 if row.status in _LOCAL_FINAL:
-                    updates.append(
+                    read.updates.append(
                         OrderUpdate(order_row_id=row.id, status=row.status, filled_qty=Decimal(0))
                     )
-                continue  # pending / unknown without an id: the 1.5d resolver's case
+                else:  # pending / unknown without an id: the resolver's type (a)
+                    read.candidates.append((row, "a"))
+                continue
             try:
-                updates.append(await self._read_order(row, broker_id, min_qty, deadline))
-            except Exception:
+                read.updates.append(await self._read_order(row, broker_id, min_qty, deadline))
+            except OrderNotFound:  # the broker no longer knows the id: type (b)
                 log.exception("risk.order_sync_failed", order_row=row.id)
-                failed.append(row.id)
-        return SyncResult(updates=tuple(updates), failed=tuple(failed))
+                read.failed.append(row.id)
+                read.candidates.append((row, "b"))
+            except Exception:  # the order is known, the read failed: not resolution
+                log.exception("risk.order_sync_failed", order_row=row.id)
+                read.failed.append(row.id)
+            else:
+                if row.resolve_since is not None:
+                    read.resolutions.append(
+                        OrderResolution(
+                            order_row_id=row.id,
+                            action="clear_clock",
+                            at=now,
+                            clock=row.resolve_since,
+                        )
+                    )
+        return read
+
+    async def _resolve(self, read: _Read, deadline: float) -> SyncResult:
+        """Decide each candidate (module docstring). Writes nothing: the decisions travel in
+        `SyncResult.resolutions` and the ledger applies each conditionally."""
+        now = self._clock()  # once: a type (b) incident must carry the clock it started
+        jid = await self._journal_id()
+        live = {row.id for row, _ in read.candidates}  # forget rows that left resolution
+        self._last_outcome = {k: v for k, v in self._last_outcome.items() if k in live}
+        resolutions = read.resolutions
+        incidents = dict(read.incidents)
+        failed = read.failed
+        if jid is None and read.candidates:  # a journal fault, not the rows': resolve nothing
+            log.error("risk.journal_id_missing")
+            read.candidates.clear()
+        for row, kind in read.candidates:
+            if kind == "a" and row.id in self._in_flight:  # its submit is still running
+                continue
+            since = now
+            if kind == "b":
+                if row.resolve_since is None:
+                    resolutions.append(
+                        OrderResolution(order_row_id=row.id, action="start_clock", at=since)
+                    )
+                else:
+                    since = row.resolve_since
+            clock = since if kind == "b" else None
+            reason = await self._decide(row, kind, jid or "", since, deadline, now, resolutions)
+            if reason is None:
+                continue
+            resolutions.append(
+                OrderResolution(
+                    order_row_id=row.id, action="incident", at=now, reason=reason, clock=clock
+                )
+            )
+            incidents[row.id] = reason
+            if kind == "b":  # D20.5: an incident blocks only its own symbol
+                failed.remove(row.id)
+        self._remind(incidents)
+        return SyncResult(
+            updates=tuple(read.updates), failed=tuple(failed), resolutions=tuple(resolutions)
+        )
+
+    async def _decide(
+        self,
+        row: Order,
+        kind: Literal["a", "b"],
+        jid: str,
+        since: datetime,
+        deadline: float,
+        now: datetime,
+        resolutions: list[OrderResolution],
+    ) -> IncidentReason | None:
+        """One candidate: appends a link, or returns the incident reason (None = wait)."""
+        cid = row.client_order_id
+        if cid is None or not owns(cid, jid):
+            return "no_ownership_proof"
+        outcome: IncidentReason | None = None  # None: not looked up this pass
+        if deadline - self._monotonic() > 0:
+            try:
+                view = await self._within(
+                    deadline, partial(self._broker.get_order_by_client_id, cid)
+                )
+            except Exception:  # "don't know", never a zero match
+                log.warning("risk.order_lookup_failed", order_row=row.id, exc_info=True)
+                outcome = "lookup_failed"
+            else:
+                if view is None:
+                    outcome = "not_found"
+                elif view.client_order_id != cid or mismatches(
+                    view,
+                    symbol=row.symbol or "",
+                    side=row.side,
+                    qty=row.qty,
+                    submitted_at=row.submitted_at,
+                    broker_order_id=row.broker_order_id if kind == "b" else None,
+                ):
+                    log.error(
+                        "risk.order_lookup_mismatch", order_row=row.id, order_id=view.order_id
+                    )
+                    return "client_id_mismatch"
+                elif kind == "a":
+                    resolutions.append(
+                        OrderResolution(
+                            order_row_id=row.id,
+                            action="link",
+                            at=now,
+                            broker_order_id=view.order_id,
+                        )
+                    )
+                    return None
+                else:  # type (b): the broker knows the order but cannot read it (3.7)
+                    outcome = "lookup_inconsistent"
+            self._last_outcome[row.id] = outcome
+        start = row.submitted_at if kind == "a" else since
+        if now >= start + self._resolution_timeout:
+            return outcome or self._last_outcome.get(row.id, "lookup_failed")
+        expected = (
+            row.submitted_at + timedelta(seconds=self._io_timeout) + self._visibility_allowance
+        )
+        (log.debug if now < expected else log.info)(
+            "risk.order_resolve_pending", order_row=row.id, kind=kind, outcome=outcome
+        )
+        return None
+
+    def _remind(self, incidents: dict[int, str]) -> None:
+        """`risk.order_incident_open` every 60 s while any unsettled row is an incident."""
+        if not incidents:
+            return
+        last = self._incident_logged_at
+        if last is not None and self._monotonic() - last < _INCIDENT_REMINDER_S:
+            return
+        self._incident_logged_at = self._monotonic()
+        log.error(
+            "risk.order_incident_open",
+            order_rows=[{"order_row": i, "reason": r} for i, r in sorted(incidents.items())],
+        )
 
     async def _read_order(
         self, row: Order, broker_id: str, min_qty: dict[str, Decimal], deadline: float

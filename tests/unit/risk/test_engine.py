@@ -193,6 +193,8 @@ def make_engine_(
     cls: type[RiskEngine] = RiskEngine,
     ledger: Accounting | None = None,
     healthy: bool = True,
+    order_visibility_allowance_s: float = 60.0,
+    order_resolution_timeout_s: float = 80.0,
 ) -> RiskEngine:
     engine = cls(
         broker,
@@ -207,6 +209,8 @@ def make_engine_(
         clock=clock or Clock(NOW),
         io_timeout_s=io_timeout_s,
         monotonic=time.monotonic if monotonic is None else monotonic,
+        order_visibility_allowance_s=order_visibility_allowance_s,
+        order_resolution_timeout_s=order_resolution_timeout_s,
     )
     if healthy:  # a fresh loop snapshot and a reconciled cash step (spec 2026-11-09 4, 5.2)
         engine.last_snapshot_at = (time.monotonic if monotonic is None else monotonic)()
@@ -1773,13 +1777,22 @@ async def test_sync_orders_reads_every_unsettled_row_once(
                 await repo.update_order(s, r.id, status=status, now=NOW, broker_order_id=broker_id)
             return r.id
 
-        unknown = await row("unknown", None)  # 1.5d's resolver: not read
+        unknown = await row("unknown", None)  # the resolver's type (a): not read
         never = await row("not_submitted", None)  # local final: no broker call
         ghost = await row("new", "sim-404")  # the broker does not know it
         same_symbol = await row("new", direct.order_id)  # second BTC row: rules cached
 
+    # The read step alone (check()'s) reports the ghost as unreadable ...
+    assert (await engine._sync(time.monotonic() + 10)).failed == (ghost,)
+    # ... the full pass resolves it: NULL client ids carry no ownership proof, so the ghost
+    # and the id-less unknown row become incidents, and an incident leaves `failed`.
     first = await engine.sync_orders()
-    assert first.failed == (ghost,)
+    assert first.failed == ()
+    assert [(x.order_row_id, x.action, x.reason) for x in first.resolutions] == [
+        (unknown, "incident", "no_ownership_proof"),
+        (ghost, "start_clock", None),
+        (ghost, "incident", "no_ownership_proof"),
+    ]
     by_row = {u.order_row_id: u for u in first.updates}
     assert unknown not in by_row
     assert (by_row[never].status, by_row[never].min_qty) == ("not_submitted", None)
