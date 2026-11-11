@@ -401,7 +401,49 @@ async def test_type_b_lookup_failed_incident_is_repairable(
     assert booked.incident is None
 
 
-# --- not_submitted (5.3) ------------------------------------------------------------------
+async def test_a_queued_read_never_books_a_row_whose_incident_committed_first(r: Rig) -> None:
+    """PR #35 review: the reverse of `test_type_b_incident_after_check_cleared_the_clock_
+    is_dropped`. A successful read (fills + `clear_clock`) is queued; another pass commits
+    the incident first. Applying the queued result must book nothing on that row and keep
+    the symbol's later rows held back until `repair link` (D20.10)."""
+    row, oid = await tr.acked_entry(r)
+    later_cid = await own_cid(r.sessions, 99)
+    later_oid = await submit(r.sim, later_cid)
+    later = await tr.insert_row(r.sessions, cid=later_cid, status="new", broker_order_id=later_oid)
+    r.sim.forget(oid)
+    await r.sync_at(0)  # starts the type (b) clock
+    r.sim.unforget(oid)
+    r.sim.process_bar(tr.bar(31, BTC))  # both orders fill
+    r.clock.now = NOW + 40 * SEC
+    queued = await r.engine.sync_orders()  # reads both: fills + clear_clock, not yet booked
+    assert {u.order_row_id for u in queued.updates} == {row, later}
+    r.sim.forget(oid)
+    await r.sync_at(80)  # another pass commits the incident first
+    assert (await tr.order(r.sessions, row)).incident == "lookup_inconsistent"
+
+    with capture_logs() as logs:
+        await r.ledger.apply_all(queued)
+
+    marked = await tr.order(r.sessions, row)
+    assert (marked.incident, marked.settled_at, marked.filled_qty) == (
+        "lookup_inconsistent",
+        None,
+        D(0),
+    )
+    assert (await tr.order(r.sessions, later)).settled_at is None  # held back behind it
+    assert [e["order_row"] for e in logs if e["event"] == "ledger.update_deferred"] == [later]
+    async with r.sessions() as s:
+        assert list(await s.scalars(select(m.Fill))) == []
+
+    r.sim.unforget(oid)
+    await do(r, await prepare_link(r.sessions, row, oid, lookup_of(r.sim)))
+    await r.sync_at(82)
+    for settled in (row, later):
+        booked = await tr.order(r.sessions, settled)
+        assert booked.settled_at is not None and booked.filled_qty == booked.qty
+
+
+# --- not_submitted (5.3)------------------------------------------------------------------
 
 
 async def test_not_submitted_then_sync_settles_with_zero_fill(r: Rig) -> None:

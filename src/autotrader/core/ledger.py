@@ -41,6 +41,10 @@ type (b) incident only while `resolve_since` still holds the clock its decision 
 clock start never moves an existing clock, and a clear only erases the clock it observed. A
 write that matched no row writes nothing and publishes nothing.
 
+Booking never touches an incident row: `_book` checks `incident` inside its own transaction
+and defers, so an update read before the incident committed books nothing and the row keeps
+holding back its symbol's later rows until an operator repair clears it (D20.10).
+
 Money columns are text on SQLite, so Decimal values are compared in Python, never in SQL.
 """
 
@@ -514,6 +518,11 @@ class Ledger:
         if order is None:
             raise LookupError(f"no order row {u.order_row_id}")
         unit.cycle_id = order.cycle_id
+        if order.incident is not None:
+            # Read inside the booking transaction: an update read before the incident
+            # committed (check() and the sync loop overlap) must not book it. Only an
+            # operator repair clears it (D20.10); deferring holds the symbol's later rows.
+            raise _Deferred(f"order row {order.id} is an open incident ({order.incident})")
         booked = {
             r.broker_fill_id: r
             for r in await session.scalars(select(FillRow).where(FillRow.order_id == order.id))
