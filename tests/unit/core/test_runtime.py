@@ -2014,10 +2014,14 @@ async def test_readiness_cannot_open_admission_after_close_began(
     configure_logging(stream=buf)
     in_ready, release = asyncio.Event(), asyncio.Event()
     opened: list[int] = []
+    answered: list[int] = []
 
     async def late_ready(self: AdmissionReadiness) -> bool:
         in_ready.set()
         await release.wait()
+        if answered:  # True once only: later ticks must not depend on timing
+            return False
+        answered.append(1)
         return True
 
     real_open = CycleRunner.open_admission
