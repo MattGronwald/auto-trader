@@ -55,7 +55,9 @@ Open admission logs `cycle.admission_open` (info). If it is still closed 3 x the
 after the start (3 min by default), `cycle.admission_waiting` (warning) logs `unmet` (the open
 conditions), `positions` (the open positions that are not `evaluated` or `latched`, with their
 outcome) and `short` (symbols failing the holdings check), then repeats every 10 min while
-admission stays closed. Until it opens, a candidate is dropped with `cycle.dropped`
+admission stays closed. It is never logged while admission is disabled (`ready()` returns
+before any logging); the `cycle.admission_disabled` startup line is the signal then. Until it
+opens, a candidate is dropped with `cycle.dropped`
 (`admission disabled: ...` or `startup reconciliation pending`).
 
 ### Admission disabled
@@ -94,7 +96,13 @@ exit. Check `mode` against `ALPACA_PAPER` in `.env`; nothing runs until they agr
     check reports `holdings short`; that needs the manual journal correction described there.
   - `failed`: the position's step raised (`positions.step_failed`, with the traceback) or its
     trigger could not be latched. A position whose exit keeps raising stays `failed` and keeps
-    admission closed until it is exited or the cause is fixed.
+    admission closed until it is exited or the cause is fixed. An exit that is only REJECTED
+    (`exit()` returns `rejected` or `not_submitted`) does not raise: the position stays
+    `latched`, the Position Manager backs off and logs `positions.exit_failing`, and admission
+    is not blocked by it.
+- **`no position manager step since the cash check`** (`unmet`): transient, clears on the next
+  `positions.manage` step. If it persists, look for `positions.manage` stalls or
+  `positions.step_failed`.
 - **`holdings short`** (`admission.holdings_short`, error: `symbol`, `journal_qty`, `dust`,
   `broker_qty`): the journal claims more than the broker holds. Investigate (a manual sale, a
   missed fill, a withdrawal) and correct the journal by hand; this includes a dust-only symbol
@@ -112,7 +120,8 @@ Known costs (revisited in WP 1.6):
 - An exit left unsettled after the cash check (an incident, or a sell that never settles) keeps
   admission closed until it settles or is repaired.
 - A latched position whose exit attempts keep raising reports `failed` and keeps admission
-  closed.
+  closed. One whose exits are rejected (`rejected` or `not_submitted`, logged
+  `positions.exit_failing`) reports `latched` and does not block admission.
 - `cycle.admission_waiting` repeats every 10 min and names the current causes, including
   unsettled order rows; the per-cause lines (`admission.holdings_short`, `positions.*`,
   `risk.cash_fault_set`) have the details.
