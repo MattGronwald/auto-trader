@@ -571,7 +571,9 @@ class RiskEngine:
                 )
             )
             incidents[row.id] = reason
-            if kind == "b":  # D20.5: an incident blocks only its own symbol
+            # D20.5: the incident itself blocks only its own symbol (after a restart the
+            # skipped cash check still blocks every symbol, PLAN D20 note 2026-11-11)
+            if kind == "b":
                 failed.remove(row.id)
         self._remind(incidents)
         return SyncResult(

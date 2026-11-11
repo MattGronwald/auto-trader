@@ -206,7 +206,11 @@ for (a), or from the first `OrderNotFound` (persisted as `resolve_since`, restar
 Past it, or at once on a mismatch, the row becomes an incident: `risk.order_incident` (error),
 an `OrderIncident` event, and a reminder `risk.order_incident_open` every 60 s while it is
 unsettled. While a (b) row is within its bound, entries fail closed on all symbols; afterwards
-only its own symbol is blocked, like an (a) incident. Symptoms you may also see:
+the incident itself blocks only its own symbol, like an (a) incident. That holds only while the
+core keeps running: after a restart (and every repair needs one, the core must be stopped) the
+cash check is `skipped` while any row is unsettled, so `cash reconciliation failed` rejects
+entries on **every** symbol until all incidents are repaired, their rows settled and one cash
+check completes (see "Entries rejected"). Symptoms you may also see:
 `positions.exit_unresolved`, `positions.entry_unresolved`, `"unresolved": true` in
 `flatten_result.remaining.orders`.
 
