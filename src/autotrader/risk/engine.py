@@ -81,6 +81,7 @@ from autotrader.broker.base import (
     Account,
     Broker,
     BrokerOrder,
+    BrokerOrderView,
     DustRemainder,
     Fill,
     Mode,
@@ -174,6 +175,15 @@ class OrderResult:
 
 def _dec(value: float | None) -> Decimal | None:
     return None if value is None or not math.isfinite(value) else Decimal(str(value))
+
+
+async def read_order_by_client_id(
+    broker: Broker, client_order_id: str, *, timeout_s: float
+) -> BrokerOrderView | None:
+    """The `repair link` broker read (spec 5.2): the CLI hands its broker here, so only this
+    module holds a `Broker` (SPEC 0.1) and `core/repair.py` gets a lookup callable. Raises
+    `TimeoutError` past `timeout_s`; broker errors propagate."""
+    return await asyncio.wait_for(broker.get_order_by_client_id(client_order_id), timeout_s)
 
 
 class RiskEngine:

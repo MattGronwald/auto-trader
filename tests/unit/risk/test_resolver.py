@@ -29,7 +29,7 @@ from autotrader.core.types import Bar, Quote
 from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
-from autotrader.risk.engine import OrderResult, RiskEngine
+from autotrader.risk.engine import OrderResult, RiskEngine, read_order_by_client_id
 from autotrader.risk.resolve import entry_client_id
 from autotrader.risk.types import ExitRequest, SyncResult
 from tests.health import seed_baseline
@@ -777,3 +777,30 @@ async def test_resolver_never_sets_not_submitted(
         ("unknown", "not_found"),
         ("unknown", "lookup_failed"),
     ]
+
+
+# --- read_order_by_client_id: the repair CLI's broker read (spec 5.2) ---------------------
+
+
+async def test_read_order_by_client_id_finds_the_order(r: Rig) -> None:
+    cid = entry_client_id(await jid_of(r.sessions), 9)
+    ack = await r.sim.submit_order(
+        BrokerOrder(symbol=BTC, side="buy", qty=D("0.01"), type="market", client_order_id=cid)
+    )
+    view = await read_order_by_client_id(r.sim, cid, timeout_s=5)
+    assert view is not None and (view.order_id, view.client_order_id) == (ack.order_id, cid)
+
+
+async def test_read_order_by_client_id_returns_none_for_a_miss(r: Rig) -> None:
+    assert await read_order_by_client_id(r.sim, "at-00000000-c1-e", timeout_s=5) is None
+
+
+class HangingLookup(SimBroker):
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        await asyncio.Event().wait()
+        return None
+
+
+async def test_read_order_by_client_id_times_out() -> None:
+    with pytest.raises(TimeoutError):
+        await read_order_by_client_id(make_sim(HangingLookup), "at-00000000-c1-e", timeout_s=0.01)
