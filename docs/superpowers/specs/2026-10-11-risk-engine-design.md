@@ -128,6 +128,7 @@ Nothing else: no gate, no pause, no rate limit (G1). The resulting action is the
 fee-reduced quantity of G10 and precision mismatches. Partial exits are out of scope.
 *Update 2026-10-12 (WP 1.R1a):* `exit()` reads positions from the broker only
 (`_broker_positions`, unpriced) and never touches the feed, so a broken feed can't block it.
+*Update 2026-11-11 (WP 1.5d-2, D20):* the exit action is no longer `close_position`: `exit()` sends a market sell of the broker position's free qty (`qty_available`) via `submit_order` with a client id (spec `2026-11-10-order-resolver-repair-design.md` 2). Passages below that name `close_position` or an exit without a client id describe the 1.3 design.
 
 ## 6. Engine flow (`risk/engine.py`)
 
@@ -175,6 +176,7 @@ its own broker calls with a separate budget. Broker-side request timeouts in
 3. Approved: insert the `orders` row first, `status = pending`, with the deterministic
    `client_order_id = "at-c{cycle_id}-e"`. The unique column means a cycle can never
    submit a second entry, even if the Cycle Runner retries.
+   *Update 2026-11-11 (WP 1.5d-2, D20):* new entry ids are `at-{jid}-c{cycle_id}-e`, namespaced by the journal id (`control_state.journal_id`); the unique-per-cycle property is unchanged. Ids in the old form `at-c{cycle_id}-e` stay in the journal and count as having no ownership proof.
 4. Ask the gate again immediately before submitting; a kill or pause that arrived during
    gathering marks the order `not_submitted` and returns. A gate that raises or times out
    counts as "not allowed" (`not_submitted`, reason `gate unavailable: <error type>`). (Status values fit the
@@ -185,12 +187,14 @@ its own broker calls with a separate budget. Broker-side request timeouts in
    - any other exception (timeout, network) → `status = unknown`. The order may exist at
      the broker; WP 1.5 reconciliation resolves it by `client_order_id`. Until then it
      counts as an open entry order for checks 5, 8 and 9.
+     *Update 2026-11-11 (WP 1.5d-2, D20):* the bounded resolver in `sync_orders` (client-id lookup, 80 s bound, operator incidents) now does this; it never marks `not_submitted` by itself.
 
 ### `exit(request) -> ExitResult`
 No gate check. Gather the symbol's position and asset rules (no price needed), `check_exit`, persist (kind `exit`),
 insert the `orders` row (no `client_order_id`: `Broker.close_position(symbol)` takes none,
 so an acked exit is identified by its `broker_order_id`), `close_position`, record the outcome as above. The caller retries
 failed exits; a stop that failed must be attempted again.
+*Update 2026-11-11 (WP 1.5d-2, D20):* exits now carry `client_order_id = at-{jid}-o{row_id}` (set right after the row insert, when the row id is known) and are sent with `submit_order`, so the claim above that an exit has no client id is superseded.
 
 Retries are safe: every `exit()` re-reads the live position from the broker, and spot
 brokers refuse to sell more than the free quantity (`SimBroker` does; for Alpaca this is

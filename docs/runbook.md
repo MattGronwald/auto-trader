@@ -7,7 +7,7 @@ Requirements live in `SPEC.md`, delivery status in `PLAN.md`.
 The examples assume the default `config.yaml` (journal `data/autotrader.db`, SQLite). Run SQL with
 `sqlite3 data/autotrader.db`. Never delete journal rows; change only the columns a procedure names.
 
-## Current limits (WP 1.5d-1)
+## Current limits (WP 1.5d-2)
 
 - `run core` connects `AlpacaBroker`, which cannot place orders until WP 1.6: its order methods
   raise `OrderMethodsUnavailable` and `can_place_orders()` is false. The Position Manager still
@@ -17,9 +17,13 @@ The examples assume the default `config.yaml` (journal `data/autotrader.db`, SQL
 - `run core` places no entries until the Cycle Runner is wired in WP 1.5d-3 (it calls no
   `check()` yet). The rejection reasons in "Entries rejected" below are enforced by
   `RiskEngine.check()` and apply once it is wired.
-- An exit or entry left `pending`/`unknown` without a broker order id is never retried and never
-  resolved automatically until the 1.5d resolver. Use the manual procedure below.
-- Recovering from an `oversell` anomaly needs journal-repair tooling that WP 1.5d owns (see below).
+- An order the engine cannot account for (no broker id, or one the broker no longer knows) is
+  looked up by its client id for 80 s, then becomes an incident. The resolver never marks
+  `not_submitted` by itself and never retries the order: the operator repairs it with
+  `autotrader repair` (see "Resolving an order incident"). On `AlpacaBroker` the lookup, and so
+  `repair link`, is unavailable until WP 1.6; no such rows exist before then.
+- Recovering from an `oversell` anomaly is `autotrader repair oversell` (see "Manual coins in a
+  traded symbol").
 - An external sale that failed is retried only after the order-sync loop has settled the failed
   row, so external retries run every max(backoff, about 2 s).
 - An entry on a symbol with an unsettled sell row (an external sale included) is rejected by
@@ -40,7 +44,7 @@ no `check()` until WP 1.5d-3, so today these describe what the engine will do.
 | `daily-loss baseline unavailable` | No equity snapshot in [trading-day start - 120 s, trading-day start] (2 x the 60 s snapshot interval). | The next trading day that has such a snapshot. Nothing to fix. |
 | `equity snapshot overdue` | The snapshot loop has not committed a snapshot yet in this process, or the last one is older than 120 s. | A snapshot loop commit (within 60 s once the loop is healthy). |
 | `cash reconciliation failed` | The ledger cash check has not completed since startup, or its guard, snapshot or check stage raised. | A completed cash check with result baseline, ok or discrepancy (not `skipped`). After a `CommitUncertain` error it holds until the core is restarted. A completed check can also be `skipped`: the ledger skips the comparison when any order row has `settled_at` NULL (at either guard read) or the order/fill generation (`max(orders.id)`, fill watermark) moved between the reads. A skipped check neither sets nor clears the fault and logs no `ledger.cash_check_failed`, so after a restart one stuck unsettled row keeps entries rejected. Find it with `SELECT id, symbol, side, status FROM orders WHERE settled_at IS NULL;` and settle it (see below). |
-| `unsettled sell on <SYM>` | An order row with side `sell` and `settled_at` NULL exists on that symbol. | The ledger settles the row. A `pending`/`unknown` sell without a broker id stays until the 1.5d-2 resolver or the manual procedure below settles it. |
+| `unsettled sell on <SYM>` | An order row with side `sell` and `settled_at` NULL exists on that symbol. | The ledger settles the row. A `pending`/`unknown` sell without a broker id is linked by the resolver, or becomes an incident that stays until `autotrader repair` (see "Resolving an order incident") settles it. |
 
 Pre-submit re-check: a fault, an overdue snapshot or `trading day changed` that appears after
 the gather but before the broker call marks the order row `not_submitted` (log
@@ -141,9 +145,10 @@ broker cannot trade). `remaining` holds:
 - `positions`: `[{position_id, symbol, qty}]`, the open journal positions;
 - `holdings`: `[{symbol, qty}]`, the non-dust broker holdings, or `"unavailable"` when the broker
   read failed;
-- `orders`: `[{order_row_id, symbol, side, status, age_s, unresolved, anomaly}]`, every unsettled
-  order row. `unresolved` is true for a `pending`/`unknown` row without a broker id; `anomaly` is
-  the row's latest ledger anomaly kind, or null.
+- `orders`: `[{order_row_id, symbol, side, status, age_s, unresolved, incident, anomaly}]`, every unsettled
+  order row. `unresolved` is true for a `pending`/`unknown` row without a broker id and for any
+  order incident; `incident` is the row's incident reason or null; `anomaly` is the row's latest
+  ledger anomaly kind, or null.
 
 Read it with:
 
@@ -173,70 +178,129 @@ it also latches `kill` on every open position, including one opened by a late fi
 external holdings. Without it, positions keep normal stop/TP/time/trailing management. After
 `kill --clear` no further cancels are sent; exits already latched still complete.
 
-## Resolving an unresolved order by hand
+## Resolving an order incident
 
-Symptoms: `positions.exit_unresolved` (every 60 s, with `order_rows`), `positions.entry_unresolved`,
-or `"unresolved": true` in `flatten_result.remaining.orders`. The row is `pending` or `unknown`
-with no `broker_order_id`: the request may or may not have reached the broker. The order-sync loop
-skips such rows and the Position Manager never retries them, so until the 1.5d resolver exists an
-operator decides.
+Every order carries a client id, so the engine can find it at the broker even when the submit
+response was lost. Entries use `at-{jid}-c{cycle_id}-e`, exits `at-{jid}-o{order_row_id}`; `jid`
+is the journal's own 8-hex id (`control_state.journal_id`), so ids of another journal or the
+legacy `at-c<cycle>-e` form are never taken as ours. Exits are sent with `submit_order` for the
+free qty (`qty_available`) of the broker holding, not with `close_position`; a holding fully
+reserved by pending sells rejects the exit (`reserved by pending sells in <SYM>`) until they
+settle. A journal without a `journal_id` row (hand-deleted) fails entries closed
+(`state unavailable`); exits still go out without a client id and log `risk.journal_id_missing`.
 
-1. Stop the core (Ctrl-C) so nothing writes while you work.
-2. Read the row:
+### What the resolver does
+
+The ledger's 2 s sync pass (`RiskEngine.sync_orders`; `check()` only reads its result) resolves
+two kinds of unsettled row:
+- (a) `pending`/`unknown` with no broker id and no submit call in flight;
+- (b) a row with a broker id whose `get_order` raised `OrderNotFound`.
+
+It looks the order up by client id. A match on symbol, side, qty and creation time (5 minutes of
+skew) links the row (`risk.order_resolved`, `OrderResolved` event; the next read books its fills
+and settles it). A zero match or a failed lookup waits: the bound is 80 s from `submitted_at`
+for (a), or from the first `OrderNotFound` (persisted as `resolve_since`, restart-safe) for (b).
+Past it, or at once on a mismatch, the row becomes an incident: `risk.order_incident` (error),
+an `OrderIncident` event, and a reminder `risk.order_incident_open` every 60 s while it is
+unsettled. While a (b) row is within its bound, entries fail closed on all symbols; afterwards
+only its own symbol is blocked, like an (a) incident. Symptoms you may also see:
+`positions.exit_unresolved`, `positions.entry_unresolved`, `"unresolved": true` in
+`flatten_result.remaining.orders`.
+
+The resolver never sets `not_submitted`: a lookup that finds nothing is no proof that an order
+can never be accepted or become visible (PLAN.md section 3.2 item 4).
+
+| Incident reason | Meaning | Repair |
+|---|---|---|
+| `no_ownership_proof` | The row has no client id of this journal (NULL or legacy form), so no lookup was made. | Manual procedure below. |
+| `client_id_mismatch` | The broker has an order under our client id that differs from the row (symbol, side, qty, time, or broker id). A broker inconsistency. | Find out which is right; `repair link` only if it matches after all, else escalate. |
+| `not_found` | Zero match until the bound. The order may still exist. | Investigate at the broker, then `repair link` (found) or `repair not-submitted` (authoritative evidence). |
+| `lookup_failed` | The lookups raised until the bound (or the budget ran out), so nothing was learned. | Same as `not_found`. |
+| `lookup_inconsistent` | (b) only: `get_order` says not found while the client-id lookup finds the order, until the bound. | `repair link` with the broker id the lookup reports. |
+
+An open incident keeps the row's reservation and blocks flat. It also holds back every later
+booking on its symbol until repaired, the fills of a later exit included: the broker may have
+sold while the journal position stays open and the cash check reports `skipped`. This is
+deliberate (booking a later exit before an unresolved earlier order gives anomalies or a wrong
+P&L). It books nothing wrong.
+
+### Repair commands
+
+Stop the core first (Ctrl-C). Each command takes the journal lock and refuses with `core is
+running` (exit 1) otherwise.
+
+```
+uv run autotrader repair link <order_row> <broker_order_id> --evidence "..."
+uv run autotrader repair not-submitted <order_row> --evidence "..."
+uv run autotrader repair oversell <order_row> --evidence "..."
+```
+
+All take `--evidence TEXT` (required: what you checked and when), `--yes` (skip the confirmation)
+and `--config/-c`. Each prints the row before and after, asks to confirm, then writes the row
+change and an `OperatorRepair` event (`action`, `order_row_id`, `before`, `after`, `evidence`,
+`operator`) in one unit. Exit 0 done, 1 refused (reason printed), 2 usage. A repair never
+resumes the manual pause.
+
+1. Read the row and its incident:
    ```sql
-   SELECT id, symbol, side, qty, status, submitted_at, client_order_id, external
+   SELECT id, symbol, side, qty, status, submitted_at, client_order_id, broker_order_id,
+          incident, incident_at, external
    FROM orders WHERE id = <row>;
+   SELECT ts, payload FROM events WHERE type = 'OrderIncident' ORDER BY id;
    ```
-3. Look for the order at the broker. Entries carry `client_order_id`; exits carry none
-   (`close_position` takes no id), so match an exit by symbol, side `sell`, qty and a time close
-   to `submitted_at`.
-4. Record the outcome on the row:
-   - **Found at the broker:** set its id and leave the status; the next sync pass reads the order,
-     books its fills and settles it.
-     ```sql
-     UPDATE orders SET broker_order_id = '<broker id>' WHERE id = <row>;
-     ```
-   - **Not found at the broker:** leave the row unresolved (`pending` / `unknown`, no
-     `broker_order_id`) and escalate it as an operator incident. Absence is not proof: most of
-     these rows are `unknown`, which the engine records after a timeout or a network error,
-     exactly the case where the order may have reached the broker and is not visible yet. Waiting
-     alone does not change that. Wait at least 15 minutes after `submitted_at` before concluding
-     anything (an investigation delay, nothing more), then record what you checked, each with
-     the time you checked it: the broker's full order history, open and closed (entries by
-     `client_order_id`, exits by symbol, side, qty and time); fills and activities for the symbol
-     from `submitted_at` on; the broker position qty against the journal (the open journal
-     position's qty plus any `symbol_dust`). If the broker position changed by the row's qty,
-     the order executed: find its broker id and use the **Found** branch.
+2. Look for the order at the broker (its full order history, open and closed): by client id, or
+   for a row without one by symbol, side, qty and a time close to `submitted_at`. Absence is not
+   proof: most of these rows are `unknown`, which the engine records after a timeout or a network
+   error, exactly the case where the order may have reached the broker and is not visible yet.
+   Wait at least 15 minutes after `submitted_at` before concluding anything (an investigation
+   delay, nothing more). Also check fills and activities for the symbol from `submitted_at` on,
+   and the broker position qty against the journal (the open journal position's qty plus any
+   `symbol_dust`). If the position changed by the row's qty, the order executed: find its id.
+3. **Found at the broker:** `repair link <row> <broker_order_id>`. It reads the order (read-only)
+   and requires the broker order's client id to equal the row's, plus symbol, side, qty and the
+   5-minute `created_at` check. It accepts id-less `pending`/`unknown` rows and (b) incident rows
+   (`not_found`, `lookup_failed`, `lookup_inconsistent`, `client_id_mismatch`; the broker id is
+   then replaced, `before` keeps the old one). It refuses lookup misses, mismatches (the
+   differences are printed) and rows without ownership proof; there is no `--force`. It writes
+   `broker_order_id` and clears the incident fields. On `AlpacaBroker` it fails with
+   `broker lookup failed: OrderMethodsUnavailable` until 1.6.
+4. **Not found, with authoritative evidence:** `repair not-submitted <row>`, only for an unsettled
+   `pending`/`unknown` row without a broker id. Use it only with what PLAN.md section 3.2 item 4
+   requires: the original worker is quiescent (the core is stopped) **and** authoritative broker
+   evidence rules out that the order was or will ever be accepted or become visible, such as a
+   broker-confirmed final rejection. A grace window plus a zero-match lookup does not qualify,
+   and neither does an HTTP timeout. The command cannot check the evidence; it records it. The
+   mark is final: the next sync pass settles the row with zero fill and never reads it again,
+   even if a broker id is added later. A wrong mark books permanently wrong (an exit that filled
+   leaves the journal position open against a flat broker, so `positions.exit_failing` repeats
+   and flat never completes; an entry that filled makes its coins look like an external holding
+   that the next flatten sells with no P&L).
+5. **No ownership proof (`no_ownership_proof`):** the CLI refuses `link` here (a wrong link books
+   a foreign order); the operator's own evidence is the proof. With the core stopped and the
+   broker order identified by symbol, side, qty and time, set its id by hand:
+   ```sql
+   UPDATE orders SET broker_order_id = '<broker id>', incident = NULL, incident_at = NULL
+   WHERE id = <row>;
+   ```
+   (`not_submitted` for such a row is `repair not-submitted`, same evidence rule as step 4.)
+6. Start the core again. Confirm the row settles (`settled_at` set) and the incident reminders
+   stop. A row left unrepaired keeps reminding every 60 s and holding back its symbol; that is
+   expected. Resume the manual pause only after this (see "Resuming after a pause").
 
-     The row may be marked `not_submitted` only with what PLAN.md section 3.2 item 4 requires:
-     the original worker is quiescent (the core is stopped, step 1) **and** authoritative broker
-     evidence rules out that the order was or will ever be accepted or become visible, such as a
-     broker-confirmed final rejection or non-acceptance status for that request. A grace window
-     plus a zero-match lookup does not qualify, and neither does an HTTP timeout. A
-     broker-confirmed final status normally comes with a broker order id, which is the
-     **Found** branch, not this one. The mark is final and irreversible: the sync loop settles
-     the row at once with zero fill (`settled_at` set) and never reads it again, even if a broker
-     id is added later; undoing it needs the 1.5d journal-repair tooling. A wrong mark books
-     permanently wrong (an exit that filled leaves the journal position open against a flat
-     broker, so `positions.exit_failing` repeats and flat never completes; an entry that filled
-     makes its coins look like an external holding that the next flatten sells with no P&L).
-     Only with that authoritative evidence in hand:
-     ```sql
-     -- ONLY with authoritative broker evidence of non-acceptance (PLAN.md 3.2 item 4)
-     UPDATE orders SET status = 'not_submitted' WHERE id = <row>;
-     ```
+Undoing `repair not-submitted` is manual and only safe with the core stopped, when the mark was
+wrong and the broker order is identified. Back up `data/autotrader.db` first, then set the broker
+id and the status back (`pending` or `unknown`, as the `OperatorRepair` event's `before` shows):
 
-     The cost of leaving the row unresolved, stated plainly: until the 1.5d resolver exists it
-     blocks flat, retries for that position and later bookings on that symbol. It books nothing
-     wrong, and reservations stay in place.
-5. Start the core again. After a **Found** update (or the fenced mark), confirm the row settles
-   (`settled_at` set) and the alert stops. A row left unresolved keeps alerting every 60 s until
-   the incident is resolved; that is expected.
+```sql
+UPDATE orders SET broker_order_id = '<broker id>', status = '<before status>', settled_at = NULL
+WHERE id = <row>;
+```
 
-With `AlpacaBroker` in 1.5c this cannot arise in production: `can_place_orders()` is false, so
-the Position Manager attempts no exits or cancels, and nothing places entries before 1.5d-3. A
-direct engine call would still fail with `OrderMethodsUnavailable` before anything is sent and be
-recorded `not_submitted`. The sync loop cannot read Alpaca orders yet either.
+This does not undo bookings made after the mark: check the symbol's position, fills and cash
+against the broker by hand and expect to correct them.
+
+With `AlpacaBroker` in 1.5d-2 no order is ever placed (`can_place_orders()` is false, nothing
+places entries before 1.5d-3), so none of this arises in production yet.
 
 ## Accounting for an external sale
 
@@ -258,13 +322,24 @@ SELECT ts, payload FROM events WHERE type = 'ExternalHoldingSold' ORDER BY id;
 
 **Prevention rule: never hold manual coins in a symbol the bot trades.**
 
-A normal exit closes the whole broker-reported position, so it also sells manual coins in that
-symbol. The ledger then sees a sell beyond the position's open qty: the `oversell` anomaly rolls
+A normal exit sells the whole free (`qty_available`) broker-reported holding, so it also sells
+manual coins in that symbol. The ledger then sees a sell beyond the position's open qty: the `oversell` anomaly rolls
 the booking back, sets the manual pause (one `LedgerAnomaly` event, `ledger.anomaly` error log) and
 re-checks the row on every sync pass; while the pause stays set, the repeats write nothing. Resuming
 alone does not recover: the next pass pauses again and writes another `LedgerAnomaly` event with the
 same kind and detail (`ledger.anomaly_repaused` warning), and the row keeps blocking flat.
 
-WP 1.5c ships no repair for this. The journal-repair tooling is WP 1.5d's (PLAN 1.5 row, 1.5b
-follow-up b). Until then, leave the pause set, keep the core's other symbols running, and record
-the broker-side facts (order, fills, how many manual coins) for the repair.
+Recover with `repair oversell` (stop the core first):
+
+```
+uv run autotrader repair oversell <order_row> --evidence "..."
+```
+
+It needs a sell row that is unsettled and whose latest `LedgerAnomaly` is `oversell`. It sets
+`orders.excess_external` and writes an `OperatorRepair` event; no balance is edited. On the next
+core run the ledger books each fill of that row to the position up to what it can still absorb
+(open qty plus carried dust), and the rest as external: the split is stored per fill
+(`fills.external_qty`). The position closes, the external part is published as
+`ExternalHoldingSold` (account for it by hand, see above), and no new anomaly is raised. The
+manual pause stays set: resume it (see "Resuming after a pause") only after the row settled and
+you recorded the broker-side facts (order, fills, how many manual coins).
