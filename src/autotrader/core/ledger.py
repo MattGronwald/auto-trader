@@ -37,9 +37,10 @@ Each is a conditional `UPDATE` whose guard lives in its `WHERE` clause (never a 
 before the write: another session may commit between the two): a link only on a
 `pending`/`unknown` row with no broker id, no incident and no settlement (`OrderResolved`); an
 incident only once (`OrderIncident`), a type (a) incident only while the row is still
-`pending`/`unknown` with no broker id, and a type (b) incident only while `resolve_since` still holds the clock its decision observed; a
-clock start never moves an existing clock, and a clear only erases the clock it observed. A
-write that matched no row writes nothing and publishes nothing.
+`pending`/`unknown` with no broker id, and a type (b) incident only while `resolve_since`
+still holds the clock its decision observed; a clock start never moves an existing clock, and
+a clear only erases the clock it observed. A write that matched no row writes nothing and
+publishes nothing.
 
 Booking never touches an incident row: `_book` checks `incident` inside its own transaction
 and defers, so an update read before the incident committed books nothing and the row keeps
