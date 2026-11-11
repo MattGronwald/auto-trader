@@ -6,7 +6,10 @@ reason is what gets persisted. Order: 1 control and mode, the caller's fault rea
 5a unsettled sell on the symbol, 5 positions, 6 stop, 7-11 sizing and limits. The
 fault, baseline and unsettled-sell rejections never set a pause.
 `check_exit` is reduce-only (G1): it never looks at control state,
-pauses or rate limits, so a stop-out can't be blocked.
+pauses or rate limits, so a stop-out can't be blocked. It sizes from the free qty
+(`qty_available`, held minus open sells), so it never asks to sell what a pending sell
+already reserves; a holding reserved in full is refused, not treated as dust. Entry
+client ids carry the journal id (`at-{jid}-c{cycle}-e`, `resolve.entry_client_id`).
 """
 
 from collections.abc import Sequence
@@ -15,6 +18,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from autotrader.broker.base import BrokerOrder, FeeSchedule
 from autotrader.core.config import StrategyProfile
 from autotrader.core.kill import ControlStatus
+from autotrader.risk.resolve import entry_client_id
 from autotrader.risk.types import (
     EntryIntent,
     ExitRequest,
@@ -65,6 +69,7 @@ def check_entry(
     profile: StrategyProfile,
     control: ControlStatus,
     mode_matches: bool,
+    journal_id: str,
     faults: tuple[str, ...] = (),
 ) -> RiskDecision:
     limits = profile.risk
@@ -126,7 +131,9 @@ def check_entry(
             f"stop distance {distance} outside {limits.min_stop_atr}-"
             f"{limits.max_stop_atr} x ATR {market.atr}"
         )
-    return _size_and_finish(intent, portfolio, market, profile, entry, distance, last_trade)
+    return _size_and_finish(
+        intent, portfolio, market, profile, entry, distance, last_trade, journal_id
+    )
 
 
 def _size_and_finish(
@@ -137,6 +144,7 @@ def _size_and_finish(
     entry: Decimal,
     distance: Decimal,
     last_trade: Decimal,
+    journal_id: str,
 ) -> RiskDecision:
     limits, rules = profile.risk, market.rules
     taker = market.fees.taker_bps / _BPS
@@ -206,7 +214,7 @@ def _size_and_finish(
         type="limit",
         limit_price=entry,
         time_in_force="ioc",
-        client_order_id=f"at-c{intent.cycle_id}-e",
+        client_order_id=entry_client_id(journal_id, intent.cycle_id),
     )
     return RiskDecision(
         approved=True,
@@ -235,4 +243,9 @@ def check_exit(
         return _reject(f"no position to exit in {request.symbol}")
     if position.is_dust:
         return _reject(f"dust only in {request.symbol}")
-    return RiskDecision(approved=True, reasons=(f"exit: {request.reason}",), qty=position.qty)
+    # Sell only what is free: open sells already reserve the rest (the broker refuses more).
+    if position.qty_available < position.min_qty:
+        return _reject(f"reserved by pending sells in {request.symbol}")
+    return RiskDecision(
+        approved=True, reasons=(f"exit: {request.reason}",), qty=position.qty_available
+    )

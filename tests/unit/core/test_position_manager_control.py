@@ -120,18 +120,18 @@ class CannotTrade(SimBroker):
 
 
 class EthCloseRejected(SimBroker):
-    async def close_position(self, symbol: str) -> OrderAck:
-        if symbol == ETH:
-            raise OrderRejected(f"no {symbol} today")
-        return await super().close_position(symbol)
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "sell" and order.symbol == ETH:
+            raise OrderRejected(f"no {order.symbol} today")
+        return await super().submit_order(order)
 
 
 class EthAckLost(SimBroker):
     """The ETH close lands at the broker, but its acknowledgement is lost."""
 
-    async def close_position(self, symbol: str) -> OrderAck:
-        ack = await super().close_position(symbol)
-        if symbol == ETH:
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        ack = await super().submit_order(order)
+        if order.side == "sell" and order.symbol == ETH:
             raise RuntimeError("connection reset")
         return ack
 
@@ -139,10 +139,10 @@ class EthAckLost(SimBroker):
 class BtcAckLost(SimBroker):
     """The BTC close raises before reaching the broker: the engine records `unknown`."""
 
-    async def close_position(self, symbol: str) -> OrderAck:
-        if symbol == BTC:
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "sell" and order.symbol == BTC:
             raise RuntimeError("connection reset")
-        return await super().close_position(symbol)
+        return await super().submit_order(order)
 
 
 class RacingEngine(RiskEngine):
@@ -683,6 +683,33 @@ async def test_flat_is_not_reported_while_an_entry_is_unsettled_or_an_exit_unres
     (only,) = result["remaining"]["orders"]
     assert (only["order_row_id"], only["side"], only["unresolved"]) == (btc_sell.id, "sell", True)
     assert await pending_request(h) is not None
+
+
+async def test_flatten_result_reports_incident_rows(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    h = Harness(sessions, bus, sim=make_sim(cls=BtcAckLost))
+    await h.open_position(BTC)
+    entry_row, _ = await h.submit_entry(ETH)  # an ordinary open (resting) row
+    await ask_flatten(h)
+    await h.pm.step()
+    (btc_sell,) = await h.sells(BTC)
+    async with sessions() as session, session.begin():
+        await session.execute(
+            update(m.Order)
+            .where(m.Order.id == btc_sell.id)
+            .values(broker_order_id="b-gone", incident="not_found")
+        )
+    h.clock.advance(10)
+    await h.pm.step()
+    result = await result_of(h)
+    assert result is not None
+    orders = {o["order_row_id"]: o for o in result["remaining"]["orders"]}
+    assert (orders[btc_sell.id]["incident"], orders[btc_sell.id]["unresolved"]) == (
+        "not_found",
+        True,
+    )
+    assert (orders[entry_row]["incident"], orders[entry_row]["unresolved"]) == (None, False)
 
 
 async def test_a_fill_landing_between_the_flat_check_reads_delays_completion(

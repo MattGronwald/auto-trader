@@ -140,6 +140,14 @@ class Order(Base):
     exit_reason: Mapped[str | None] = mapped_column(String(16))
     # WP 1.5c: a sell of a broker holding with no journal position (decision 13).
     external: Mapped[bool] = mapped_column(default=False, server_default=false())
+    # WP 1.5d-2: order resolver. `incident` is the reason an unresolved order needs an
+    # operator (NULL = none), `incident_at` when it was raised, `resolve_since` the start of
+    # the not-found clock. `excess_external`: the sell exceeds the journal position (the
+    # excess is a broker holding without a journal position).
+    incident: Mapped[str | None] = mapped_column(String(24))
+    incident_at: Mapped[datetime | None]
+    resolve_since: Mapped[datetime | None]
+    excess_external: Mapped[bool] = mapped_column(default=False, server_default=false())
 
 
 class Fill(Base):
@@ -161,6 +169,9 @@ class Fill(Base):
     price: Mapped[Decimal]
     fee: Mapped[Decimal]
     ts: Mapped[datetime]
+    # WP 1.5d-2: the part of a sell fill that came from a broker holding without a journal
+    # position (excess_external orders); 0 for every other fill.
+    external_qty: Mapped[Decimal] = mapped_column(default=Decimal(0), server_default="0")
 
 
 class Position(Base):
@@ -284,7 +295,8 @@ class Hypothesis(Base):
 
 
 class ControlState(Base):
-    """Keys: paused, paused_until, kill, mode, cash_check, flatten_requested, flatten_result."""
+    """Keys: paused, paused_until, kill, mode, cash_check, flatten_requested, flatten_result,
+    journal_id (8 hex chars, written once by migration 0007, part of every client order id)."""
 
     __tablename__ = "control_state"
 

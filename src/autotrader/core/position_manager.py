@@ -369,7 +369,9 @@ class PositionManager:
                     "side": o.side,
                     "status": o.status,
                     "age_s": (now - o.submitted_at).total_seconds(),
-                    "unresolved": o.broker_order_id is None and o.status in ("pending", "unknown"),
+                    "unresolved": o.incident is not None
+                    or (o.broker_order_id is None and o.status in ("pending", "unknown")),
+                    "incident": o.incident,
                     "anomaly": anomalies.get(o.id),
                 }
                 for o in unsettled
@@ -605,14 +607,21 @@ class PositionManager:
                 )
 
     def _alert_unsettled(self, key: Key, sells: Sequence[Order], now: datetime) -> None:
+        # An incident row (WP 1.5d-2) is unresolved whatever its broker id: it waits for the
+        # operator, not for the sync loop, so it is never reported as in flight.
         unresolved = [
             r.id
             for r in sells
-            if r.broker_order_id is None and r.status not in ("not_submitted", "rejected")
+            if r.incident is not None
+            or (r.broker_order_id is None and r.status not in ("not_submitted", "rejected"))
         ]
         if unresolved and self._due(self._last_unresolved_log, key, now):
             log.error("positions.exit_unresolved", order_rows=unresolved, **_key_fields(key))
-        in_flight = [r for r in sells if r.broker_order_id is not None and r.status not in FINAL]
+        in_flight = [
+            r
+            for r in sells
+            if r.incident is None and r.broker_order_id is not None and r.status not in FINAL
+        ]
         if (
             in_flight
             and now - min(r.submitted_at for r in in_flight) > STUCK_AFTER

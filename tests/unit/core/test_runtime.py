@@ -1099,7 +1099,14 @@ class HoldingBroker(FakeBroker):
     async def get_positions(self) -> list[Any]:
         if self.release():
             return []
-        return [Position(symbol="BTC/USD", qty=Decimal("0.5"), avg_entry_price=Decimal(100))]
+        return [
+            Position(
+                symbol="BTC/USD",
+                qty=Decimal("0.5"),
+                qty_available=Decimal("0.5"),
+                avg_entry_price=Decimal(100),
+            )
+        ]
 
     async def asset_rules(self, symbol: str) -> AssetRules:
         return AssetRules(

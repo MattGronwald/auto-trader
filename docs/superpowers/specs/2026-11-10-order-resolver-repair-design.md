@@ -137,7 +137,8 @@ lock; that caller does **not** run the resolver, so an entry check never spends 
 client-id lookups and the two callers can never write the same link or incident concurrently
 **(builder call: split `_sync` into the read step both callers use and a resolve step only
 `sync_orders` runs)**. The link and incident writes are still idempotent: each is a conditional
-update (`WHERE broker_order_id IS NULL` / `incident IS NULL`) whose `publish_tx` verify step
+update (`WHERE broker_order_id IS NULL` / `incident IS NULL`; type (a) writes also require
+status `pending`/`unknown`, added 2026-11-11 after the PR #35 review) whose `publish_tx` verify step
 publishes the event only if this unit changed the row. No new loop, no new lock. A row the
 resolver cannot reach within the budget is "not looked up this pass", never a zero match.
 
@@ -160,6 +161,14 @@ in `SyncResult.failed`, so `check()` rejects entries on every symbol (today's be
 becomes an incident it leaves `failed` and blocks only its own symbol, like a type (a) incident:
 the existing unsettled-row rules (open entry, unsettled sell) cover it. Type (a) rows were never in
 `failed` and keep blocking only their symbol.
+
+**Note 2026-11-11 (PR #35 review):** the per-symbol scope holds only within one process. The cash
+check is `skipped` while any row is unsettled (spec 2026-11-09 4.6), and a skipped check never
+clears the engine's startup cash fault (`not yet reconciled`). So after a restart, which every
+repair requires (5.1, core stopped), any open incident keeps `check()` rejecting entries on every
+symbol (`cash reconciliation failed`) until all incidents are repaired, settled and one cash check
+completes. This fails closed and is accepted as is; per-symbol blocking across restarts would need
+a different cash check and is not in this WP.
 
 ### 3.3 In flight
 
@@ -266,7 +275,7 @@ restarts.
 ```python
 class BrokerOrderView(_Frozen):
     order_id: str
-    client_order_id: str | None
+    client_order_id: str  # the lookup is by this id, so the broker's order always has one
     symbol: str
     side: Side
     qty: Dec
@@ -307,6 +316,9 @@ id, and otherwise a new `get_order_view(order_id) -> BrokerOrderView` **(builder
   asks for confirmation (`--yes` skips the prompt) **(builder call)**.
 - Each command writes its row change and an `OperatorRepair` event (`action`, `order_row_id`,
   `before`, `after`, `evidence`, `operator` = the local OS user name) in one `publish_tx` unit.
+  *Added 2026-11-11 (PR #35 review):* `link` also records `broker_view`, the broker order the
+  lookup returned; and repair never migrates: it refuses a missing journal file and a schema that
+  is not at head.
 - Exit codes: 0 done, 1 refused (precondition or lock), 2 usage. Refusals print the reason.
 - Repair never resumes the manual pause. The operator resumes it (runbook) after the next core run
   shows the row settled.
@@ -437,7 +449,8 @@ corrected (section 7).
     rejected; an exit on the reserved symbol is rejected `reserved by pending sells` with no row.
 10. Type (b): `get_order` raises `OrderNotFound` for a known id; `resolve_since` persisted;
     entries on every symbol rejected until the deadline; incident at the deadline, after which
-    only its own symbol is blocked and `get_order` is no longer called for it; `repair link`
+    only its own symbol is blocked (until a restart, see the 3.2 note of 2026-11-11) and
+    `get_order` is no longer called for it; `repair link`
     replaces its broker id. With client-id lookups failing through the deadline the incident is
     `lookup_failed`; after the broker recovers, `repair link` links it and the next sync settles it
     (added 2026-11-10, PR #34).

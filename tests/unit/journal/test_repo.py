@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -762,3 +762,13 @@ async def test_last_anomaly_kinds_keep_the_latest_per_row(session: AsyncSession)
         )
     assert await repo.last_anomaly_kinds(session, [1, 3]) == {1: "sell_without_position"}
     assert await repo.last_anomaly_kinds(session, []) == {}
+
+
+async def test_journal_id_reads_the_control_row(session: AsyncSession) -> None:
+    jid = await repo.journal_id(session)
+    assert jid is not None
+    assert await repo.get_control(session, repo.JOURNAL_ID_KEY) == jid
+
+    await session.execute(delete(m.ControlState).where(m.ControlState.key == "journal_id"))
+    await session.commit()
+    assert await repo.journal_id(session) is None

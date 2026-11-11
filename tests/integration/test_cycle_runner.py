@@ -33,6 +33,7 @@ from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
 from autotrader.risk.engine import RiskEngine
+from autotrader.risk.resolve import entry_client_id
 from tests.health import seed_baseline
 
 PROFILE_PATH = Path(__file__).resolve().parents[2] / "strategies" / "fast_momentum_v1.yaml"
@@ -195,6 +196,7 @@ async def test_candidate_reaches_the_broker_and_waits_in_submitted(
     async with sessions() as s:
         (cycle,) = list(await s.scalars(select(m.Cycle)))
         (order,) = list(await s.scalars(select(m.Order)))
+        jid = await repo.journal_id(s)
         events = list(
             await s.scalars(
                 select(m.Event).where(m.Event.cycle_id == cycle.id).order_by(m.Event.id)
@@ -204,7 +206,7 @@ async def test_candidate_reaches_the_broker_and_waits_in_submitted(
     assert (order.cycle_id, order.status, order.client_order_id) == (
         cycle.id,
         "new",
-        f"at-c{cycle.id}-e",
+        entry_client_id(str(jid), cycle.id),
     )
     assert [e.payload["to_state"] for e in events if e.type == "CycleTransitioned"] == [
         "NEW",
@@ -233,8 +235,9 @@ async def test_broker_accepts_then_the_ack_write_fails(
     async with sessions() as s:
         (cycle,) = list(await s.scalars(select(m.Cycle)))
         (order,) = list(await s.scalars(select(m.Order)))
+        jid = await repo.journal_id(s)
     assert (cycle.state, cycle.reject_reason) == ("ERROR", "RISK_CHECK: OperationalError")
-    assert (order.status, order.client_order_id) == ("pending", f"at-c{cycle.id}-e")
+    assert (order.status, order.client_order_id) == ("pending", entry_client_id(str(jid), cycle.id))
     assert (await sim.get_order("sim-1")).status == "new"  # it really is at the broker
 
     with capture_logs() as logs:
@@ -262,10 +265,11 @@ async def test_forced_shutdown_after_broker_acceptance_keeps_the_order_recoverab
     async with sessions() as s:
         (cycle,) = list(await s.scalars(select(m.Cycle)))
         (order,) = list(await s.scalars(select(m.Order)))
+        jid = await repo.journal_id(s)
     assert cycle.state == "RISK_CHECK"
     assert (order.status, order.client_order_id, order.broker_order_id) == (
         "pending",
-        f"at-c{cycle.id}-e",
+        entry_client_id(str(jid), cycle.id),
         None,
     )
     assert broker.submits == 1

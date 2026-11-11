@@ -130,6 +130,7 @@ async def test_crypto_positions_use_slash_symbols(raw_symbol: str) -> None:
             "symbol": raw_symbol,
             "asset_class": "crypto",
             "qty": "0.012345678",
+            "qty_available": "0.012",
             "avg_entry_price": "61234.5",
         },
         {"symbol": "AAPL", "asset_class": "us_equity", "qty": "1", "avg_entry_price": "200"},
@@ -139,6 +140,7 @@ async def test_crypto_positions_use_slash_symbols(raw_symbol: str) -> None:
 
     assert position.symbol == "BTC/USD"
     assert position.qty == Decimal("0.012345678")
+    assert position.qty_available == Decimal("0.012")
     assert position.avg_entry_price == Decimal("61234.5")
 
 
@@ -174,7 +176,15 @@ def test_fee_tiers_match_published_schedule() -> None:
 
 
 async def test_unmappable_position_symbol_is_a_broker_error() -> None:
-    positions = [{"symbol": "WEIRD", "asset_class": "crypto", "qty": "1", "avg_entry_price": "1"}]
+    positions = [
+        {
+            "symbol": "WEIRD",
+            "asset_class": "crypto",
+            "qty": "1",
+            "qty_available": "1",
+            "avg_entry_price": "1",
+        }
+    ]
 
     with pytest.raises(BrokerError, match="WEIRD"):
         await (await connect(FakeClient(positions=positions))).get_positions()
@@ -290,7 +300,9 @@ async def test_malformed_account_payload_is_a_broker_error(account: dict[str, An
 
 
 async def test_malformed_position_payload_is_a_broker_error() -> None:
-    positions = [{"symbol": "BTC/USD", "asset_class": "crypto", "qty": "1"}]  # no avg_entry_price
+    positions = [
+        {"symbol": "BTC/USD", "asset_class": "crypto", "qty": "1", "qty_available": "1"}
+    ]  # no avg_entry_price
 
     with pytest.raises(BrokerError, match="unexpected"):
         await (await connect(FakeClient(positions=positions))).get_positions()
@@ -314,6 +326,7 @@ async def test_order_methods_raise_the_typed_unavailable_error() -> None:
         lambda: broker.close_position("BTC/USD"),
         lambda: broker.cancel_order("x"),
         lambda: broker.get_order("x"),
+        lambda: broker.get_order_by_client_id("x"),
     ]
     for call in calls:
         with pytest.raises(OrderMethodsUnavailable, match=r"is not implemented until WP 1\.6"):

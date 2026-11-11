@@ -2,9 +2,10 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from autotrader.broker.base import AssetRules, BrokerOrder, Dec, FeeSchedule, Fill
+from autotrader.risk.resolve import IncidentReason
 
 
 class _Frozen(BaseModel):
@@ -37,7 +38,10 @@ class ExitRequest(_Frozen):
 
 class HeldPosition(_Frozen):
     symbol: str
-    qty: Dec
+    qty: Dec  # held: exposure and dust use it
+    # Free to sell: held minus the remainders of open sells. Exits size from it; a holding
+    # whose open sells reserve it all is not dust, the exit is refused instead.
+    qty_available: Dec
     # qty x the feed's last price; None when the feed has no price or the symbol is stale,
     # and always None for exits, which read the broker only. Entries fail closed (check 8).
     market_value: Dec | None
@@ -107,11 +111,26 @@ class OrderUpdate(_Frozen):
     min_qty: Dec | None = None  # None only for local finals: no broker call, no fills
 
 
+class OrderResolution(_Frozen):
+    """One order resolver decision for the ledger (spec 2026-11-10, 3.5-3.7). Each is
+    applied by a conditional write: one whose condition no longer holds writes nothing."""
+
+    order_row_id: int
+    action: Literal["link", "incident", "start_clock", "clear_clock"]
+    at: AwareDatetime
+    broker_order_id: str | None = None  # link only
+    reason: IncidentReason | None = None  # incident only
+    # clear_clock and type (b) incidents: the resolve_since the decision observed
+    clock: AwareDatetime | None = None
+
+
 class SyncResult(_Frozen):
-    """One sync pass. `failed` lists order rows whose broker state could not be read."""
+    """One sync pass. `failed` lists order rows whose broker state could not be read;
+    `resolutions` are the order resolver's decisions, applied before the updates."""
 
     updates: tuple[OrderUpdate, ...] = ()
     failed: tuple[int, ...] = ()
+    resolutions: tuple[OrderResolution, ...] = ()
 
     @property
     def complete(self) -> bool:

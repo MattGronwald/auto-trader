@@ -3,7 +3,10 @@
 `check()` gathers state under the entry lock, runs the pure `check_entry`, persists the
 decision, applies a pause side effect on rejection, writes the order row, asks the
 control gate and re-checks engine health right before submitting, then submits. `exit()` is
-reduce-only and ignores kill/pause. Any failure while gathering rejects (fail closed).
+reduce-only and ignores kill/pause; it sells the free qty through `submit_order` like an
+entry does (`close_position` is never called). Every order carries a journal-namespaced client
+id (`risk/resolve.py`); an entry fails closed without the journal id, an exit goes out without
+a client id (logged). Any failure while gathering rejects (fail closed).
 
 Two locks: entries serialise on one, exits on another, and an exit never waits for an
 entry (a stalled journal call inside `check()` cannot block a stop-out). That is safe
@@ -12,10 +15,24 @@ rejects or over-counts it (conservative), and a late IOC fill after a kill-flatt
 happen with or without a shared lock (fills are broker-side); the ledger books it (WP 1.5b)
 and the Position Manager manages it (WP 1.5c).
 
-`check()` first syncs every unsettled order (`sync_orders`) and books it through the ledger
-(`core/ledger.py`, WP 1.5b); an unreadable order, or a symbol whose booking raised in the
-ledger, rejects every entry (`state unavailable: SyncIncomplete`). Exits never sync.
+`check()` first reads every unsettled order (the read step of the sync) and books it through
+the ledger (`core/ledger.py`, WP 1.5b); an unreadable order, or a symbol whose booking raised in
+the ledger, rejects every entry (`state unavailable: SyncIncomplete`). Exits never sync.
 After that sync, a symbol with any unsettled sell row (own or external) rejects its entries.
+
+Order resolver (WP 1.5d-2, spec 2026-11-10 3): only `sync_orders()` (the ledger's sync loop)
+resolves, after the same read step and under the same budget; `check()` only reads. Candidates
+are (a) rows without a broker id that are not locally final (`rejected` / `not_submitted`) and
+not in flight, which in practice means `pending`/`unknown` (no other status is written without a
+broker id; the ledger's type (a) writes require it), and (b) rows whose
+`get_order` raised `OrderNotFound` (clock `resolve_since`, persisted at the first miss and kept
+until a successful read). A row is looked up by its own journal-namespaced client id: a match
+links a type (a) row; a row without ownership proof or with a mismatching hit becomes an
+incident at once; otherwise the row becomes an incident once `order_resolution_timeout_s` has
+passed since `submitted_at` (a) or `resolve_since` (b). A lookup the budget did not reach is
+"not looked up", never a zero match. Incident rows are skipped by the read and by the resolver
+until an operator repairs them; `risk.order_incident_open` reminds every 60 s. The resolver
+never marks a row `not_submitted` (D20.2): a zero match is no proof that an order cannot exist.
 
 Daily-loss baseline (D19, spec 2026-11-09 3): the equity of the latest snapshot observed in
 the `2 x snapshot_interval_s` before the trading-day start; without one, entries are rejected
@@ -38,7 +55,7 @@ order row `not_submitted` (`risk.entry_not_submitted`) and nothing is sent. Exit
 
 Each locked section has ONE budget of `io_timeout_s`, measured from taking its lock and
 shared by its network/gate awaits only (gate.status, get_account, get_positions, each
-asset_rules, get_order and order_fills, submit/close); each is wrapped in `_within`. Journal
+asset_rules, get_order and order_fills, submit_order); each is wrapped in `_within`. Journal
 reads and writes (every `self._sessions()` block, `_write_snapshot`) run outside any `wait_for`, so
 a timeout never cancels a DB session mid-statement or mid-commit; SQLite errors on a
 locked DB after `busy_timeout` (5 s) instead of hanging. A step whose budget is already
@@ -53,11 +70,11 @@ import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable, Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
-from typing import Protocol, TypeVar
+from typing import Literal, Protocol, TypeVar
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -65,11 +82,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from autotrader.broker.base import (
     Account,
     Broker,
+    BrokerOrder,
+    BrokerOrderView,
     DustRemainder,
     Fill,
     Mode,
     OrderAck,
     OrderMethodsUnavailable,
+    OrderNotFound,
     OrderRejected,
 )
 from autotrader.core.config import StrategyProfile
@@ -80,6 +100,7 @@ from autotrader.core.types import Bar, Quote
 from autotrader.journal import repo
 from autotrader.journal.models import Order
 from autotrader.risk.checks import check_entry, check_exit
+from autotrader.risk.resolve import IncidentReason, exit_client_id, mismatches, owns
 from autotrader.risk.types import (
     FINAL,
     CancelResult,
@@ -88,6 +109,7 @@ from autotrader.risk.types import (
     HeldPosition,
     MarketSnapshot,
     OpenEntry,
+    OrderResolution,
     OrderUpdate,
     Pause,
     PortfolioState,
@@ -102,6 +124,27 @@ T = TypeVar("T")
 
 # Final rows that never reached the broker: nothing to read, the ledger settles them.
 _LOCAL_FINAL = ("not_submitted", "rejected")
+# How often `risk.order_incident_open` repeats while any incident row is unsettled.
+_INCIDENT_REMINDER_S = 60.0
+
+
+@dataclass
+class _Read:
+    """The read step of one sync pass: the ledger's `SyncResult` parts plus the resolver's
+    candidates, in row order (`b` = `get_order` raised `OrderNotFound`)."""
+
+    updates: list[OrderUpdate] = field(default_factory=list)
+    failed: list[int] = field(default_factory=list)
+    resolutions: list[OrderResolution] = field(default_factory=list)
+    candidates: list[tuple[Order, Literal["a", "b"]]] = field(default_factory=list)
+    incidents: dict[int, str] = field(default_factory=dict)  # unsettled rows already marked
+
+    def result(self) -> SyncResult:
+        return SyncResult(
+            updates=tuple(self.updates),
+            failed=tuple(self.failed),
+            resolutions=tuple(self.resolutions),
+        )
 
 
 class Accounting(Protocol):
@@ -136,6 +179,15 @@ def _dec(value: float | None) -> Decimal | None:
     return None if value is None or not math.isfinite(value) else Decimal(str(value))
 
 
+async def read_order_by_client_id(
+    broker: Broker, client_order_id: str, *, timeout_s: float
+) -> BrokerOrderView | None:
+    """The `repair link` broker read (spec 5.2): the CLI hands its broker here, so only this
+    module holds a `Broker` (SPEC 0.1) and `core/repair.py` gets a lookup callable. Raises
+    `TimeoutError` past `timeout_s`; broker errors propagate."""
+    return await asyncio.wait_for(broker.get_order_by_client_id(client_order_id), timeout_s)
+
+
 class RiskEngine:
     def __init__(
         self,
@@ -153,6 +205,8 @@ class RiskEngine:
         io_timeout_s: float = 10.0,
         monotonic: Callable[[], float] = time.monotonic,
         snapshot_interval_s: float = 60.0,
+        order_visibility_allowance_s: float = 60.0,
+        order_resolution_timeout_s: float = 80.0,
     ) -> None:
         self._broker = broker
         self._profile = profile
@@ -178,6 +232,26 @@ class RiskEngine:
         self.cash_fault_sticky = False
         self._entry_lock = asyncio.Lock()  # check(): two entries never pass check 5 together
         self._exit_lock = asyncio.Lock()  # exit(): never waits for an entry
+        self._cached_journal_id: str | None = None
+        # Row ids of orders `check()`/`exit()` is handling right now: added once the row is
+        # inserted, dropped when the call returns. The order resolver (spec 2026-11-10) skips
+        # these rows; it never links a row whose submit is still in progress.
+        self._in_flight: set[int] = set()
+        # Order resolver bounds (spec 2026-11-10 3.5): a miss before submit + io timeout +
+        # allowance is expected (debug); an unlinked row becomes an incident at the timeout.
+        self._visibility_allowance = timedelta(seconds=order_visibility_allowance_s)
+        self._resolution_timeout = timedelta(seconds=order_resolution_timeout_s)
+        # Last lookup outcome per candidate row, for the incident reason when a later pass
+        # cannot look it up (spent budget). Per process: after a restart the reason defaults.
+        self._last_outcome: dict[int, IncidentReason] = {}
+        self._incident_logged_at: float | None = None  # monotonic time of the last reminder
+
+    async def _journal_id(self) -> str | None:
+        """The journal's id (client ids embed it), read once and cached when found."""
+        if self._cached_journal_id is None:
+            async with self._sessions() as session:
+                self._cached_journal_id = await repo.journal_id(session)
+        return self._cached_journal_id
 
     # --- health: entry faults (spec 2026-11-09 4, 5.2, 6) ------------------------------
 
@@ -220,7 +294,7 @@ class RiskEngine:
             deadline = self._monotonic() + self._io_timeout
             now = self._clock()
             try:
-                control, portfolio, market, faults = await self._gather_entry(
+                control, portfolio, market, faults, jid = await self._gather_entry(
                     intent.symbol, now, deadline
                 )
             except Exception as e:  # fail closed: unknown state must not allow an entry
@@ -238,6 +312,7 @@ class RiskEngine:
                 control=control,
                 mode_matches=self._mode == self._broker.mode(),
                 faults=faults,
+                journal_id=jid,
             )
             await self._persist(intent.cycle_id, "entry", decision, now)
             if not decision.approved or decision.order is None:
@@ -245,56 +320,68 @@ class RiskEngine:
                 log.info("risk.entry_rejected", symbol=intent.symbol, reason=decision.reasons[0])
                 return OrderResult(decision)
             order = decision.order
-            async with self._sessions() as session:
-                row = await repo.insert_order(
-                    session,
-                    cycle_id=intent.cycle_id,
-                    client_order_id=order.client_order_id,
-                    symbol=intent.symbol,
-                    mode=self._mode,
-                    type_=order.type,
-                    side=order.side,
-                    qty=order.qty,
-                    limit_price=order.limit_price,
-                    stop_price=intent.stop,
-                    tp_price=intent.take_profit,
-                    status="pending",
-                    now=now,
-                )
+            claimed: list[int] = []  # the row id this call put into `_in_flight`
             try:
-                final = await self._within(deadline, lambda: self._gate.status(self._clock()))
-                allowed, reasons = final.entries_allowed, list(final.reasons)
-            except Exception as e:  # an unanswered gate is not an allowed gate
-                allowed, reasons = False, [f"gate unavailable: {type(e).__name__}"]
-            if not allowed:
-                await self._set_status(row.id, "not_submitted")
-                log.warning("risk.entry_not_submitted", reasons=reasons)
-                return OrderResult(decision, row.id, "not_submitted")
-            # Health may have turned bad since the gather (spec 2026-11-09 6.1): synchronous
-            # state and clock reads only, so no await separates this from the submit.
-            late = (
-                *self.health_faults(),
-                *(
-                    ("trading day changed",)
-                    if day_start(self._clock(), self._tz) != day_start(now, self._tz)
-                    else ()
-                ),
-            )
-            if late:
-                await self._set_status(row.id, "not_submitted")
-                log.warning("risk.entry_not_submitted", reasons=list(late))
-                return OrderResult(decision, row.id, "not_submitted")
-            return await self._submit(
-                row.id, decision, deadline, lambda: self._broker.submit_order(order)
-            )
+                async with self._sessions() as session:
+                    row = await repo.insert_order(
+                        session,
+                        cycle_id=intent.cycle_id,
+                        client_order_id=order.client_order_id,
+                        symbol=intent.symbol,
+                        mode=self._mode,
+                        type_=order.type,
+                        side=order.side,
+                        qty=order.qty,
+                        limit_price=order.limit_price,
+                        stop_price=intent.stop,
+                        tp_price=intent.take_profit,
+                        status="pending",
+                        now=now,
+                    )
+                    # Inside the block, before the session closes (an await): see `_in_flight`.
+                    # The `finally` below covers that close too: a cancel there must not leak it.
+                    self._in_flight.add(row.id)
+                    claimed.append(row.id)
+                try:
+                    final = await self._within(deadline, lambda: self._gate.status(self._clock()))
+                    allowed, reasons = final.entries_allowed, list(final.reasons)
+                except Exception as e:  # an unanswered gate is not an allowed gate
+                    allowed, reasons = False, [f"gate unavailable: {type(e).__name__}"]
+                if not allowed:
+                    await self._set_status(row.id, "not_submitted")
+                    log.warning("risk.entry_not_submitted", reasons=reasons)
+                    return OrderResult(decision, row.id, "not_submitted")
+                # Health may have turned bad since the gather (spec 2026-11-09 6.1):
+                # synchronous state and clock reads only, so no await separates this from
+                # the submit.
+                late = (
+                    *self.health_faults(),
+                    *(
+                        ("trading day changed",)
+                        if day_start(self._clock(), self._tz) != day_start(now, self._tz)
+                        else ()
+                    ),
+                )
+                if late:
+                    await self._set_status(row.id, "not_submitted")
+                    log.warning("risk.entry_not_submitted", reasons=list(late))
+                    return OrderResult(decision, row.id, "not_submitted")
+                return await self._submit(
+                    row.id, decision, deadline, lambda: self._broker.submit_order(order)
+                )
+            finally:
+                self._in_flight.difference_update(claimed)
 
     async def _gather_entry(
         self, symbol: str, now: datetime, deadline: float
-    ) -> tuple[ControlStatus, PortfolioState, MarketSnapshot, tuple[str, ...]]:
+    ) -> tuple[ControlStatus, PortfolioState, MarketSnapshot, tuple[str, ...], str]:
         """Only the network/gate awaits are budgeted; a timeout raises out of here and
         `check()` turns it into the persisted `state unavailable` rejection. The health
         faults are read first, before the order sync; the gather runs fully either way."""
         faults = self.health_faults()
+        jid = await self._journal_id()
+        if jid is None:  # entries fail closed without the id their client ids embed
+            raise RuntimeError("journal has no journal_id")
         # Book our own orders BEFORE reading positions: a fill the sync observed is then in
         # the journal and in the positions read below (never neither position nor entry).
         synced = await self._sync(deadline)
@@ -395,35 +482,180 @@ class RiskEngine:
             rules=rules,
             fees=fees,
         )
-        return control, portfolio, market, faults
+        return control, portfolio, market, faults, jid
 
     async def sync_orders(self) -> SyncResult:
-        """Read-only broker view of every unsettled order for the ledger (spec 4.2). Takes
-        no lock (never delays an exit) and has its own `io_timeout_s` budget."""
-        return await self._sync(self._monotonic() + self._io_timeout)
+        """Broker view of every unsettled order for the ledger (spec 4.2), then the order
+        resolver's decisions (spec 2026-11-10 3), under ONE `io_timeout_s` budget. Takes no
+        lock (never delays an exit)."""
+        deadline = self._monotonic() + self._io_timeout
+        return await self._resolve(await self._read(deadline), deadline)
 
     async def _sync(self, deadline: float) -> SyncResult:
+        """The read step alone (`check()`): it never spends an entry's budget on lookups."""
+        return (await self._read(deadline)).result()
+
+    async def _read(self, deadline: float) -> _Read:
         """Per-order failures (incl. `OrderNotFound` and a spent budget) are collected,
-        never raised: the caller decides, and `check()` then fails closed."""
+        never raised: the caller decides, and `check()` then fails closed. Incident rows are
+        not read (the operator has them); a successful read of a row with a type (b) clock
+        clears exactly the clock it observed."""
+        now = self._clock()
         async with self._sessions() as session:
             rows = await repo.unsettled_orders(session)
-        updates: list[OrderUpdate] = []
-        failed: list[int] = []
+        read = _Read()
         min_qty: dict[str, Decimal] = {}
         for row in rows:
+            if row.incident is not None:
+                read.incidents[row.id] = row.incident
+                continue
             broker_id = row.broker_order_id
             if broker_id is None:
                 if row.status in _LOCAL_FINAL:
-                    updates.append(
+                    read.updates.append(
                         OrderUpdate(order_row_id=row.id, status=row.status, filled_qty=Decimal(0))
                     )
-                continue  # pending / unknown without an id: the 1.5d resolver's case
+                else:  # not locally final, no id (in practice pending / unknown): type (a)
+                    read.candidates.append((row, "a"))
+                continue
             try:
-                updates.append(await self._read_order(row, broker_id, min_qty, deadline))
-            except Exception:
+                read.updates.append(await self._read_order(row, broker_id, min_qty, deadline))
+            except OrderNotFound:  # the broker no longer knows the id: type (b)
                 log.exception("risk.order_sync_failed", order_row=row.id)
-                failed.append(row.id)
-        return SyncResult(updates=tuple(updates), failed=tuple(failed))
+                read.failed.append(row.id)
+                read.candidates.append((row, "b"))
+            except Exception:  # the order is known, the read failed: not resolution
+                log.exception("risk.order_sync_failed", order_row=row.id)
+                read.failed.append(row.id)
+            else:
+                if row.resolve_since is not None:
+                    read.resolutions.append(
+                        OrderResolution(
+                            order_row_id=row.id,
+                            action="clear_clock",
+                            at=now,
+                            clock=row.resolve_since,
+                        )
+                    )
+        return read
+
+    async def _resolve(self, read: _Read, deadline: float) -> SyncResult:
+        """Decide each candidate (module docstring). Writes nothing: the decisions travel in
+        `SyncResult.resolutions` and the ledger applies each conditionally."""
+        now = self._clock()  # once: a type (b) incident must carry the clock it started
+        jid = await self._journal_id()
+        live = {row.id for row, _ in read.candidates}  # forget rows that left resolution
+        self._last_outcome = {k: v for k, v in self._last_outcome.items() if k in live}
+        resolutions = read.resolutions
+        incidents = dict(read.incidents)
+        failed = read.failed
+        if jid is None and read.candidates:  # a journal fault, not the rows': resolve nothing
+            log.error("risk.journal_id_missing")
+            read.candidates.clear()
+        for row, kind in read.candidates:
+            if kind == "a" and row.id in self._in_flight:  # its submit is still running
+                continue
+            since = now
+            if kind == "b":
+                if row.resolve_since is None:
+                    resolutions.append(
+                        OrderResolution(order_row_id=row.id, action="start_clock", at=since)
+                    )
+                else:
+                    since = row.resolve_since
+            clock = since if kind == "b" else None
+            reason = await self._decide(row, kind, jid or "", since, deadline, now, resolutions)
+            if reason is None:
+                continue
+            resolutions.append(
+                OrderResolution(
+                    order_row_id=row.id, action="incident", at=now, reason=reason, clock=clock
+                )
+            )
+            incidents[row.id] = reason
+            # D20.5: the incident itself blocks only its own symbol (after a restart the
+            # skipped cash check still blocks every symbol, PLAN D20 note 2026-11-11)
+            if kind == "b":
+                failed.remove(row.id)
+        self._remind(incidents)
+        return SyncResult(
+            updates=tuple(read.updates), failed=tuple(failed), resolutions=tuple(resolutions)
+        )
+
+    async def _decide(
+        self,
+        row: Order,
+        kind: Literal["a", "b"],
+        jid: str,
+        since: datetime,
+        deadline: float,
+        now: datetime,
+        resolutions: list[OrderResolution],
+    ) -> IncidentReason | None:
+        """One candidate: appends a link, or returns the incident reason (None = wait)."""
+        cid = row.client_order_id
+        if cid is None or not owns(cid, jid):
+            return "no_ownership_proof"
+        outcome: IncidentReason | None = None  # None: not looked up this pass
+        if deadline - self._monotonic() > 0:
+            try:
+                view = await self._within(
+                    deadline, partial(self._broker.get_order_by_client_id, cid)
+                )
+            except Exception:  # "don't know", never a zero match
+                log.warning("risk.order_lookup_failed", order_row=row.id, exc_info=True)
+                outcome = "lookup_failed"
+            else:
+                if view is None:
+                    outcome = "not_found"
+                elif view.client_order_id != cid or mismatches(
+                    view,
+                    symbol=row.symbol or "",
+                    side=row.side,
+                    qty=row.qty,
+                    submitted_at=row.submitted_at,
+                    broker_order_id=row.broker_order_id if kind == "b" else None,
+                ):
+                    log.error(
+                        "risk.order_lookup_mismatch", order_row=row.id, order_id=view.order_id
+                    )
+                    return "client_id_mismatch"
+                elif kind == "a":
+                    resolutions.append(
+                        OrderResolution(
+                            order_row_id=row.id,
+                            action="link",
+                            at=now,
+                            broker_order_id=view.order_id,
+                        )
+                    )
+                    return None
+                else:  # type (b): the broker knows the order but cannot read it (3.7)
+                    outcome = "lookup_inconsistent"
+            self._last_outcome[row.id] = outcome
+        start = row.submitted_at if kind == "a" else since
+        if now >= start + self._resolution_timeout:
+            return outcome or self._last_outcome.get(row.id, "lookup_failed")
+        expected = (
+            row.submitted_at + timedelta(seconds=self._io_timeout) + self._visibility_allowance
+        )
+        (log.debug if now < expected else log.info)(
+            "risk.order_resolve_pending", order_row=row.id, kind=kind, outcome=outcome
+        )
+        return None
+
+    def _remind(self, incidents: dict[int, str]) -> None:
+        """`risk.order_incident_open` every 60 s while any unsettled row is an incident."""
+        if not incidents:
+            return
+        last = self._incident_logged_at
+        if last is not None and self._monotonic() - last < _INCIDENT_REMINDER_S:
+            return
+        self._incident_logged_at = self._monotonic()
+        log.error(
+            "risk.order_incident_open",
+            order_rows=[{"order_row": i, "reason": r} for i, r in sorted(incidents.items())],
+        )
 
     async def _read_order(
         self, row: Order, broker_id: str, min_qty: dict[str, Decimal], deadline: float
@@ -462,6 +694,7 @@ class RiskEngine:
                 HeldPosition(
                     symbol=p.symbol,
                     qty=p.qty,
+                    qty_available=p.qty_available,
                     market_value=None,
                     avg_entry_price=p.avg_entry_price,
                     min_qty=rules.min_qty,
@@ -502,7 +735,7 @@ class RiskEngine:
             return OrderResult(decision, row_id, "not_submitted")
         try:
             ack = await self._within(deadline, call)
-        except DustRemainder as e:  # close_position only: report dust as a type (1.5c)
+        except DustRemainder as e:  # a full free sell below min_qty: report dust as a type (1.5c)
             log.warning("risk.exit_dust", order_row=row_id, qty=str(e.qty), min_qty=str(e.min_qty))
             await self._set_status(row_id, "rejected")
             return OrderResult(decision, row_id, "rejected", dust=True, min_qty=e.min_qty)
@@ -561,8 +794,10 @@ class RiskEngine:
     # --- exits -----------------------------------------------------------------------
 
     async def exit(self, request: ExitRequest) -> OrderResult:
-        """Reduce-only full exit (G1). No gate check: kill and pause never block it.
-        Carries no client_order_id because `Broker.close_position` takes none."""
+        """Reduce-only full exit (G1). No gate check: kill and pause never block it. Sells the
+        free qty with `submit_order` as a market order whose client id (`at-{jid}-o{row}`)
+        is stamped on the row when it is inserted; without a journal id it goes out with
+        none (logged), because an exit must stay possible."""
         async with self._exit_lock:
             deadline = self._monotonic() + self._io_timeout
             now = self._clock()
@@ -586,28 +821,48 @@ class RiskEngine:
                     return OrderResult(decision)
                 if position is None:
                     return OrderResult(decision, no_position=True)
+                if not position.is_dust:  # open sells reserve the whole holding: a failure
+                    return OrderResult(decision)
                 return OrderResult(decision, dust=True, min_qty=position.min_qty)
-            async with self._sessions() as session:
-                row = await repo.insert_order(
-                    session,
-                    cycle_id=request.cycle_id,
-                    client_order_id=None,
+            jid = await self._journal_id()
+            if jid is None:  # reduce-only exits stay possible; the row just has no client id
+                log.error("risk.journal_id_missing", symbol=request.symbol)
+            claimed: list[int] = []  # the row id this call put into `_in_flight`
+            try:
+                async with self._sessions() as session:
+                    row = await repo.insert_order(
+                        session,
+                        cycle_id=request.cycle_id,
+                        client_order_id=None,
+                        symbol=request.symbol,
+                        mode=self._mode,
+                        type_="market",
+                        side="sell",
+                        qty=decision.qty,
+                        limit_price=None,
+                        stop_price=None,
+                        tp_price=None,
+                        status="pending",
+                        now=now,
+                        exit_reason=request.reason,
+                        external=request.external,
+                        client_order_id_for=None if jid is None else partial(exit_client_id, jid),
+                    )
+                    self._in_flight.add(row.id)  # inside the block: see `_in_flight`
+                    claimed.append(row.id)
+                sell = BrokerOrder(
                     symbol=request.symbol,
-                    mode=self._mode,
-                    type_="market",
                     side="sell",
                     qty=decision.qty,
-                    limit_price=None,
-                    stop_price=None,
-                    tp_price=None,
-                    status="pending",
-                    now=now,
-                    exit_reason=request.reason,
-                    external=request.external,
+                    type="market",
+                    time_in_force="gtc",
+                    client_order_id=row.client_order_id,
                 )
-            return await self._submit(
-                row.id, decision, deadline, lambda: self._broker.close_position(request.symbol)
-            )
+                return await self._submit(
+                    row.id, decision, deadline, lambda: self._broker.submit_order(sell)
+                )
+            finally:
+                self._in_flight.difference_update(claimed)
 
     async def cancel_open_entries(self, exclude: Collection[int] = ()) -> CancelResult:
         """Cancel unsettled, non-final entry (buy) orders at the broker, under the exit lock

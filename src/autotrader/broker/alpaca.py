@@ -25,6 +25,7 @@ from autotrader.broker.base import (
     AssetRules,
     BrokerError,
     BrokerOrder,
+    BrokerOrderView,
     FeeSchedule,
     Fill,
     Mode,
@@ -114,6 +115,7 @@ class AlpacaBroker:
                 Position(
                     symbol=_slash_symbol(p["symbol"]),
                     qty=Decimal(p["qty"]),
+                    qty_available=Decimal(p["qty_available"]),
                     avg_entry_price=Decimal(p["avg_entry_price"]),
                 )
                 for p in raw
@@ -149,6 +151,9 @@ class AlpacaBroker:
 
     async def get_order(self, order_id: str) -> OrderStatus:
         _not_yet("get_order")
+
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        _not_yet("get_order_by_client_id")
 
     async def order_fills(self, order_id: str) -> list[Fill]:
         _not_yet("order_fills")

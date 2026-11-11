@@ -22,19 +22,44 @@ written-off dust (`symbol_dust`); the remainder is external and reported in
 `ExternalHoldingSold`. A marked sell that finds an open position books through the normal
 sell path, `oversell` included.
 
+An operator-marked oversell (`repair oversell` sets `orders.excess_external`, WP 1.5d-2,
+spec 2026-11-10 5.4) is split per fill, in booking order, when the fill is booked: the
+position absorbs up to its open qty plus the carried dust (consumed as for any sell), and
+the rest of that fill, and every later fill of the row, is external, persisted in
+`fills.external_qty` (0 on every ordinary fill). Position fees and realized P&L take only
+each fill's position share; at the row's settlement `ExternalHoldingSold` reports the
+external shares from the stored split (`dust_consumed` 0). A marked row whose position
+absorbs the whole sell books like any sell, with no external part and no event.
+
+Order resolver decisions (WP 1.5d-2, spec 2026-11-10 3.5-3.7) arrive with the sync pass as
+`SyncResult.resolutions`; `apply_all` applies them first, each in its own unit, then books.
+Each is a conditional `UPDATE` whose guard lives in its `WHERE` clause (never a Python check
+before the write: another session may commit between the two): a link only on a
+`pending`/`unknown` row with no broker id, no incident and no settlement (`OrderResolved`); an
+incident only once (`OrderIncident`), a type (a) incident only while the row is still
+`pending`/`unknown` with no broker id, and a type (b) incident only while `resolve_since`
+still holds the clock its decision observed; a clock start never moves an existing clock, and
+a clear only erases the clock it observed. A write that matched no row writes nothing and
+publishes nothing.
+
+Booking never touches an incident row: `_book` checks `incident` inside its own transaction
+and defers, so an update read before the incident committed books nothing and the row keeps
+holding back its symbol's later rows until an operator repair clears it (D20.10).
+
 Money columns are text on SQLite, so Decimal values are compared in Python, never in SQL.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import structlog
 from pydantic import Field
-from sqlalchemy import func, select
+from sqlalchemy import CursorResult, func, select
+from sqlalchemy import update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from autotrader.broker.base import Account, Fill
@@ -45,11 +70,14 @@ from autotrader.journal import repo
 from autotrader.journal.models import ControlState, Order, Position, RiskDecision, SymbolDust
 from autotrader.journal.models import Event as EventRow
 from autotrader.journal.models import Fill as FillRow
-from autotrader.risk.types import FINAL, OrderUpdate, SyncResult
+from autotrader.risk.types import FINAL, OrderResolution, OrderUpdate, SyncResult
 
 log = structlog.get_logger(__name__)
 
 _RANK = {"new": 1, "partially_filled": 2}  # pending / unknown: 0, final: 3
+# Statuses a type (a) resolver write (link, incident) may still find; the same set
+# `core/repair.py` accepts for `link` / `not-submitted`.
+_TYPE_A_STATUSES = ("pending", "unknown")
 _D0 = Decimal(0)
 CASH_CHECK_KEY = "cash_check"
 CENT = Decimal("0.01")
@@ -103,6 +131,28 @@ class LedgerAnomaly(LedgerEvent):
     kind: AnomalyKind
     order_row_id: int
     detail: str
+
+
+class OrderResolved(LedgerEvent):
+    """The order resolver linked an unlinked row to its broker order (spec 3.7)."""
+
+    order_row_id: int
+    broker_order_id: str
+    client_order_id: str | None
+    how: Literal["resolver"] = "resolver"
+
+
+class OrderIncident(LedgerEvent):
+    """An unresolved order needs an operator (spec 3.6): the row stays unsettled."""
+
+    order_row_id: int
+    symbol: str
+    side: str
+    qty: Decimal
+    client_order_id: str | None
+    broker_order_id: str | None
+    reason: str
+    submitted_at: datetime
 
 
 class ExternalHoldingSold(LedgerEvent):
@@ -195,6 +245,18 @@ def _cash_effect(row: FillRow) -> Decimal:
     return notional - row.fee
 
 
+def _split(amount: Decimal, qty: Decimal, external_qty: Decimal) -> tuple[Decimal, Decimal]:
+    """`(position_part, external_part)` of a fill's amount by its persisted external qty
+    (spec 2026-11-10 5.4). An ordinary fill (`external_qty == 0`) returns `amount` itself:
+    at 28-digit precision `a * q / q != a` for some values, so the arithmetic would leave a
+    rounding residue in ordinary trades. The parts sum to `amount` exactly; any residue
+    lands in the external part."""
+    if external_qty == 0:
+        return amount, _D0
+    position_part = amount * (qty - external_qty) / qty
+    return position_part, amount - position_part
+
+
 def _same(row: FillRow, fill: Fill) -> bool:
     return (row.side, row.fee_asset, row.qty, row.price, row.fee) == (
         fill.side,
@@ -270,7 +332,11 @@ class Ledger:
 
         A row whose booking raises is logged and holds back its own symbol only; the other
         symbols still book. Returns the symbols that raised on this pass (the caller fails
-        closed on them). `CancelledError` is never caught."""
+        closed on them). `CancelledError` is never caught.
+
+        The pass's resolutions are applied first (`apply_resolutions`); a linked row is read
+        and booked by a later pass."""
+        await self.apply_resolutions(result.resolutions)
         updates = {u.order_row_id: u for u in result.updates}
         async with self._sessions() as session:
             rows = await repo.unsettled_orders(session)
@@ -296,6 +362,130 @@ class Ledger:
             if outcome in ("deferred", "anomaly"):
                 held.add(symbol)
         return frozenset(failed)
+
+    async def apply_resolutions(self, resolutions: Sequence[OrderResolution]) -> None:
+        """Apply the order resolver's decisions in order, each in its own conditional unit
+        (module docstring). One that raises is logged `ledger.resolution_failed` and does
+        not stop the others; `CancelledError` propagates."""
+        for r in resolutions:
+            try:
+                await self._resolve(r)
+            except Exception:
+                log.exception("ledger.resolution_failed", order_row=r.order_row_id, action=r.action)
+
+    async def _resolve(self, r: OrderResolution) -> None:
+        if r.action == "link":
+            await self._link(r)
+        elif r.action == "incident":
+            await self._incident(r)
+        else:
+            if r.action == "start_clock":
+                stmt = (
+                    sql_update(Order)
+                    .where(
+                        Order.id == r.order_row_id,
+                        Order.resolve_since.is_(None),
+                        Order.incident.is_(None),
+                        Order.settled_at.is_(None),
+                    )
+                    .values(resolve_since=r.at)
+                )
+            else:  # clear_clock: only the clock its read observed
+                stmt = (
+                    sql_update(Order)
+                    .where(Order.id == r.order_row_id, Order.resolve_since == r.clock)
+                    .values(resolve_since=None)
+                )
+            async with self._sessions() as session:
+                await session.execute(stmt)
+                await session.commit()
+
+    async def _link(self, r: OrderResolution) -> None:
+        async def build(session: AsyncSession) -> DomainEvent | None:
+            result = cast(
+                CursorResult[Any],
+                await session.execute(
+                    sql_update(Order)
+                    .where(
+                        Order.id == r.order_row_id,
+                        Order.broker_order_id.is_(None),
+                        Order.status.in_(_TYPE_A_STATUSES),
+                        Order.settled_at.is_(None),
+                        Order.incident.is_(None),
+                    )
+                    .values(broker_order_id=r.broker_order_id, updated_at=r.at)
+                ),
+            )
+            if result.rowcount != 1 or r.broker_order_id is None:
+                return None
+            order = await self._reread(session, r.order_row_id)
+            return OrderResolved(
+                ts=r.at,
+                cycle_id=order.cycle_id,
+                order_row_id=order.id,
+                broker_order_id=r.broker_order_id,
+                client_order_id=order.client_order_id,
+            )
+
+        if await self._bus.publish_tx(build, verify_unit) is not None:
+            log.info(
+                "risk.order_resolved", order_row=r.order_row_id, broker_order_id=r.broker_order_id
+            )
+
+    async def _incident(self, r: OrderResolution) -> None:
+        guard = [
+            Order.id == r.order_row_id,
+            Order.incident.is_(None),
+            Order.settled_at.is_(None),
+        ]
+        if r.clock is not None:  # type (b): only while the clock it observed still holds
+            guard.append(Order.resolve_since == r.clock)
+        else:  # type (a): only while the row still has no broker id (not acked since the read)
+            # and is not locally final since the read (rejected / not_submitted): an incident
+            # there could not be repaired, `repair` accepts only pending / unknown rows.
+            guard.append(Order.broker_order_id.is_(None))
+            guard.append(Order.status.in_(_TYPE_A_STATUSES))
+
+        async def build(session: AsyncSession) -> DomainEvent | None:
+            result = cast(
+                CursorResult[Any],
+                await session.execute(
+                    sql_update(Order)
+                    .where(*guard)
+                    .values(incident=r.reason, incident_at=r.at, resolve_since=None)
+                ),
+            )
+            if result.rowcount != 1 or r.reason is None:
+                return None
+            order = await self._reread(session, r.order_row_id)
+            return OrderIncident(
+                ts=r.at,
+                cycle_id=order.cycle_id,
+                order_row_id=order.id,
+                symbol=order.symbol or "",
+                side=order.side,
+                qty=order.qty,
+                client_order_id=order.client_order_id,
+                broker_order_id=order.broker_order_id,
+                reason=r.reason,
+                submitted_at=order.submitted_at,
+            )
+
+        event = await self._bus.publish_tx(build, verify_unit)
+        if isinstance(event, OrderIncident):
+            log.error(
+                "risk.order_incident",
+                order_row=event.order_row_id,
+                symbol=event.symbol,
+                reason=event.reason,
+            )
+
+    @staticmethod
+    async def _reread(session: AsyncSession, row_id: int) -> Order:
+        order = await session.get(Order, row_id, populate_existing=True)
+        if order is None:
+            raise LookupError(f"no order row {row_id}")
+        return order
 
     async def apply(self, update: OrderUpdate) -> Outcome:
         """Book one order's update in one transaction. Never raises for a deferral or an
@@ -336,6 +526,11 @@ class Ledger:
         if order is None:
             raise LookupError(f"no order row {u.order_row_id}")
         unit.cycle_id = order.cycle_id
+        if order.incident is not None:
+            # Read inside the booking transaction: an update read before the incident
+            # committed (check() and the sync loop overlap) must not book it. Only an
+            # operator repair clears it (D20.10); deferring holds the symbol's later rows.
+            raise _Deferred(f"order row {order.id} is an open incident ({order.incident})")
         booked = {
             r.broker_fill_id: r
             for r in await session.scalars(select(FillRow).where(FillRow.order_id == order.id))
@@ -356,8 +551,9 @@ class Ledger:
             return None  # a stale update for an order that is already settled
         applied = order.filled_qty + sum((f.qty for f in new), _D0)
         final = u.status in FINAL
-        # An exit is a close_position: the broker sells what it holds, which can exceed the
-        # qty recorded when exit() read the position. Only an entry's own qty bounds it.
+        # An exit sells an exact qty (its free holding, via submit_order), but rows from
+        # journals that closed with close_position can exceed their recorded qty: the sell
+        # side stays exempt. Only an entry's own qty bounds it.
         if order.side == "buy" and applied > order.qty:
             raise _Anomaly("overfilled", f"applied {applied} > ordered {order.qty}")
         if final and u.filled_qty < applied:
@@ -368,22 +564,22 @@ class Ledger:
             None if order.position_id is None else await session.get(Position, order.position_id)
         )
         for fill in new:
-            session.add(
-                FillRow(
-                    order_id=order.id,
-                    broker_fill_id=fill.fill_id,
-                    side=fill.side,
-                    fee_asset=fill.fee_asset,
-                    qty=_norm(fill.qty),
-                    price=_norm(fill.price),
-                    fee=_norm(fill.fee),
-                    ts=fill.ts,
-                )
+            fill_row = FillRow(
+                order_id=order.id,
+                broker_fill_id=fill.fill_id,
+                side=fill.side,
+                fee_asset=fill.fee_asset,
+                qty=_norm(fill.qty),
+                price=_norm(fill.price),
+                fee=_norm(fill.fee),
+                ts=fill.ts,
+                external_qty=_D0,
             )
+            session.add(fill_row)
             if order.side == "buy":
                 position = await self._buy(session, order, position, fill)
             else:
-                position = await self._sell(session, order, position, fill, now)
+                position = await self._sell(session, order, position, fill, fill_row, now)
         changed = bool(new)
         if new:
             order.filled_qty = _norm(applied)
@@ -405,10 +601,12 @@ class Ledger:
                 dust = await self._maybe_close(session, position, u.min_qty, now)
                 if dust is not None:
                     extra.append(dust)
-            if order.side == "sell" and order.external and order.position_id is None:
+            if order.side == "sell" and order.excess_external:
+                unit.external = await self._excess_sale(session, order, now)
+            elif order.side == "sell" and order.external and order.position_id is None:
                 unit.external = await self._external_sale(session, order, now)
-                if unit.external is not None:
-                    extra.append(unit.external)
+            if unit.external is not None:
+                extra.append(unit.external)
         if not changed:
             return None
         order.updated_at = now
@@ -458,12 +656,18 @@ class Ledger:
         order: Order,
         position: Position | None,
         fill: Fill,
+        fill_row: FillRow,
         now: datetime,
     ) -> Position | None:
         """Reduce the symbol's open position. A sell beyond the open qty is carried dust of
         earlier trades, resolved only once every earlier order on the symbol is settled
         (spec 4.3): until then the whole update is deferred, never an anomaly. A marked
-        external sell with no open position books no position (None, spec 4.4.1)."""
+        external sell with no open position books no position (None, spec 4.4.1).
+
+        Beyond the open qty and the carried dust, an unmarked row is an `oversell`; a row
+        marked `excess_external` (spec 2026-11-10 5.4) consumes the dust, empties the
+        position and persists the rest of the fill in `fill_row.external_qty`. The position
+        is charged only the position's share of the fill's fee."""
         if position is None:
             # Never "the oldest open one": check() keeps one open journal trade per symbol,
             # so more than one is a contradiction, not a choice (PR #25 review).
@@ -488,26 +692,64 @@ class Ledger:
                     "sell_without_position", f"sell fill {fill.fill_id}: no open {order.symbol}"
                 )
             order.position_id = position.id
-        position.fees = _norm(
-            (position.fees or _D0) + _fee_usd(fill.fee, fill.fee_asset, fill.price)
-        )
+        external = _D0
         excess = fill.qty - position.qty
         if excess <= 0:
             position.qty = _norm(position.qty - fill.qty)
-            return position
-        if await _earlier_unsettled(session, order):
-            raise _Deferred(f"sells {excess} beyond the open qty; an earlier order is unsettled")
-        dust = await session.get(SymbolDust, position.symbol)
-        available = _D0 if dust is None else dust.qty
-        if dust is None or excess > available:
-            raise _Anomaly(
-                "oversell", f"sells {excess} beyond the open qty, carried dust {available}"
-            )
-        dust.qty = _norm(available - excess)
-        dust.updated_at = now
-        position.dust_consumed = _norm(position.dust_consumed + excess)
-        position.qty = _D0
+        else:
+            if await _earlier_unsettled(session, order):
+                raise _Deferred(
+                    f"sells {excess} beyond the open qty; an earlier order is unsettled"
+                )
+            dust = await session.get(SymbolDust, position.symbol)
+            available = _D0 if dust is None else dust.qty
+            if order.excess_external:
+                consumed = min(excess, available)
+                external = excess - consumed
+            elif dust is None or excess > available:
+                raise _Anomaly(
+                    "oversell", f"sells {excess} beyond the open qty, carried dust {available}"
+                )
+            else:
+                consumed = excess
+            if dust is not None and consumed > 0:
+                dust.qty = _norm(available - consumed)
+                dust.updated_at = now
+            position.dust_consumed = _norm(position.dust_consumed + consumed)
+            position.qty = _D0
+            fill_row.external_qty = _norm(external)
+        fee_usd = _fee_usd(fill.fee, fill.fee_asset, fill.price)
+        position.fees = _norm((position.fees or _D0) + _split(fee_usd, fill.qty, external)[0])
         return position
+
+    async def _excess_sale(
+        self, session: AsyncSession, order: Order, now: datetime
+    ) -> ExternalHoldingSold | None:
+        """The external part of a settled `excess_external` row (spec 2026-11-10 5.4), from
+        the split `_sell` persisted per fill (never recomputed). Its dust went to the
+        position, so `dust_consumed` is 0 and `SymbolDust` is not touched again (never
+        `_external_sale`). None when no fill had an external part."""
+        await session.flush()
+        rows = list(await session.scalars(select(FillRow).where(FillRow.order_id == order.id)))
+        external = sum((r.external_qty for r in rows), _D0)
+        if external == 0:
+            return None
+        proceeds = sum((_split(r.qty * r.price, r.qty, r.external_qty)[1] for r in rows), _D0)
+        fees = sum(
+            (_split(_fee_usd(r.fee, r.fee_asset, r.price), r.qty, r.external_qty)[1] for r in rows),
+            _D0,
+        )
+        return ExternalHoldingSold(
+            ts=now,
+            cycle_id=order.cycle_id,
+            order_row_id=order.id,
+            symbol=order.symbol or "",
+            qty=_norm(external),
+            dust_consumed=_D0,
+            external_qty=_norm(external),
+            proceeds_usd=_norm(proceeds),
+            fees_usd=_norm(fees),
+        )
 
     async def _external_sale(
         self, session: AsyncSession, order: Order, now: datetime
@@ -589,7 +831,8 @@ class Ledger:
     ) -> DustLeft | None:
         """Close once every order of the position is settled and less than `min_qty` is
         left (spec 4.3/4.4; stricter than "entry settled", see the plan's clarification 1).
-        Realized P&L is cash in minus cash out, so dust is written off (D17)."""
+        Realized P&L is cash in minus cash out, so dust is written off (D17); a fill's
+        external part (`excess_external`, spec 2026-11-10 5.4) is not the trade's."""
         if position.closed_at is not None or min_qty is None or position.qty >= min_qty:
             return None
         await session.flush()
@@ -608,7 +851,9 @@ class Ledger:
         exits = [o for o in linked if o.side == "sell"]
         position.closed_at = max(r.ts for r in rows)
         position.exit_reason = (exits[-1].exit_reason or "exit") if exits else "dust"
-        position.realized_pnl = _norm(sum((_cash_effect(r) for r in rows), _D0))
+        position.realized_pnl = _norm(
+            sum((_split(_cash_effect(r), r.qty, r.external_qty)[0] for r in rows), _D0)
+        )
         position.dust_qty = position.qty
         log.info(
             "ledger.position_closed",

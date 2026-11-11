@@ -92,7 +92,25 @@ class Fill(_Frozen):
 class Position(_Frozen):
     symbol: str
     qty: Dec
+    # Held qty minus the remainder of open sells: what a new sell may still use.
+    qty_available: Dec
     avg_entry_price: Dec
+
+
+class BrokerOrderView(_Frozen):
+    """A broker order as found by its client order id (the order resolver's lookup).
+
+    Only what ownership and booking decisions need: identity, side/qty, status and how
+    much has filled. `created_at` is the broker's creation time."""
+
+    order_id: str
+    client_order_id: str
+    symbol: str
+    side: Side
+    qty: Dec
+    status: OrderState
+    filled_qty: Dec
+    created_at: AwareDatetime
 
 
 class Account(_Frozen):
@@ -156,6 +174,7 @@ class Broker(Protocol):
     async def submit_order(self, order: BrokerOrder) -> OrderAck: ...
     async def cancel_order(self, order_id: str) -> None: ...
     async def get_order(self, order_id: str) -> OrderStatus: ...
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None: ...
     async def order_fills(self, order_id: str) -> list[Fill]: ...
     async def close_position(self, symbol: str) -> OrderAck: ...
     async def close_all(self) -> list[OrderAck]: ...

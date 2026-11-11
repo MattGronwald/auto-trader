@@ -26,6 +26,7 @@ from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
 from autotrader.risk.engine import OrderResult
+from autotrader.risk.resolve import entry_client_id
 from autotrader.risk.types import EntryIntent, RiskDecision
 from tests.dbhooks import CommitHook, hooked_sessionmaker
 
@@ -636,7 +637,7 @@ async def test_open_entry_order_of_an_error_cycle_blocks_its_symbol(
         await repo.insert_order(
             s,
             cycle_id=cid,
-            client_order_id=f"at-c{cid}-e",
+            client_order_id=entry_client_id(str(await repo.journal_id(s)), cid),
             symbol=BTC,
             mode="paper",
             type_="limit",
@@ -858,7 +859,7 @@ async def test_recover(
             await repo.insert_order(
                 s,
                 cycle_id=cid,
-                client_order_id=f"at-c{cid}-e",
+                client_order_id=entry_client_id(str(await repo.journal_id(s)), cid),
                 symbol=BTC,
                 mode="paper",
                 type_="limit",

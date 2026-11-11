@@ -12,7 +12,8 @@ with REJECTED / EXPIRED / ERROR exits (§4). `check()` is called once, never ret
 and never timed out by the runner (only `close()` forces it). After submission only
 proven outcomes are mapped; `new` / `canceled` stay SUBMITTED until the ledger (WP 1.5b)
 settles the order from the broker's filled qty; an `unknown` row without a broker id waits for
-the 1.5d resolver. Orders are reconciled by order row, not cycle state: an ERROR
+the order resolver in the sync loop (WP 1.5d-2), which links it or marks it an incident for the
+operator. Orders are reconciled by order row, not cycle state: an ERROR
 cycle may own a real `pending` order.
 
 Any `CommitUncertain` suspends admission for the rest of the process; `recover()` on
