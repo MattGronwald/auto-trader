@@ -335,16 +335,22 @@ text:
      `g1 = await ledger.cash_guard()`, `broker = await risk.broker_holdings()`,
      `journal = await journal()`, `g2 = await ledger.cash_guard()`. If `g1.unsettled`,
      `g2.unsettled` or `g1.generation != g2.generation`, discard the result silently. Otherwise a
-     symbol is short when `open + dust > broker.get(symbol, 0)`. No short symbol: passed (kept
-     for the process unless step 2 resets it). Per short symbol, log `admission.holdings_short`
+     symbol is short when `open + dust > broker.get(symbol, 0)`. No short symbol: passed, and the
+     tracker keeps `g2.generation` as the pass's generation (kept unless step 2 or step 5
+     drops it). Per short symbol, log `admission.holdings_short`
      (error) with `symbol`, `journal_qty`, `dust`, `broker_qty` (as `str`) when its triple
      differs from the last logged one. A symbol that is no longer short is dropped from the
      last-logged figures, so the same shortfall returning is logged again. A raising guard,
      broker or journal read logs `admission.holdings_read_failed` (warning, with the exception)
      once per failure streak. Any read that completes, including one whose result is discarded,
      ends the streak.
-  5. If (b), (c) and (d) hold and `risk.cash_fault is None` (re-read after the awaits), return
-     `True`.
+  5. If (b), (c) and (d) hold and `risk.cash_fault is None` (re-read after the awaits), read
+     `g3 = await ledger.cash_guard()` once more (Codex review of 95d350c: a cached pass must not
+     let admission open past an exit the Position Manager placed after it). `g3.unsettled`: not
+     ready (`unmet` gets `"unsettled order rows"`). `g3.generation` differs from the pass's
+     generation: drop the cached pass (the holdings check runs again on the next tick) and return
+     `False`. Otherwise return `True`. A raising `g3` read counts as a failed holdings read
+     (step 4's streak rule) and returns `False`.
   6. Else, once `now - created >= waiting_after_s`, log `cycle.admission_waiting` (warning), then
      again every `WAITING_REPEAT_S = 600.0` (module constant) while admission stays closed (D21
      note 2026-11-11, plan review: one line is not enough for a cause that persists or appears
@@ -385,6 +391,12 @@ text:
   - `test_unsettled_or_moved_guard_discards_silently` (parametrize: `g1.unsettled`,
     `g2.unsettled`, generation moved): `False`, no `admission.holdings_short`, and the next
     clean tick passes.
+  - `test_cached_holdings_pass_does_not_bypass_a_later_exit` (Codex review): fault clear,
+    `ready()` (sets `T_b`, holdings pass on generation G, no report yet: `False`). A `manage()`
+    whose step returns a complete report while the fake ledger now answers
+    `CashGuard(G+1, unsettled=True)` (the exit it placed): `ready()` is `False`. The exit
+    settles (`CashGuard(G+2, unsettled=False)`): the next `ready()` drops the stale pass and is
+    `False`; the one after re-runs the holdings check, passes on G+2 and returns `True`.
   - `test_broker_read_failure_logs_once_per_streak`: two failing ticks give one warning; a
     success, then a failure, gives a second warning.
   - `test_waiting_logged_after_three_snapshot_intervals_and_repeated`: `waiting_after_s=180`.
@@ -463,7 +475,7 @@ text:
   8. The existing `control.requested` check returns `None`.
   9. Build the poller, PM and `readiness = AdmissionReadiness(risk, ledger, partial(journal_holdings, sessions), waiting_after_s=3 * snapshot_s, disabled=disabled)`.
      The loops change: `Loop("positions.manage", partial(readiness.manage, pm.step), manage_s, MANAGE_STALL_S, "error")`,
-     plus `Loop("admission.ready", partial(_admission_step, readiness, runner), tick_s, CONTROL_STALL_S)`.
+     plus `Loop("admission.ready", partial(_admission_step, readiness, runner), tick_s, SYNC_STALL_S)`.
      Start the stream and the supervisor and log `core.started`, then return
      `_Started(supervisor, stream_task, runner)`.
 - `run_core` unpacks only `supervisor` and `stream_task` from `_Started` in this task. Task 5
@@ -573,10 +585,15 @@ text:
     `CloseReport((42,))`. Result `EXIT_FAILED`, `core.shutdown_forced.steps` contains
     `"cycle:42"` and so does `core.shutdown_abandoned`.
   - `test_abandoned_cycle_is_reported_with_a_short_shutdown_budget`: no monkeypatched `close`.
-    `shutdown.timeout_s = 3`, a `SimBroker` whose `submit_order` hangs (as
-    `te.HangingSubmit`), admission opened, one candidate admitted and inside `check()`. Request
-    the stop: `core.shutdown_forced.steps` contains `"cycle:<id>"` (not only `"runner.close"`),
-    and `cycle.task_abandoned` is logged.
+    `shutdown.timeout_s = 3`, a `SimBroker` whose `submit_order` ignores cancellation until a
+    release event (built on the `Stubborn` helper in this file; a cooperative hang such as
+    `te.HangingSubmit` unwinds when `close()` cancels it, so nothing is abandoned: Codex review
+    of 95d350c), admission opened, one candidate admitted and inside `check()`. Request the
+    stop: `core.shutdown_forced.steps` contains `"cycle:<id>"` (not only `"runner.close"`), and
+    `cycle.task_abandoned` is logged. Release the submit and drain the task in cleanup.
+  - `test_cooperative_hung_check_is_not_abandoned`: the same with `te.HangingSubmit`: the
+    forced cancel unwinds within the budget, no `cycle:<id>`, no `cycle.task_abandoned`
+    (`cycle.forced_cancel` is logged). No production change follows from this pair.
   - `test_runner_close_is_skipped_when_startup_failed`: broker connect fails. No
     `CycleRunner.close` call.
   - `test_stop_during_recover_skips_runner_close` (Review Focus 3): `CycleRunner.recover` awaits

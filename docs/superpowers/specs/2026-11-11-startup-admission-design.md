@@ -248,7 +248,10 @@ catches a missing holding only indirectly. 1.5d-3 adds a **one-sided** check to 
   the step reads the ledger's cash guard before the broker read and again after the journal read;
   if either shows an unsettled row or the generation moved, the result is discarded and retried on
   the next tick (no log). A Position Manager exit placed after `T_b` makes the guard unsettled until
-  it books, which only delays the check.
+  it books, which only delays the check. *(Note 2026-11-11, Codex review of plan PR #38:)* a
+  passed check is tied to the generation it passed on; before admission opens, the step reads the
+  guard once more and stays closed on an unsettled row, and re-runs the check if the generation
+  moved, so an exit placed after a cached pass must settle first.
 - **On a shortfall:** admission stays closed; `admission.holdings_short` (error) is logged once per
   symbol, with journal qty, dust and broker qty, and re-logged only if the figures change. No
   manual pause is committed **(Claude's call)**: admission is already closed, and the check
