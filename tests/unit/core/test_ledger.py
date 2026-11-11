@@ -34,7 +34,7 @@ from autotrader.core.types import Bar
 from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
-from autotrader.risk.types import OrderUpdate, SyncResult
+from autotrader.risk.types import OrderResolution, OrderUpdate, SyncResult
 from tests.dbhooks import CommitHook, hooked_sessionmaker
 
 REPO = Path(__file__).resolve().parents[3]
@@ -1480,3 +1480,234 @@ async def test_a_failing_row_holds_back_its_symbol_only(
     by_id = {o.id: o for o in await orders(sessions)}
     assert by_id[eth].settled_at is not None  # the other symbol booked
     assert by_id[btc].settled_at is None and by_id[btc_exit].settled_at is None
+
+
+# --- order resolutions (WP 1.5d-2, spec 2026-11-10 3.6/3.7) -----------------------------
+
+T1 = T0 + timedelta(seconds=30)
+
+
+async def bare_row(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    broker_order_id: str | None = None,
+    incident: str | None = None,
+    resolve_since: datetime | None = None,
+    symbol: str = BTC,
+) -> int:
+    """An unsettled sell row like the engine journals one, with resolver fields set."""
+    async with sessions() as s:
+        row = await repo.insert_order(
+            s,
+            cycle_id=None,
+            client_order_id=None,
+            symbol=symbol,
+            mode="paper",
+            type_="market",
+            side="sell",
+            qty=D("0.5"),
+            limit_price=None,
+            stop_price=None,
+            tp_price=None,
+            status="pending",
+            now=T0,
+            client_order_id_for=lambda i: f"at-deadbeef-o{i}",
+        )
+        o = await s.get(m.Order, row.id)
+        assert o is not None
+        o.broker_order_id = broker_order_id
+        o.incident = incident
+        o.incident_at = None if incident is None else T0
+        o.resolve_since = resolve_since
+        await s.commit()
+        return row.id
+
+
+async def order_row(sessions: async_sessionmaker[AsyncSession], row_id: int) -> m.Order:
+    async with sessions() as s:
+        o = await s.get(m.Order, row_id)
+        assert o is not None
+        return o
+
+
+def link(row: int, broker_id: str = "b-1") -> OrderResolution:
+    return OrderResolution(order_row_id=row, action="link", at=T1, broker_order_id=broker_id)
+
+
+def incident(row: int, reason: Any = "not_found", clock: datetime | None = None) -> OrderResolution:
+    return OrderResolution(order_row_id=row, action="incident", at=T1, reason=reason, clock=clock)
+
+
+def start_clock(row: int, at: datetime) -> OrderResolution:
+    return OrderResolution(order_row_id=row, action="start_clock", at=at)
+
+
+def clear_clock(row: int, clock: datetime) -> OrderResolution:
+    return OrderResolution(order_row_id=row, action="clear_clock", at=T1, clock=clock)
+
+
+async def test_link_writes_once_and_publishes_once(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    row = await bare_row(sessions)
+    linked = await bare_row(sessions, broker_order_id="b-old")
+    marked = await bare_row(sessions, incident="not_found")
+
+    with capture_logs() as logs:
+        await ledger.apply_resolutions(
+            [link(row), link(row), link(linked, "b-2"), link(marked, "b-3")]
+        )
+
+    assert (await order_row(sessions, row)).broker_order_id == "b-1"
+    assert (await order_row(sessions, row)).updated_at == T1
+    assert (await order_row(sessions, linked)).broker_order_id == "b-old"
+    assert (await order_row(sessions, marked)).broker_order_id is None
+    resolved = [e for e in await event_rows(sessions) if e.type == "OrderResolved"]
+    assert [e.payload for e in resolved] == [
+        {
+            "unit_id": resolved[0].payload["unit_id"],
+            "order_row_id": row,
+            "broker_order_id": "b-1",
+            "client_order_id": f"at-deadbeef-o{row}",
+            "how": "resolver",
+        }
+    ]
+    assert [e["order_row"] for e in logs if e["event"] == "risk.order_resolved"] == [row]
+
+
+async def test_incident_writes_once_clears_the_clock_and_logs(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    row = await bare_row(sessions)
+
+    with capture_logs() as logs:
+        await ledger.apply_resolutions([start_clock(row, T0), incident(row)])
+        await ledger.apply_resolutions([incident(row, "lookup_failed")])
+
+    o = await order_row(sessions, row)
+    assert (o.incident, o.incident_at, o.resolve_since) == ("not_found", T1, None)
+    events = [e for e in await event_rows(sessions) if e.type == "OrderIncident"]
+    assert len(events) == 1
+    payload = events[0].payload
+    assert {k: payload[k] for k in payload if k != "unit_id"} == {
+        "order_row_id": row,
+        "symbol": BTC,
+        "side": "sell",
+        "qty": "0.5",
+        "client_order_id": f"at-deadbeef-o{row}",
+        "broker_order_id": None,
+        "reason": "not_found",
+        "submitted_at": "2026-10-09T12:00:00Z",
+    }
+    found = [e for e in logs if e["event"] == "risk.order_incident"]
+    assert [(e["order_row"], e["symbol"], e["reason"], e["log_level"]) for e in found] == [
+        (row, BTC, "not_found", "error")
+    ]
+
+
+async def test_start_clock_never_moves_an_existing_clock(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    row = await bare_row(sessions, resolve_since=T0)
+    fresh = await bare_row(sessions)
+    marked = await bare_row(sessions, incident="not_found")
+
+    await ledger.apply_resolutions([start_clock(row, T1), start_clock(fresh, T1)])
+    await ledger.apply_resolutions([start_clock(marked, T1)])
+
+    assert (await order_row(sessions, row)).resolve_since == T0
+    assert (await order_row(sessions, fresh)).resolve_since == T1
+    assert (await order_row(sessions, marked)).resolve_since is None
+    assert await event_types(sessions) == []  # clocks are bookkeeping: no event
+
+
+async def test_clear_clock(sessions: async_sessionmaker[AsyncSession], ledger: Ledger) -> None:
+    row = await bare_row(sessions, resolve_since=T0)
+    other = await bare_row(sessions, resolve_since=T0)
+
+    await ledger.apply_resolutions([clear_clock(row, T0), clear_clock(other, T1)])
+
+    assert (await order_row(sessions, row)).resolve_since is None
+    assert (await order_row(sessions, other)).resolve_since == T0  # observed another clock
+    assert await event_types(sessions) == []
+
+
+async def test_stale_type_b_incident_is_not_written(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    stale = await bare_row(sessions, broker_order_id="b-1", resolve_since=T0)
+    live = await bare_row(sessions, broker_order_id="b-2", resolve_since=T0)
+
+    await ledger.apply_resolutions([clear_clock(stale, T0)])
+    await ledger.apply_resolutions(
+        [incident(stale, "lookup_inconsistent", T0), incident(live, "lookup_inconsistent", T0)]
+    )
+
+    assert (await order_row(sessions, stale)).incident is None
+    o = await order_row(sessions, live)
+    assert (o.incident, o.resolve_since) == ("lookup_inconsistent", None)
+    events = [e for e in await event_rows(sessions) if e.type == "OrderIncident"]
+    assert [e.payload["order_row_id"] for e in events] == [live]
+
+
+async def test_clear_committed_inside_the_incident_unit_wins(
+    sessions: async_sessionmaker[AsyncSession],
+    hooked: tuple[Ledger, list[DomainEvent], EventBus],
+    hook: CommitHook,
+    ledger: Ledger,
+) -> None:
+    hledger, delivered, hbus = hooked
+    row = await bare_row(sessions, broker_order_id="b-1", resolve_since=T0)
+    release = asyncio.Event()
+    hook.block_before_update = release
+
+    task = asyncio.create_task(
+        hledger.apply_resolutions([incident(row, "lookup_inconsistent", T0)])
+    )
+    await hook.update_reached.wait()
+    await ledger.apply_resolutions([clear_clock(row, T0)])  # a plain session commits the clear
+    release.set()
+    await task
+    await hbus.drain()
+
+    o = await order_row(sessions, row)
+    assert (o.incident, o.resolve_since) == (None, None)
+    assert "OrderIncident" not in await event_types(sessions)
+    assert delivered == []
+
+
+async def test_delayed_clear_never_erases_a_newer_clock(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    row = await bare_row(sessions, broker_order_id="b-1", resolve_since=T0)
+
+    await ledger.apply_resolutions([clear_clock(row, T0), start_clock(row, T1)])
+    await ledger.apply_resolutions([clear_clock(row, T0)])  # delayed, decided on T0
+
+    assert (await order_row(sessions, row)).resolve_since == T1
+
+
+async def test_failed_resolution_does_not_block_booking(
+    sessions: async_sessionmaker[AsyncSession],
+    hooked: tuple[Ledger, list[DomainEvent], EventBus],
+    hook: CommitHook,
+) -> None:
+    hledger, _, _ = hooked
+    sim = make_sim()
+    row = await bare_row(sessions)
+    eth, oid = await place(sessions, sim, "buy", "1", symbol=ETH)
+    sim.process_bar(bar(1, symbol=ETH))
+    eth_update = await update(sim, eth, oid)
+    hook.fail_before = 1  # the link unit's commit fails
+
+    with capture_logs() as logs:
+        failed = await hledger.apply_all(
+            SyncResult(updates=(eth_update,), resolutions=(link(row),))
+        )
+
+    assert failed == frozenset()
+    errors = [e for e in logs if e["event"] == "ledger.resolution_failed"]
+    assert [(e["order_row"], e["action"]) for e in errors] == [(row, "link")]
+    assert errors[0]["exc_info"] is True
+    assert (await order_row(sessions, row)).broker_order_id is None
+    assert (await order_row(sessions, eth)).settled_at is not None

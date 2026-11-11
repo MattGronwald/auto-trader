@@ -22,19 +22,29 @@ written-off dust (`symbol_dust`); the remainder is external and reported in
 `ExternalHoldingSold`. A marked sell that finds an open position books through the normal
 sell path, `oversell` included.
 
+Order resolver decisions (WP 1.5d-2, spec 2026-11-10 3.5-3.7) arrive with the sync pass as
+`SyncResult.resolutions`; `apply_all` applies them first, each in its own unit, then books.
+Each is a conditional `UPDATE` whose guard lives in its `WHERE` clause (never a Python check
+before the write: another session may commit between the two): a link only on a row with no
+broker id, no incident and no settlement (`OrderResolved`); an incident only once
+(`OrderIncident`), and a type (b) incident only while `resolve_since` still holds the clock
+its decision observed; a clock start never moves an existing clock, and a clear only erases
+the clock it observed. A write that matched no row writes nothing and publishes nothing.
+
 Money columns are text on SQLite, so Decimal values are compared in Python, never in SQL.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import structlog
 from pydantic import Field
-from sqlalchemy import func, select
+from sqlalchemy import CursorResult, func, select
+from sqlalchemy import update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from autotrader.broker.base import Account, Fill
@@ -45,7 +55,7 @@ from autotrader.journal import repo
 from autotrader.journal.models import ControlState, Order, Position, RiskDecision, SymbolDust
 from autotrader.journal.models import Event as EventRow
 from autotrader.journal.models import Fill as FillRow
-from autotrader.risk.types import FINAL, OrderUpdate, SyncResult
+from autotrader.risk.types import FINAL, OrderResolution, OrderUpdate, SyncResult
 
 log = structlog.get_logger(__name__)
 
@@ -103,6 +113,28 @@ class LedgerAnomaly(LedgerEvent):
     kind: AnomalyKind
     order_row_id: int
     detail: str
+
+
+class OrderResolved(LedgerEvent):
+    """The order resolver linked an unlinked row to its broker order (spec 3.7)."""
+
+    order_row_id: int
+    broker_order_id: str
+    client_order_id: str | None
+    how: Literal["resolver"] = "resolver"
+
+
+class OrderIncident(LedgerEvent):
+    """An unresolved order needs an operator (spec 3.6): the row stays unsettled."""
+
+    order_row_id: int
+    symbol: str
+    side: str
+    qty: Decimal
+    client_order_id: str | None
+    broker_order_id: str | None
+    reason: str
+    submitted_at: datetime
 
 
 class ExternalHoldingSold(LedgerEvent):
@@ -270,7 +302,11 @@ class Ledger:
 
         A row whose booking raises is logged and holds back its own symbol only; the other
         symbols still book. Returns the symbols that raised on this pass (the caller fails
-        closed on them). `CancelledError` is never caught."""
+        closed on them). `CancelledError` is never caught.
+
+        The pass's resolutions are applied first (`apply_resolutions`); a linked row is read
+        and booked by a later pass."""
+        await self.apply_resolutions(result.resolutions)
         updates = {u.order_row_id: u for u in result.updates}
         async with self._sessions() as session:
             rows = await repo.unsettled_orders(session)
@@ -296,6 +332,124 @@ class Ledger:
             if outcome in ("deferred", "anomaly"):
                 held.add(symbol)
         return frozenset(failed)
+
+    async def apply_resolutions(self, resolutions: Sequence[OrderResolution]) -> None:
+        """Apply the order resolver's decisions in order, each in its own conditional unit
+        (module docstring). One that raises is logged `ledger.resolution_failed` and does
+        not stop the others; `CancelledError` propagates."""
+        for r in resolutions:
+            try:
+                await self._resolve(r)
+            except Exception:
+                log.exception("ledger.resolution_failed", order_row=r.order_row_id, action=r.action)
+
+    async def _resolve(self, r: OrderResolution) -> None:
+        if r.action == "link":
+            await self._link(r)
+        elif r.action == "incident":
+            await self._incident(r)
+        else:
+            if r.action == "start_clock":
+                stmt = (
+                    sql_update(Order)
+                    .where(
+                        Order.id == r.order_row_id,
+                        Order.resolve_since.is_(None),
+                        Order.incident.is_(None),
+                        Order.settled_at.is_(None),
+                    )
+                    .values(resolve_since=r.at)
+                )
+            else:  # clear_clock: only the clock its read observed
+                stmt = (
+                    sql_update(Order)
+                    .where(Order.id == r.order_row_id, Order.resolve_since == r.clock)
+                    .values(resolve_since=None)
+                )
+            async with self._sessions() as session:
+                await session.execute(stmt)
+                await session.commit()
+
+    async def _link(self, r: OrderResolution) -> None:
+        async def build(session: AsyncSession) -> DomainEvent | None:
+            result = cast(
+                CursorResult[Any],
+                await session.execute(
+                    sql_update(Order)
+                    .where(
+                        Order.id == r.order_row_id,
+                        Order.broker_order_id.is_(None),
+                        Order.settled_at.is_(None),
+                        Order.incident.is_(None),
+                    )
+                    .values(broker_order_id=r.broker_order_id, updated_at=r.at)
+                ),
+            )
+            if result.rowcount != 1 or r.broker_order_id is None:
+                return None
+            order = await self._reread(session, r.order_row_id)
+            return OrderResolved(
+                ts=r.at,
+                cycle_id=order.cycle_id,
+                order_row_id=order.id,
+                broker_order_id=r.broker_order_id,
+                client_order_id=order.client_order_id,
+            )
+
+        if await self._bus.publish_tx(build, verify_unit) is not None:
+            log.info(
+                "risk.order_resolved", order_row=r.order_row_id, broker_order_id=r.broker_order_id
+            )
+
+    async def _incident(self, r: OrderResolution) -> None:
+        guard = [
+            Order.id == r.order_row_id,
+            Order.incident.is_(None),
+            Order.settled_at.is_(None),
+        ]
+        if r.clock is not None:  # type (b): only while the clock it observed still holds
+            guard.append(Order.resolve_since == r.clock)
+
+        async def build(session: AsyncSession) -> DomainEvent | None:
+            result = cast(
+                CursorResult[Any],
+                await session.execute(
+                    sql_update(Order)
+                    .where(*guard)
+                    .values(incident=r.reason, incident_at=r.at, resolve_since=None)
+                ),
+            )
+            if result.rowcount != 1 or r.reason is None:
+                return None
+            order = await self._reread(session, r.order_row_id)
+            return OrderIncident(
+                ts=r.at,
+                cycle_id=order.cycle_id,
+                order_row_id=order.id,
+                symbol=order.symbol or "",
+                side=order.side,
+                qty=order.qty,
+                client_order_id=order.client_order_id,
+                broker_order_id=order.broker_order_id,
+                reason=r.reason,
+                submitted_at=order.submitted_at,
+            )
+
+        event = await self._bus.publish_tx(build, verify_unit)
+        if isinstance(event, OrderIncident):
+            log.error(
+                "risk.order_incident",
+                order_row=event.order_row_id,
+                symbol=event.symbol,
+                reason=event.reason,
+            )
+
+    @staticmethod
+    async def _reread(session: AsyncSession, row_id: int) -> Order:
+        order = await session.get(Order, row_id, populate_existing=True)
+        if order is None:
+            raise LookupError(f"no order row {row_id}")
+        return order
 
     async def apply(self, update: OrderUpdate) -> Outcome:
         """Book one order's update in one transaction. Never raises for a deferral or an
