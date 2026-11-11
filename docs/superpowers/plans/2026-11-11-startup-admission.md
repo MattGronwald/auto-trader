@@ -759,7 +759,7 @@ text:
   - `cycle.admission_waiting` repeats every 10 min while admission is closed and names the
     current causes, including unsettled order rows; the per-cause lines
     (`admission.holdings_short`, `positions.*`, `risk.cash_fault_set`) give the details.
-- [ ] Replace "Current limits (WP 1.5d-2)": with `SimBroker` the
+  Replace "Current limits (WP 1.5d-2)": with `SimBroker` the
   runner places entries, and with Alpaca admission stays disabled until 1.6.
 - [ ] **Step 3: PLAN.md:** the "Current repo state" line (1.5d-3 done on the branch, not yet
   merged; adjust on merge) and a dated 1.5 row note naming spec, plan and the two Claude's calls
