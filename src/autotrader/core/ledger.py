@@ -356,8 +356,9 @@ class Ledger:
             return None  # a stale update for an order that is already settled
         applied = order.filled_qty + sum((f.qty for f in new), _D0)
         final = u.status in FINAL
-        # An exit is a close_position: the broker sells what it holds, which can exceed the
-        # qty recorded when exit() read the position. Only an entry's own qty bounds it.
+        # An exit sells an exact qty (its free holding, via submit_order), but rows from
+        # journals that closed with close_position can exceed their recorded qty: the sell
+        # side stays exempt. Only an entry's own qty bounds it.
         if order.side == "buy" and applied > order.qty:
             raise _Anomaly("overfilled", f"applied {applied} > ordered {order.qty}")
         if final and u.filled_qty < applied:

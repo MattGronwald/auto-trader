@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from pathlib import Path
-from typing import Any, NoReturn, TypeVar
+from typing import Any, NoReturn, TypeVar, cast
 
 import pytest
 from sqlalchemy import delete, select, update
@@ -261,15 +261,119 @@ async def test_entry_client_id_carries_the_journal_id(
     assert await second._journal_id() == jid
 
 
-async def test_missing_journal_id_rejects_entries(
+async def test_missing_journal_id_rejects_entries_but_not_exits(
     sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
 ) -> None:
+    await _held_btc(sim)
     async with sessions() as s:
         await s.execute(delete(m.ControlState).where(m.ControlState.key == repo.JOURNAL_ID_KEY))
         await s.commit()
-    result = await make_engine_(sim, sessions, gate).check(intent(cycle_id))
+    engine = make_engine_(sim, sessions, gate)
+    result = await engine.check(intent(cycle_id))
     assert result.decision.reasons == ("state unavailable: RuntimeError",)
     assert await orders(sessions) == []
+    with capture_logs() as logs:  # reduce-only exits must stay possible
+        exited = await engine.exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert exited.decision.approved and exited.status == "new"
+    (row,) = await orders(sessions)
+    assert row.client_order_id is None
+    assert any(e["event"] == "risk.journal_id_missing" and e["symbol"] == BTC for e in logs)
+
+
+class SellSpy(SimBroker):
+    """Records the orders submitted and any `close_position` call."""
+
+    submitted: list[BrokerOrder]
+    closes: list[str]
+
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        self.submitted.append(order)
+        return await super().submit_order(order)
+
+    async def close_position(self, symbol: str) -> OrderAck:
+        self.closes.append(symbol)
+        return await super().close_position(symbol)
+
+
+async def test_exit_submits_a_namespaced_market_sell_of_the_free_qty(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    broker = SellSpy(  # a base-fee buy leaves an off-increment holding (1 less the fee)
+        cash=D("1000"),
+        fees=FeeSchedule(maker_bps=D(15), taker_bps=D(25), buy_fee_asset="base"),
+        slippage_bps=D(0),
+        asset_rules={BTC: RULES},
+        timeframe="5m",
+    )
+    broker.process_bar(five(29))
+    broker.submitted, broker.closes = [], []
+    await broker.submit_order(BrokerOrder(symbol=BTC, side="buy", qty=D("1"), type="market"))
+    broker.process_bar(five(30))
+    broker.submitted.clear()
+    (held,) = await broker.get_positions()
+    result = await make_engine_(broker, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert result.decision.approved and result.status == "new"
+    (row,) = await orders(sessions)
+    (sent,) = broker.submitted
+    assert sent.client_order_id == f"at-{await _jid(sessions)}-o{row.id}"
+    assert row.client_order_id == sent.client_order_id
+    assert (sent.side, sent.type, sent.qty) == ("sell", "market", held.qty_available)
+    assert broker.closes == []
+    broker.process_bar(five(31))
+    assert await broker.get_positions() == []  # no holding and no dust remain
+
+
+class GatedSubmit(SimBroker):
+    """`submit_order` blocks on `release` for sells; records the engine's in-flight set."""
+
+    entered: asyncio.Event
+    release: asyncio.Event
+
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        self.entered.set()
+        await self.release.wait()
+        return await super().submit_order(order)
+
+
+async def test_in_flight_set_covers_insert_to_return(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    broker = cast(GatedSubmit, _sim(GatedSubmit))
+    broker.entered, broker.release = asyncio.Event(), asyncio.Event()
+    engine = make_engine_(broker, sessions, gate)
+    task = asyncio.create_task(engine.check(intent(cycle_id)))
+    await asyncio.wait_for(broker.entered.wait(), 10)
+    (row,) = await orders(sessions)
+    assert engine._in_flight == {row.id}
+    broker.release.set()
+    result = await task
+    assert result.status == "new" and engine._in_flight == set()
+
+
+async def test_in_flight_set_is_empty_after_a_gate_rejection(
+    sim: SimBroker, sessions: async_sessionmaker[AsyncSession], cycle_id: int
+) -> None:
+    engine = make_engine_(sim, sessions, StuckGate("raise"))
+    rejected = await engine.check(intent(cycle_id))
+    assert rejected.status == "not_submitted" and engine._in_flight == set()
+
+
+async def test_in_flight_set_covers_an_exit_too(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    broker = cast(GatedSubmit, _sim(GatedSubmit))
+    broker.entered, broker.release = asyncio.Event(), asyncio.Event()
+    broker.release.set()
+    await _held_btc(broker)
+    broker.entered.clear()
+    broker.release.clear()
+    engine = make_engine_(broker, sessions, gate)
+    task = asyncio.create_task(engine.exit(ExitRequest(symbol=BTC, reason="stop")))
+    await asyncio.wait_for(broker.entered.wait(), 10)
+    (row,) = await orders(sessions)
+    assert engine._in_flight == {row.id}
+    broker.release.set()
+    assert (await task).status == "new" and engine._in_flight == set()
 
 
 async def test_approved_entry_is_persisted_and_submitted(
@@ -756,7 +860,12 @@ async def test_exit_goes_through_while_killed(
     result = await make_engine_(sim, sessions, gate).exit(ExitRequest(symbol=BTC, reason="kill"))
     assert result.decision.approved and result.status == "new"
     (row,) = await orders(sessions)
-    assert (row.side, row.type, row.qty, row.client_order_id) == ("sell", "market", D("1"), None)
+    assert (row.side, row.type, row.qty, row.client_order_id) == (
+        "sell",
+        "market",
+        D("1"),
+        f"at-{await _jid(sessions)}-o{row.id}",
+    )
     (dec,) = await decisions(sessions)
     assert (dec.kind, dec.cycle_id) == ("exit", None)
 
@@ -953,8 +1062,10 @@ class HangingPositions(SimBroker):
 
 
 class HangingClose(SimBroker):
-    async def close_position(self, symbol: str) -> OrderAck:
-        await hang()
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "sell":
+            await hang()
+        return await super().submit_order(order)
 
 
 async def test_hung_exit_state_rejects_and_hung_close_is_unknown(
@@ -1057,9 +1168,11 @@ async def test_entry_exposure_counts_reserved_qty(
 class LostCloseAck(SimBroker):
     """The broker accepts the close, but the ack never arrives (timeout after submit)."""
 
-    async def close_position(self, symbol: str) -> OrderAck:
-        await super().close_position(symbol)
-        raise TimeoutError
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        ack = await super().submit_order(order)
+        if order.side == "sell":
+            raise TimeoutError
+        return ack
 
 
 def sells(broker: SimBroker) -> list[str]:
@@ -1117,7 +1230,7 @@ class RecordingEngine(RiskEngine):
 
 class SlowBroker(SimBroker):
     """Spends `spend` of the budget clock in `slow_call` ("get_account" or
-    "get_positions"); submit_order and close_position hang."""
+    "get_positions"); submit_order hangs."""
 
     mono: Mono | None = None
     spend = 0.0
@@ -1139,9 +1252,6 @@ class SlowBroker(SimBroker):
         if self.mono is not None:  # armed by the test; setup orders go through
             await hang()
         return await super().submit_order(order)
-
-    async def close_position(self, symbol: str) -> OrderAck:
-        await hang()
 
 
 def _recording(
@@ -1681,8 +1791,10 @@ async def test_sync_orders_reads_every_unsettled_row_once(
 
 
 class DustBroker(SimBroker):
-    async def close_position(self, symbol: str) -> OrderAck:
-        raise DustRemainder(symbol, D("0.00005"), RULES.min_qty)
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "sell":
+            raise DustRemainder(order.symbol, D("0.00005"), RULES.min_qty)
+        return await super().submit_order(order)
 
 
 async def test_a_dust_close_is_reported_as_dust(
@@ -1760,8 +1872,10 @@ async def test_snapshot_equity_returns_the_account_it_read(
 
 
 class UnavailableBroker(SimBroker):
-    async def close_position(self, symbol: str) -> OrderAck:
-        raise OrderMethodsUnavailable("AlpacaBroker.close_position is not implemented until WP 1.6")
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "sell":
+            raise OrderMethodsUnavailable("AlpacaBroker.submit_order is not implemented until 1.6")
+        return await super().submit_order(order)
 
     def can_place_orders(self) -> bool:
         return False

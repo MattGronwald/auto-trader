@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
 from autotrader.broker.base import (
+    BrokerOrder,
     DustRemainder,
     OrderAck,
     OrderMethodsUnavailable,
@@ -80,23 +81,31 @@ async def exit_decisions(sessions: async_sessionmaker[AsyncSession]) -> int:
 
 
 class RejectingClose(SimBroker):
-    async def close_position(self, symbol: str) -> OrderAck:
-        raise OrderRejected(f"no {symbol} today")
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "sell":
+            raise OrderRejected(f"no {order.symbol} today")
+        return await super().submit_order(order)
 
 
 class UnavailableClose(SimBroker):
-    async def close_position(self, symbol: str) -> OrderAck:
-        raise OrderMethodsUnavailable("stub")
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "sell":
+            raise OrderMethodsUnavailable("stub")
+        return await super().submit_order(order)
 
 
 class LostClose(SimBroker):
-    async def close_position(self, symbol: str) -> OrderAck:
-        raise RuntimeError("connection reset")
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "sell":
+            raise RuntimeError("connection reset")
+        return await super().submit_order(order)
 
 
 class DustClose(SimBroker):
-    async def close_position(self, symbol: str) -> OrderAck:
-        raise DustRemainder(BTC, D("0.00005"), RULES.min_qty)
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "sell":
+            raise DustRemainder(BTC, D("0.00005"), RULES.min_qty)
+        return await super().submit_order(order)
 
 
 class CannotTrade(SimBroker):

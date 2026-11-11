@@ -120,18 +120,18 @@ class CannotTrade(SimBroker):
 
 
 class EthCloseRejected(SimBroker):
-    async def close_position(self, symbol: str) -> OrderAck:
-        if symbol == ETH:
-            raise OrderRejected(f"no {symbol} today")
-        return await super().close_position(symbol)
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "sell" and order.symbol == ETH:
+            raise OrderRejected(f"no {order.symbol} today")
+        return await super().submit_order(order)
 
 
 class EthAckLost(SimBroker):
     """The ETH close lands at the broker, but its acknowledgement is lost."""
 
-    async def close_position(self, symbol: str) -> OrderAck:
-        ack = await super().close_position(symbol)
-        if symbol == ETH:
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        ack = await super().submit_order(order)
+        if order.side == "sell" and order.symbol == ETH:
             raise RuntimeError("connection reset")
         return ack
 
@@ -139,10 +139,10 @@ class EthAckLost(SimBroker):
 class BtcAckLost(SimBroker):
     """The BTC close raises before reaching the broker: the engine records `unknown`."""
 
-    async def close_position(self, symbol: str) -> OrderAck:
-        if symbol == BTC:
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "sell" and order.symbol == BTC:
             raise RuntimeError("connection reset")
-        return await super().close_position(symbol)
+        return await super().submit_order(order)
 
 
 class RacingEngine(RiskEngine):

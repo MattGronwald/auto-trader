@@ -10,7 +10,7 @@ work package that writes them. There is deliberately no
 update/delete for events and no delete anywhere (SPEC §4.8: nothing is deleted).
 """
 
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -404,7 +404,11 @@ async def insert_order(
     now: datetime,
     exit_reason: str | None = None,
     external: bool = False,
+    client_order_id_for: Callable[[int], str] | None = None,
 ) -> Order:
+    """Insert an order row. `client_order_id_for` derives the client id from the row id
+    (exit ids embed it): the row is flushed, stamped and committed in one transaction, so
+    it never exists without its id."""
     row = Order(
         cycle_id=cycle_id,
         client_order_id=client_order_id,
@@ -423,6 +427,9 @@ async def insert_order(
         external=external,
     )
     session.add(row)
+    if client_order_id_for is not None:
+        await session.flush()
+        row.client_order_id = client_order_id_for(row.id)
     await session.commit()
     return row
 

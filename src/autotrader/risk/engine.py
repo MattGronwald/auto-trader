@@ -3,7 +3,10 @@
 `check()` gathers state under the entry lock, runs the pure `check_entry`, persists the
 decision, applies a pause side effect on rejection, writes the order row, asks the
 control gate and re-checks engine health right before submitting, then submits. `exit()` is
-reduce-only and ignores kill/pause. Any failure while gathering rejects (fail closed).
+reduce-only and ignores kill/pause; it sells the free qty through `submit_order` like an
+entry does (`close_position` is never called). Every order carries a journal-namespaced client
+id (`risk/resolve.py`); an entry fails closed without the journal id, an exit goes out without
+a client id (logged). Any failure while gathering rejects (fail closed).
 
 Two locks: entries serialise on one, exits on another, and an exit never waits for an
 entry (a stalled journal call inside `check()` cannot block a stop-out). That is safe
@@ -38,7 +41,7 @@ order row `not_submitted` (`risk.entry_not_submitted`) and nothing is sent. Exit
 
 Each locked section has ONE budget of `io_timeout_s`, measured from taking its lock and
 shared by its network/gate awaits only (gate.status, get_account, get_positions, each
-asset_rules, get_order and order_fills, submit/close); each is wrapped in `_within`. Journal
+asset_rules, get_order and order_fills, submit_order); each is wrapped in `_within`. Journal
 reads and writes (every `self._sessions()` block, `_write_snapshot`) run outside any `wait_for`, so
 a timeout never cancels a DB session mid-statement or mid-commit; SQLite errors on a
 locked DB after `busy_timeout` (5 s) instead of hanging. A step whose budget is already
@@ -65,6 +68,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from autotrader.broker.base import (
     Account,
     Broker,
+    BrokerOrder,
     DustRemainder,
     Fill,
     Mode,
@@ -80,6 +84,7 @@ from autotrader.core.types import Bar, Quote
 from autotrader.journal import repo
 from autotrader.journal.models import Order
 from autotrader.risk.checks import check_entry, check_exit
+from autotrader.risk.resolve import exit_client_id
 from autotrader.risk.types import (
     FINAL,
     CancelResult,
@@ -179,6 +184,10 @@ class RiskEngine:
         self._entry_lock = asyncio.Lock()  # check(): two entries never pass check 5 together
         self._exit_lock = asyncio.Lock()  # exit(): never waits for an entry
         self._cached_journal_id: str | None = None
+        # Row ids of orders `check()`/`exit()` is handling right now: added once the row is
+        # inserted, dropped when the call returns. The order resolver (spec 2026-11-10) skips
+        # these rows; it never links a row whose submit is still in progress.
+        self._in_flight: set[int] = set()
 
     async def _journal_id(self) -> str | None:
         """The journal's id (client ids embed it), read once and cached when found."""
@@ -270,32 +279,38 @@ class RiskEngine:
                     status="pending",
                     now=now,
                 )
+                # Inside the block, before the session closes (an await): see `_in_flight`.
+                self._in_flight.add(row.id)
             try:
-                final = await self._within(deadline, lambda: self._gate.status(self._clock()))
-                allowed, reasons = final.entries_allowed, list(final.reasons)
-            except Exception as e:  # an unanswered gate is not an allowed gate
-                allowed, reasons = False, [f"gate unavailable: {type(e).__name__}"]
-            if not allowed:
-                await self._set_status(row.id, "not_submitted")
-                log.warning("risk.entry_not_submitted", reasons=reasons)
-                return OrderResult(decision, row.id, "not_submitted")
-            # Health may have turned bad since the gather (spec 2026-11-09 6.1): synchronous
-            # state and clock reads only, so no await separates this from the submit.
-            late = (
-                *self.health_faults(),
-                *(
-                    ("trading day changed",)
-                    if day_start(self._clock(), self._tz) != day_start(now, self._tz)
-                    else ()
-                ),
-            )
-            if late:
-                await self._set_status(row.id, "not_submitted")
-                log.warning("risk.entry_not_submitted", reasons=list(late))
-                return OrderResult(decision, row.id, "not_submitted")
-            return await self._submit(
-                row.id, decision, deadline, lambda: self._broker.submit_order(order)
-            )
+                try:
+                    final = await self._within(deadline, lambda: self._gate.status(self._clock()))
+                    allowed, reasons = final.entries_allowed, list(final.reasons)
+                except Exception as e:  # an unanswered gate is not an allowed gate
+                    allowed, reasons = False, [f"gate unavailable: {type(e).__name__}"]
+                if not allowed:
+                    await self._set_status(row.id, "not_submitted")
+                    log.warning("risk.entry_not_submitted", reasons=reasons)
+                    return OrderResult(decision, row.id, "not_submitted")
+                # Health may have turned bad since the gather (spec 2026-11-09 6.1):
+                # synchronous state and clock reads only, so no await separates this from
+                # the submit.
+                late = (
+                    *self.health_faults(),
+                    *(
+                        ("trading day changed",)
+                        if day_start(self._clock(), self._tz) != day_start(now, self._tz)
+                        else ()
+                    ),
+                )
+                if late:
+                    await self._set_status(row.id, "not_submitted")
+                    log.warning("risk.entry_not_submitted", reasons=list(late))
+                    return OrderResult(decision, row.id, "not_submitted")
+                return await self._submit(
+                    row.id, decision, deadline, lambda: self._broker.submit_order(order)
+                )
+            finally:
+                self._in_flight.discard(row.id)
 
     async def _gather_entry(
         self, symbol: str, now: datetime, deadline: float
@@ -515,7 +530,7 @@ class RiskEngine:
             return OrderResult(decision, row_id, "not_submitted")
         try:
             ack = await self._within(deadline, call)
-        except DustRemainder as e:  # close_position only: report dust as a type (1.5c)
+        except DustRemainder as e:  # a full free sell below min_qty: report dust as a type (1.5c)
             log.warning("risk.exit_dust", order_row=row_id, qty=str(e.qty), min_qty=str(e.min_qty))
             await self._set_status(row_id, "rejected")
             return OrderResult(decision, row_id, "rejected", dust=True, min_qty=e.min_qty)
@@ -574,8 +589,10 @@ class RiskEngine:
     # --- exits -----------------------------------------------------------------------
 
     async def exit(self, request: ExitRequest) -> OrderResult:
-        """Reduce-only full exit (G1). No gate check: kill and pause never block it.
-        Carries no client_order_id because `Broker.close_position` takes none."""
+        """Reduce-only full exit (G1). No gate check: kill and pause never block it. Sells the
+        free qty with `submit_order` as a market order whose client id (`at-{jid}-o{row}`)
+        is stamped on the row when it is inserted; without a journal id it goes out with
+        none (logged), because an exit must stay possible."""
         async with self._exit_lock:
             deadline = self._monotonic() + self._io_timeout
             now = self._clock()
@@ -602,6 +619,9 @@ class RiskEngine:
                 if not position.is_dust:  # open sells reserve the whole holding: a failure
                     return OrderResult(decision)
                 return OrderResult(decision, dust=True, min_qty=position.min_qty)
+            jid = await self._journal_id()
+            if jid is None:  # reduce-only exits stay possible; the row just has no client id
+                log.error("risk.journal_id_missing", symbol=request.symbol)
             async with self._sessions() as session:
                 row = await repo.insert_order(
                     session,
@@ -619,10 +639,23 @@ class RiskEngine:
                     now=now,
                     exit_reason=request.reason,
                     external=request.external,
+                    client_order_id_for=None if jid is None else partial(exit_client_id, jid),
                 )
-            return await self._submit(
-                row.id, decision, deadline, lambda: self._broker.close_position(request.symbol)
-            )
+                self._in_flight.add(row.id)  # inside the block: see `_in_flight`
+            try:
+                sell = BrokerOrder(
+                    symbol=request.symbol,
+                    side="sell",
+                    qty=decision.qty,
+                    type="market",
+                    time_in_force="gtc",
+                    client_order_id=row.client_order_id,
+                )
+                return await self._submit(
+                    row.id, decision, deadline, lambda: self._broker.submit_order(sell)
+                )
+            finally:
+                self._in_flight.discard(row.id)
 
     async def cancel_open_entries(self, exclude: Collection[int] = ()) -> CancelResult:
         """Cancel unsettled, non-final entry (buy) orders at the broker, under the exit lock
