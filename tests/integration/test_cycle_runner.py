@@ -173,6 +173,8 @@ async def wire(
         sessions=sessions,
         clock=lambda: NOW,
     )
+    await runner.recover()
+    runner.open_admission()
     return runner, bus
 
 
@@ -277,7 +279,6 @@ async def test_forced_shutdown_after_broker_acceptance_keeps_the_order_recoverab
 
     # Next start: recovery must not end it, and the symbol stays reserved.
     runner2, bus2 = await wire(tmp_path, sessions, broker)
-    await runner2.recover()
     async with sessions() as s:
         assert await repo.cycle_state(s, cycle.id) == "RISK_CHECK"
     with capture_logs() as logs:

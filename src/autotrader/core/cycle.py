@@ -17,7 +17,8 @@ operator. Orders are reconciled by order row, not cycle state: an ERROR
 cycle may own a real `pending` order.
 
 Any `CommitUncertain` suspends admission for the rest of the process; `recover()` on
-the next start resolves the uncertain rows (§9).
+the next start resolves the uncertain rows (§9). Admission starts closed and is opened by
+`run core`'s readiness loop (WP 1.5d-3).
 """
 
 import asyncio
@@ -231,10 +232,41 @@ class CycleRunner:
         self._closing = False
         self._suspended = False
         self._admitting_started = False
+        self._recovered = False
+        self._open = False
+        self._disabled: tuple[str, ...] = ()
 
     @property
     def admission_suspended(self) -> bool:
         return self._suspended
+
+    @property
+    def admission_open(self) -> bool:
+        return self._open
+
+    @property
+    def admission_disabled(self) -> tuple[str, ...]:
+        return self._disabled
+
+    def disable_admission(self, reason: str) -> None:
+        """Keep admission closed for the rest of the process. Ordered, deduplicated; no log."""
+        if reason not in self._disabled:
+            self._disabled = (*self._disabled, reason)
+
+    def open_admission(self) -> None:
+        """Let candidates in, once `recover()` has completed cleanly and nothing disabled it.
+
+        A no-op while closing (a readiness tick racing teardown must not admit), when disabled,
+        and when already open.
+        """
+        if self._closing:
+            return
+        if not self._recovered:
+            raise RuntimeError("open_admission() needs a clean recover()")
+        if self._disabled or self._open:
+            return
+        self._open = True
+        log.info("cycle.admission_open")
 
     def _suspend(self, error: CommitUncertain) -> None:
         """`on_uncertain` callback: called by the bus-owned unit itself (D15)."""
@@ -262,6 +294,10 @@ class CycleRunner:
             return "shutting down"
         if self._suspended:
             return "admission suspended: commit uncertain"
+        if self._disabled:
+            return "admission disabled: " + ", ".join(self._disabled)
+        if not self._open:
+            return "startup reconciliation pending"
         return None
 
     @staticmethod
@@ -347,13 +383,12 @@ class CycleRunner:
     # --- recovery --------------------------------------------------------------------
 
     async def recover(self) -> None:
-        """Startup: end cycles that provably sent nothing; leave the rest to the ledger (WP 1.5b;
-        startup reconciliation is 1.5d).
+        """Startup: end cycles that provably sent nothing; leave the rest to the ledger (WP 1.5b).
 
         Must run before the first admission (`RuntimeError` otherwise): run later, it could
         move a live cycle's RISK_CHECK to ERROR before `check()` inserts its order row.
-        Fails closed: the first failed write aborts and raises; the caller must then not
-        subscribe the runner.
+        Fails closed: the first failed write aborts and raises; the caller must then disable
+        admission and not subscribe the runner. `_recovered` is set only after the last write.
         """
         if self._admitting_started or self._tasks:
             raise RuntimeError("recover() must run before admission")
@@ -367,6 +402,7 @@ class CycleRunner:
                     await self._move(row.id, state, S.ERROR, reason="interrupted")
                 else:
                     log.warning("cycle.awaiting_reconciliation", state=state)
+        self._recovered = True
 
     # --- shutdown --------------------------------------------------------------------
 
