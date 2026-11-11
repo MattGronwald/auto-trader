@@ -191,14 +191,17 @@ settle. A journal without a `journal_id` row (hand-deleted) fails entries closed
 
 ### What the resolver does
 
-The ledger's 2 s sync pass (`RiskEngine.sync_orders`; `check()` only reads its result) resolves
-two kinds of unsettled row:
+The ledger's 2 s sync pass (`RiskEngine.sync_orders`) resolves two kinds of unsettled row
+(`check()` runs its own order read before an entry, without the resolver):
 - (a) `pending`/`unknown` with no broker id and no submit call in flight;
 - (b) a row with a broker id whose `get_order` raised `OrderNotFound`.
 
-It looks the order up by client id. A match on symbol, side, qty and creation time (5 minutes of
-skew) links the row (`risk.order_resolved`, `OrderResolved` event; the next read books its fills
-and settles it). A zero match or a failed lookup waits: the bound is 80 s from `submitted_at`
+A row without a client id of this journal becomes a `no_ownership_proof` incident at once (no
+lookup, no bound). Otherwise it looks the order up by client id. For (a), a match on symbol, side,
+qty and creation time (5 minutes of skew) links the row (`risk.order_resolved`, `OrderResolved`
+event; the next read books its fills and settles it). For (b), a match links nothing: the row
+keeps its clock and becomes `lookup_inconsistent` at the bound. A zero match or a failed lookup
+waits: the bound is 80 s from `submitted_at`
 for (a), or from the first `OrderNotFound` (persisted as `resolve_since`, restart-safe) for (b).
 Past it, or at once on a mismatch, the row becomes an incident: `risk.order_incident` (error),
 an `OrderIncident` event, and a reminder `risk.order_incident_open` every 60 s while it is
@@ -282,13 +285,18 @@ resumes the manual pause.
    UPDATE orders SET broker_order_id = '<broker id>', incident = NULL, incident_at = NULL
    WHERE id = <row>;
    ```
+   This writes no `OperatorRepair` event, so nothing in the journal records why: put the
+   evidence (broker order id, what matched, who, when) in your ticket or operator notes.
    (`not_submitted` for such a row is `repair not-submitted`, same evidence rule as step 4.)
 6. Start the core again. Confirm the row settles (`settled_at` set) and the incident reminders
    stop. A row left unrepaired keeps reminding every 60 s and holding back its symbol; that is
    expected. Resume the manual pause only after this (see "Resuming after a pause").
 
 Undoing `repair not-submitted` is manual and only safe with the core stopped, when the mark was
-wrong and the broker order is identified. Back up `data/autotrader.db` first, then set the broker
+wrong and the broker order is identified. First check for a later order row on the same symbol
+that settled after the mark (`SELECT id, side, status, settled_at FROM orders WHERE symbol =
+'<SYM>' AND id > <row> AND settled_at IS NOT NULL;`); if one exists, do not undo: the journal
+booked on top of the mark, so escalate. Otherwise back up `data/autotrader.db` first, then set the broker
 id and the status back (`pending` or `unknown`, as the `OperatorRepair` event's `before` shows):
 
 ```sql
