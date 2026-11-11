@@ -1813,6 +1813,22 @@ async def test_stale_type_b_incident_is_not_written(
     assert [e.payload["order_row_id"] for e in events] == [live]
 
 
+async def test_type_a_incident_never_marks_a_row_with_a_broker_id(
+    sessions: async_sessionmaker[AsyncSession], ledger: Ledger
+) -> None:
+    # A type (a) decision (no clock) read the row without a broker id; the row was acked
+    # before the write, so the stale decision must not mark it.
+    acked = await bare_row(sessions, broker_order_id="b-1")
+
+    with capture_logs() as logs:
+        await ledger.apply_resolutions([incident(acked, "not_found")])
+
+    assert unit_failures(logs) == []
+    o = await order_row(sessions, acked)
+    assert (o.incident, o.incident_at) == (None, None)
+    assert "OrderIncident" not in await event_types(sessions)
+
+
 async def test_clear_committed_inside_the_incident_unit_wins(
     sessions: async_sessionmaker[AsyncSession],
     hooked: tuple[Ledger, list[DomainEvent], EventBus],

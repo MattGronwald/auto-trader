@@ -318,25 +318,28 @@ class RiskEngine:
                 log.info("risk.entry_rejected", symbol=intent.symbol, reason=decision.reasons[0])
                 return OrderResult(decision)
             order = decision.order
-            async with self._sessions() as session:
-                row = await repo.insert_order(
-                    session,
-                    cycle_id=intent.cycle_id,
-                    client_order_id=order.client_order_id,
-                    symbol=intent.symbol,
-                    mode=self._mode,
-                    type_=order.type,
-                    side=order.side,
-                    qty=order.qty,
-                    limit_price=order.limit_price,
-                    stop_price=intent.stop,
-                    tp_price=intent.take_profit,
-                    status="pending",
-                    now=now,
-                )
-                # Inside the block, before the session closes (an await): see `_in_flight`.
-                self._in_flight.add(row.id)
+            claimed: list[int] = []  # the row id this call put into `_in_flight`
             try:
+                async with self._sessions() as session:
+                    row = await repo.insert_order(
+                        session,
+                        cycle_id=intent.cycle_id,
+                        client_order_id=order.client_order_id,
+                        symbol=intent.symbol,
+                        mode=self._mode,
+                        type_=order.type,
+                        side=order.side,
+                        qty=order.qty,
+                        limit_price=order.limit_price,
+                        stop_price=intent.stop,
+                        tp_price=intent.take_profit,
+                        status="pending",
+                        now=now,
+                    )
+                    # Inside the block, before the session closes (an await): see `_in_flight`.
+                    # The `finally` below covers that close too: a cancel there must not leak it.
+                    self._in_flight.add(row.id)
+                    claimed.append(row.id)
                 try:
                     final = await self._within(deadline, lambda: self._gate.status(self._clock()))
                     allowed, reasons = final.entries_allowed, list(final.reasons)
@@ -365,7 +368,7 @@ class RiskEngine:
                     row.id, decision, deadline, lambda: self._broker.submit_order(order)
                 )
             finally:
-                self._in_flight.discard(row.id)
+                self._in_flight.difference_update(claimed)
 
     async def _gather_entry(
         self, symbol: str, now: datetime, deadline: float
@@ -820,27 +823,29 @@ class RiskEngine:
             jid = await self._journal_id()
             if jid is None:  # reduce-only exits stay possible; the row just has no client id
                 log.error("risk.journal_id_missing", symbol=request.symbol)
-            async with self._sessions() as session:
-                row = await repo.insert_order(
-                    session,
-                    cycle_id=request.cycle_id,
-                    client_order_id=None,
-                    symbol=request.symbol,
-                    mode=self._mode,
-                    type_="market",
-                    side="sell",
-                    qty=decision.qty,
-                    limit_price=None,
-                    stop_price=None,
-                    tp_price=None,
-                    status="pending",
-                    now=now,
-                    exit_reason=request.reason,
-                    external=request.external,
-                    client_order_id_for=None if jid is None else partial(exit_client_id, jid),
-                )
-                self._in_flight.add(row.id)  # inside the block: see `_in_flight`
+            claimed: list[int] = []  # the row id this call put into `_in_flight`
             try:
+                async with self._sessions() as session:
+                    row = await repo.insert_order(
+                        session,
+                        cycle_id=request.cycle_id,
+                        client_order_id=None,
+                        symbol=request.symbol,
+                        mode=self._mode,
+                        type_="market",
+                        side="sell",
+                        qty=decision.qty,
+                        limit_price=None,
+                        stop_price=None,
+                        tp_price=None,
+                        status="pending",
+                        now=now,
+                        exit_reason=request.reason,
+                        external=request.external,
+                        client_order_id_for=None if jid is None else partial(exit_client_id, jid),
+                    )
+                    self._in_flight.add(row.id)  # inside the block: see `_in_flight`
+                    claimed.append(row.id)
                 sell = BrokerOrder(
                     symbol=request.symbol,
                     side="sell",
@@ -853,7 +858,7 @@ class RiskEngine:
                     row.id, decision, deadline, lambda: self._broker.submit_order(sell)
                 )
             finally:
-                self._in_flight.discard(row.id)
+                self._in_flight.difference_update(claimed)
 
     async def cancel_open_entries(self, exclude: Collection[int] = ()) -> CancelResult:
         """Cancel unsettled, non-final entry (buy) orders at the broker, under the exit lock

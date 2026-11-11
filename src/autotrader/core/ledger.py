@@ -36,9 +36,10 @@ Order resolver decisions (WP 1.5d-2, spec 2026-11-10 3.5-3.7) arrive with the sy
 Each is a conditional `UPDATE` whose guard lives in its `WHERE` clause (never a Python check
 before the write: another session may commit between the two): a link only on a row with no
 broker id, no incident and no settlement (`OrderResolved`); an incident only once
-(`OrderIncident`), and a type (b) incident only while `resolve_since` still holds the clock
-its decision observed; a clock start never moves an existing clock, and a clear only erases
-the clock it observed. A write that matched no row writes nothing and publishes nothing.
+(`OrderIncident`), a type (a) incident only while the row still has no broker id, and a
+type (b) incident only while `resolve_since` still holds the clock its decision observed; a
+clock start never moves an existing clock, and a clear only erases the clock it observed. A
+write that matched no row writes nothing and publishes nothing.
 
 Money columns are text on SQLite, so Decimal values are compared in Python, never in SQL.
 """
@@ -430,6 +431,8 @@ class Ledger:
         ]
         if r.clock is not None:  # type (b): only while the clock it observed still holds
             guard.append(Order.resolve_since == r.clock)
+        else:  # type (a): only while the row still has no broker id (not acked since the read)
+            guard.append(Order.broker_order_id.is_(None))
 
         async def build(session: AsyncSession) -> DomainEvent | None:
             result = cast(

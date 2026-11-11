@@ -143,6 +143,19 @@ async def test_commit_refuses_a_row_changed_since_prepare(r: Rig) -> None:
     assert await repairs(r.sessions) == []
 
 
+async def test_not_submitted_refuses_a_row_acked_since_prepare(r: Rig) -> None:
+    row = await tr.insert_row(r.sessions, cid=None)
+    plan = await prepare_not_submitted(r.sessions, row)
+    async with r.sessions() as s:  # e.g. the resolver linked the row in between
+        await s.execute(update(m.Order).where(m.Order.id == row).values(broker_order_id="b-1"))
+        await s.commit()
+    with pytest.raises(RepairRefused, match="row changed since it was read"):
+        await do(r, plan)
+    after = await tr.order(r.sessions, row)
+    assert (after.status, after.broker_order_id) == ("pending", "b-1")
+    assert await repairs(r.sessions) == []
+
+
 async def test_commit_refuses_a_row_settled_since_prepare(r: Rig) -> None:
     row = await tr.insert_row(r.sessions, cid=None)
     plan = await prepare_not_submitted(r.sessions, row)

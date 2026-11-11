@@ -3,6 +3,7 @@
 import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
@@ -302,7 +303,7 @@ class SellSpy(SimBroker):
 async def test_exit_submits_a_namespaced_market_sell_of_the_free_qty(
     sessions: async_sessionmaker[AsyncSession], gate: ControlGate
 ) -> None:
-    broker = SellSpy(  # a base-fee buy leaves an off-increment holding (1 less the fee)
+    broker = SellSpy(  # a base-fee buy leaves an off-increment holding (1.0001 less 0.25 %)
         cash=D("1000"),
         fees=FeeSchedule(maker_bps=D(15), taker_bps=D(25), buy_fee_asset="base"),
         slippage_bps=D(0),
@@ -311,10 +312,11 @@ async def test_exit_submits_a_namespaced_market_sell_of_the_free_qty(
     )
     broker.process_bar(five(29))
     broker.submitted, broker.closes = [], []
-    await broker.submit_order(BrokerOrder(symbol=BTC, side="buy", qty=D("1"), type="market"))
+    await broker.submit_order(BrokerOrder(symbol=BTC, side="buy", qty=D("1.0001"), type="market"))
     broker.process_bar(five(30))
     broker.submitted.clear()
     (held,) = await broker.get_positions()
+    assert held.qty % RULES.qty_increment != 0  # the precondition this test is about
     result = await make_engine_(broker, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
     assert result.decision.approved and result.status == "new"
     (row,) = await orders(sessions)
@@ -378,6 +380,60 @@ async def test_in_flight_set_covers_an_exit_too(
     assert engine._in_flight == {row.id}
     broker.release.set()
     assert (await task).status == "new" and engine._in_flight == set()
+
+
+def cancel_at_insert_close(
+    sessions: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> async_sessionmaker[AsyncSession]:
+    """A session factory whose session that inserted an order row raises `CancelledError`
+    as it closes (the row is committed): a cancellation at the session's last await."""
+    armed: list[bool] = []
+    real_insert = repo.insert_order
+
+    async def insert(session: AsyncSession, **kw: Any) -> m.Order:
+        row = await real_insert(session, **kw)
+        armed.append(True)
+        return row
+
+    monkeypatch.setattr(repo, "insert_order", insert)
+
+    @asynccontextmanager
+    async def factory() -> AsyncIterator[AsyncSession]:
+        async with sessions() as session:
+            yield session
+        if armed:
+            armed.clear()
+            raise asyncio.CancelledError
+
+    return cast(async_sessionmaker[AsyncSession], factory)
+
+
+async def test_in_flight_set_is_empty_after_a_cancel_at_entry_session_close(
+    sim: SimBroker,
+    sessions: async_sessionmaker[AsyncSession],
+    gate: ControlGate,
+    cycle_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = make_engine_(sim, cancel_at_insert_close(sessions, monkeypatch), gate)
+    with pytest.raises(asyncio.CancelledError):
+        await engine.check(intent(cycle_id))
+    assert len(await orders(sessions)) == 1  # the row was inserted, then the close cancelled
+    assert engine._in_flight == set()
+
+
+async def test_in_flight_set_is_empty_after_a_cancel_at_exit_session_close(
+    sim: SimBroker,
+    sessions: async_sessionmaker[AsyncSession],
+    gate: ControlGate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _held_btc(sim)
+    engine = make_engine_(sim, cancel_at_insert_close(sessions, monkeypatch), gate)
+    with pytest.raises(asyncio.CancelledError):
+        await engine.exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert len(await orders(sessions)) == 1
+    assert engine._in_flight == set()
 
 
 async def test_approved_entry_is_persisted_and_submitted(

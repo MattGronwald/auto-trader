@@ -5,7 +5,8 @@ preconditions and returns a `RepairPlan` (the columns it will change, their curr
 and the new ones); any failed precondition raises `RepairRefused` with the reason the CLI
 prints. `commit` writes the plan's row change and one `OperatorRepair` audit event in one
 `EventBus.publish_tx` unit, and only while every planned column still holds the value the
-plan read (conditional `UPDATE`); otherwise nothing is written and it raises `RepairRefused`.
+plan read (conditional `UPDATE`; `not_submitted` also re-checks that the row still has no
+broker id); otherwise nothing is written and it raises `RepairRefused`.
 
 - `link` (5.2): records the broker id of an unsettled row that has none (`pending`/`unknown`)
   or that is a type (b) incident, after the broker's order found by the row's own
@@ -188,6 +189,9 @@ async def commit(
     if not evidence.strip():
         raise RepairRefused("evidence is required")
     refused: list[str] = []
+    # `not_submitted` also needs the row still without a broker id: one acked or linked since
+    # `prepare_not_submitted` read it was submitted. Not a planned column (no `after` value).
+    extra = [Order.broker_order_id.is_(None)] if plan.action == "not_submitted" else []
 
     async def build(session: AsyncSession) -> DomainEvent | None:
         # A refusal is recorded, not raised: an exception here would be logged as a failed
@@ -200,6 +204,7 @@ async def commit(
                     Order.id == plan.order_row_id,
                     Order.settled_at.is_(None),
                     *(_guard(column, value) for column, value in plan.before.items()),
+                    *extra,
                 )
                 .values(**plan.after, updated_at=now)
             ),
