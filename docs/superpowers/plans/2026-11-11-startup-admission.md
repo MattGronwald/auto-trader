@@ -347,18 +347,22 @@ text:
   5. If `T_b` is set and the holdings check has passed, read `g3 = await ledger.cash_guard()`
      (Codex review of 95d350c: a cached pass must not let admission open past an exit the
      Position Manager placed after it). A raising `g3` read counts as a failed holdings read
-     (step 4's streak rule) and returns `False`. After `g3`, decide **synchronously, with no
-     await until the return** (Codex review of 9b0003f: the fault or the report can change while
-     `g3` awaits, without moving the generation), in this order:
-     - `risk.cash_fault is not None`: forget `T_b` and the cached pass (the step 2 reset), return
-       `False`;
-     - (c) does not hold on the latest report: return `False`;
-     - `g3.unsettled`: return `False` (`unmet` gets `"unsettled order rows"`);
+     (step 4's streak rule) and is not ready. After `g3`, decide **synchronously, with no
+     await until `return True`** (Codex review of 9b0003f: the fault or the report can change
+     while `g3` awaits, without moving the generation), in this order:
+     - `risk.cash_fault is not None`: forget `T_b` and the cached pass (the step 2 reset), not
+       ready;
+     - (c) does not hold on the latest report: not ready;
+     - `g3.unsettled`: not ready (`unmet` gets `"unsettled order rows"`);
      - `g3.generation` differs from the pass's generation: drop the cached pass (the holdings
-       check runs again on the next tick), return `False`;
-     - otherwise return `True`.
-     When `T_b` is unset or the holdings check has not passed, return `False` without `g3`.
-  6. Else, once `now - created >= waiting_after_s`, log `cycle.admission_waiting` (warning), then
+       check runs again on the next tick), not ready;
+     - otherwise `return True`.
+     When `T_b` is unset or the holdings check has not passed, skip `g3`: not ready.
+     **Every not-ready outcome** (including the steps above and a failed `g3`) records its
+     `unmet` reasons and continues to step 6, which logs if due and then returns `False`
+     (Codex review of e8ad3b0). The no-await rule protects only the `True` path; step 6 may
+     await its diagnostic guard read because the call can only return `False` from there.
+  6. Not ready: once `now - created >= waiting_after_s`, log `cycle.admission_waiting` (warning), then
      again every `WAITING_REPEAT_S = 600.0` (module constant) while admission stays closed (D21
      note 2026-11-11, plan review: one line is not enough for a cause that persists or appears
      later). The line carries `unmet: list[str]`. While the fault is set, the entries are
@@ -415,7 +419,9 @@ text:
     success, then a failure, gives a second warning.
   - `test_waiting_logged_after_three_snapshot_intervals_and_repeated`: `waiting_after_s=180`.
     `advance(179)` and `ready()`: no log. `advance(1)`: one `cycle.admission_waiting`.
-    `advance(599)`: no more. `advance(1)`: a second one.
+    `advance(599)`: no more. `advance(1)`: a second one. Parametrize over two not-ready
+    states: the cash fault set (no `T_b`), and `T_b` set with a cached holdings pass but an
+    incomplete latest report (Codex review of e8ad3b0: both must reach the waiting logger).
   - `test_waiting_names_unsettled_rows_while_the_fault_is_set`: fault `not yet reconciled`, the
     guard shows `unsettled=True`: `unmet == ["cash check not completed: not yet reconciled",
     "unsettled order rows"]`.
