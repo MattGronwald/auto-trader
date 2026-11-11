@@ -195,6 +195,12 @@ async def _snapshot_step(risk: _Snapshotter, ledger: _CashChecker) -> None:
         risk.cash_reconciled()
 
 
+async def _manage_step(pm: PositionManager) -> None:
+    """The `positions.manage` step: the loop discards the report (replaced by the readiness
+    tracker in WP 1.5d-3)."""
+    await pm.step()
+
+
 async def _sync_step(risk: RiskEngine, ledger: Ledger) -> None:
     """One order sync: read the unsettled orders from the broker, then book them. Failures
     are logged, never raised (the engine bounds its broker reads, `io_timeout_s`)."""
@@ -311,7 +317,9 @@ async def run_core(
                     2 * snapshot_s,
                 ),
                 Loop("ledger.sync", partial(_sync_step, risk, ledger), sync_s, SYNC_STALL_S),
-                Loop("positions.manage", pm.step, manage_s, MANAGE_STALL_S, "error"),
+                Loop(
+                    "positions.manage", partial(_manage_step, pm), manage_s, MANAGE_STALL_S, "error"
+                ),
             ],
             [Freshness("risk.snapshot", lambda: risk.last_snapshot_at, 2 * snapshot_s)],
         )

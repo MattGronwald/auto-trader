@@ -12,6 +12,9 @@ never holds a broker: it talks to the Risk Engine only.
 Durable (journal): the latch (`exit_trigger`, `exit_triggered_at`), `time_limit_at` and the
 trailing values. A latched trigger is never re-evaluated and a restart honours it.
 
+`step()` returns a `StepReport` (one `PositionCheck` outcome per open position it read) for
+the admission readiness check (WP 1.5d-3); the supervised loop discards it.
+
 In memory (per process, forgotten on restart): the retry backoff, the pending sell rows
 whose outcome is still to be judged (clarification 5: each settled row counts once by id;
 an accepted order never resets the backoff, a settled fill does), the dust hold-back and
@@ -54,9 +57,10 @@ a `--cancel` record or a newer request.
 import math
 import typing
 from collections.abc import Callable, Collection, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -93,6 +97,25 @@ ALERT_EVERY = timedelta(seconds=60)
 STUCK_AFTER = timedelta(seconds=60)
 PENDING_EVERY = timedelta(seconds=10)
 _REASONS = frozenset(typing.get_args(ExitReason))
+
+PositionOutcome = Literal["evaluated", "latched", "no_bid", "failed"]
+
+
+@dataclass(frozen=True)
+class PositionCheck:
+    position_id: int
+    symbol: str
+    outcome: PositionOutcome
+
+
+@dataclass(frozen=True)
+class StepReport:
+    positions: tuple[PositionCheck, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        """True when every position was evaluated or already latched (empty: True)."""
+        return all(p.outcome in ("evaluated", "latched") for p in self.positions)
 
 
 class ExitTriggered(LedgerEvent):
@@ -176,7 +199,9 @@ class PositionManager:
         self._entry_unresolved: set[int] = set()  # id-less entry rows already logged
         self._last_pending: tuple[str, datetime] | None = None  # (request ts, last refresh)
 
-    async def step(self) -> None:
+    async def step(self) -> StepReport:
+        """Run one pass. Returns a per-position report for the admission readiness check
+        (WP 1.5d-3); the supervised loop discards it."""
         now = self._clock()
         can_trade = self._risk.can_place_orders()
         if not can_trade and not self._cannot_trade_logged:
@@ -187,16 +212,21 @@ class PositionManager:
             positions = await repo.open_positions(session)
             unsettled = await repo.unsettled_orders(session)
         await self._monitor_external(unsettled, now)
+        checks: list[PositionCheck] = []
         for pos in positions:
             with bind_cycle(pos.cycle_id):
+                outcome: PositionOutcome
                 try:
-                    await self._manage(pos, unsettled, now, can_trade)
+                    outcome = await self._manage(pos, unsettled, now, can_trade)
                 except Exception:
                     log.exception("positions.step_failed", position_id=pos.id, symbol=pos.symbol)
+                    outcome = "failed"
+                checks.append(PositionCheck(pos.id, pos.symbol, outcome))
         self._alert_stale_held({p.symbol for p in positions})
         self._forget({p.id for p in positions})
         if request is not None:
             await self._flat_check(request, now, can_trade)
+        return StepReport(tuple(checks))
 
     # --- control: kill handling, flatten passes, external sales -----------------------
 
@@ -442,7 +472,7 @@ class PositionManager:
 
     async def _manage(
         self, pos: Position, unsettled: Sequence[Order], now: datetime, can_trade: bool
-    ) -> None:
+    ) -> PositionOutcome:
         time_limit = pos.time_limit_at
         if time_limit is None:
             time_limit = pos.opened_at + timedelta(minutes=self._profile.risk.max_hold_min)
@@ -452,17 +482,22 @@ class PositionManager:
             log.warning("positions.unprotected", position_id=pos.id, symbol=pos.symbol)
             self._unprotected.add(pos.id)
         trigger = pos.exit_trigger
+        outcome: PositionOutcome = "latched"
         if trigger is None:
-            trigger = await self._evaluate(pos, time_limit)
+            trigger, outcome = await self._evaluate(pos, time_limit)
             if trigger is None:
-                return
+                return outcome
         if can_trade:
             sells = [o for o in unsettled if o.symbol == pos.symbol and o.side == "sell"]
             await self._exit_path(pos, trigger, sells, now)
+        return outcome
 
-    async def _evaluate(self, pos: Position, time_limit: datetime) -> str | None:
-        """The fired and latched reason, or None (nothing fired, or the latch failed). Judged
-        at a fresh clock reading, not the step start (D18: see the module docstring)."""
+    async def _evaluate(
+        self, pos: Position, time_limit: datetime
+    ) -> tuple[str | None, PositionOutcome]:
+        """The fired and latched reason (or None: nothing fired, or the latch failed) and the
+        outcome for the report. Judged at a fresh clock reading, not the step start (D18: see
+        the module docstring)."""
         state = ExitState(
             entry_price=pos.entry_price,
             stop=pos.stop,
@@ -480,9 +515,11 @@ class PositionManager:
                 await repo.update_trailing(
                     session, pos.id, trail_high=trail.trail_high, trail_stop=trail.trail_stop
                 )
-        if reason is None or not await self._latch(pos, reason, bid, now):
-            return None
-        return reason
+        if reason is None:
+            return None, "evaluated" if bid is not None else "no_bid"
+        if not await self._latch(pos, reason, bid, now):
+            return None, "failed"
+        return reason, "evaluated" if bid is not None else "latched"
 
     def _trusted_bid(self, symbol: str, now: datetime) -> Decimal | None:
         quote = self._market.quote(symbol)

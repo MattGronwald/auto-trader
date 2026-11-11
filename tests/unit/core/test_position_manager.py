@@ -24,6 +24,7 @@ from autotrader.broker.base import (
 )
 from autotrader.broker.sim import FillPlan, SimBroker
 from autotrader.core.bus import EventBus
+from autotrader.core.position_manager import PositionCheck, StepReport
 from autotrader.journal import models as m
 from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
@@ -703,3 +704,112 @@ async def test_an_unknown_trigger_value_is_a_step_failure(
     assert (failed["position_id"], failed["symbol"]) == (btc, BTC)
     assert await h.sells(BTC) == []
     assert len(await h.sells(ETH)) == 1
+
+
+# --- step report (WP 1.5d-3) ------------------------------------------------------------
+
+
+async def test_report_evaluated_with_a_bid_and_no_trigger(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    h = Harness(sessions, bus)
+    pid = await h.open_position()
+    h.quote(BTC, 100.0)
+    report = await h.pm.step()
+    assert report.positions == (PositionCheck(pid, BTC, "evaluated"),)
+    assert report.complete
+
+
+async def test_report_evaluated_when_a_trigger_fires_and_latches(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    h = Harness(sessions, bus)
+    pid = await h.open_position()
+    h.quote(BTC, 95.0)
+    report = await h.pm.step()
+    assert report.positions == (PositionCheck(pid, BTC, "evaluated"),)
+    assert (await h.position(pid)).exit_trigger == "stop"
+
+
+async def test_report_latched_for_an_already_latched_position(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    h = Harness(sessions, bus)
+    pid = await h.open_position()
+    h.quote(BTC, 95.0)
+    await h.pm.step()
+    report = await h.pm.step()
+    assert report.positions == (PositionCheck(pid, BTC, "latched"),)
+    assert report.complete
+
+
+async def test_report_no_bid_without_a_trusted_quote(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    h = Harness(sessions, bus)
+    pid = await h.open_position()
+    report = await h.pm.step()
+    assert report.positions == (PositionCheck(pid, BTC, "no_bid"),)
+    assert not report.complete
+
+
+async def test_report_latched_for_a_time_exit_without_a_bid(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    h = Harness(sessions, bus)
+    pid = await h.open_position()
+    await h.pm.step()
+    limit = (await h.position(pid)).time_limit_at
+    assert limit is not None
+    h.clock.now = limit
+    report = await h.pm.step()
+    assert report.positions == (PositionCheck(pid, BTC, "latched"),)
+    assert (await h.position(pid)).exit_trigger == "time"
+
+
+async def test_report_failed_when_manage_raises(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = Harness(sessions, bus)
+    pid = await h.open_position()
+    h.quote(BTC, 106.0)  # above the trailing activation: a trailing update is written
+
+    async def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("journal down")
+
+    monkeypatch.setattr(repo, "update_trailing", boom)
+    with capture_logs() as logs:
+        report = await h.pm.step()
+    assert report.positions == (PositionCheck(pid, BTC, "failed"),)
+    assert not report.complete
+    assert len(named(logs, "positions.step_failed")) == 1
+
+
+async def test_report_failed_when_the_latch_is_uncertain(db_url: str) -> None:
+    engine = make_engine(db_url)
+    hook = CommitHook()
+    sessions = hooked_sessionmaker(engine, hook)
+    bus = EventBus(sessions)
+    try:
+        h = Harness(sessions, bus)
+        pid = await h.open_position()
+        h.quote(BTC, 100.0)
+        await h.pm.step()  # writes time_limit_at
+        h.quote(BTC, 95.0)
+        hook.fail_before = 1
+        report = await h.pm.step()
+        assert report.positions == (PositionCheck(pid, BTC, "failed"),)
+    finally:
+        await bus.close()
+        await engine.dispose()
+
+
+async def test_report_is_empty_without_positions(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    h = Harness(sessions, bus)
+    report = await h.pm.step()
+    assert report == StepReport()
+    assert report.complete
