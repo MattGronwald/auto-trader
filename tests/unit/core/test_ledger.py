@@ -3,7 +3,7 @@ migrated SQLite journal."""
 
 import asyncio
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, MutableMapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from pathlib import Path
@@ -1786,17 +1786,26 @@ async def test_clear_clock(sessions: async_sessionmaker[AsyncSession], ledger: L
     assert await event_types(sessions) == []
 
 
+def unit_failures(logs: list[MutableMapping[str, Any]]) -> list[str]:
+    """Failure entries a resolution unit leaves when it raises instead of being skipped."""
+    return [
+        e["event"] for e in logs if e["event"] in ("ledger.resolution_failed", "bus.unit_failed")
+    ]
+
+
 async def test_stale_type_b_incident_is_not_written(
     sessions: async_sessionmaker[AsyncSession], ledger: Ledger
 ) -> None:
     stale = await bare_row(sessions, broker_order_id="b-1", resolve_since=T0)
     live = await bare_row(sessions, broker_order_id="b-2", resolve_since=T0)
 
-    await ledger.apply_resolutions([clear_clock(stale, T0)])
-    await ledger.apply_resolutions(
-        [incident(stale, "lookup_inconsistent", T0), incident(live, "lookup_inconsistent", T0)]
-    )
+    with capture_logs() as logs:
+        await ledger.apply_resolutions([clear_clock(stale, T0)])
+        await ledger.apply_resolutions(
+            [incident(stale, "lookup_inconsistent", T0), incident(live, "lookup_inconsistent", T0)]
+        )
 
+    assert unit_failures(logs) == []  # skipped by its guard, not by a raising unit
     assert (await order_row(sessions, stale)).incident is None
     o = await order_row(sessions, live)
     assert (o.incident, o.resolve_since) == ("lookup_inconsistent", None)
@@ -1815,15 +1824,17 @@ async def test_clear_committed_inside_the_incident_unit_wins(
     release = asyncio.Event()
     hook.block_before_update = release
 
-    task = asyncio.create_task(
-        hledger.apply_resolutions([incident(row, "lookup_inconsistent", T0)])
-    )
-    await hook.update_reached.wait()
-    await ledger.apply_resolutions([clear_clock(row, T0)])  # a plain session commits the clear
-    release.set()
-    await task
-    await hbus.drain()
+    with capture_logs() as logs:
+        task = asyncio.create_task(
+            hledger.apply_resolutions([incident(row, "lookup_inconsistent", T0)])
+        )
+        await asyncio.wait_for(hook.update_reached.wait(), 5)
+        await ledger.apply_resolutions([clear_clock(row, T0)])  # a plain session commits it
+        release.set()
+        await asyncio.wait_for(task, 5)
+        await hbus.drain()
 
+    assert unit_failures(logs) == []  # skipped by its guard, not by a raising unit
     o = await order_row(sessions, row)
     assert (o.incident, o.resolve_since) == (None, None)
     assert "OrderIncident" not in await event_types(sessions)
