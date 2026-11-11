@@ -20,6 +20,7 @@ from autotrader.broker.base import (
     Account,
     AssetRules,
     Broker,
+    BrokerError,
     BrokerOrder,
     DustRemainder,
     FeeSchedule,
@@ -1146,6 +1147,71 @@ async def test_hung_exit_state_rejects_and_hung_close_is_unknown(
     assert result.decision.approved and result.status == "unknown"
     (row,) = await orders(sessions)
     assert (row.side, row.status, row.broker_order_id) == ("sell", "unknown", None)
+
+
+# --- broker_holdings: the readiness holdings check (WP 1.5d-3) ---------------------------
+
+
+class FixedPositions(SimBroker):
+    held: list[Position]
+    calls: int = 0
+
+    async def get_positions(self) -> list[Position]:
+        self.calls += 1
+        return list(self.held)
+
+    async def asset_rules(self, symbol: str) -> AssetRules:
+        raise AssertionError("the holdings check needs no asset rules")
+
+
+class FailingPositions(SimBroker):
+    async def get_positions(self) -> list[Position]:
+        raise BrokerError("positions unavailable")
+
+
+def _pos(symbol: str, qty: str, available: str | None = None) -> Position:
+    return Position(
+        symbol=symbol,
+        qty=D(qty),
+        qty_available=D(available if available is not None else qty),
+        avg_entry_price=D("100"),
+    )
+
+
+async def test_broker_holdings_sums_total_qty_per_symbol(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    broker = cast(FixedPositions, _sim(FixedPositions))
+    broker.held = [
+        _pos(BTC, "1", available="0.4"),  # an open sell reserves part: the total counts
+        _pos(BTC, "0.5"),
+        _pos("ETH/USD", "0.00003"),  # dust (below min_qty) is included
+    ]
+    engine = make_engine_(broker, sessions, gate, monotonic=Mono())
+    assert await engine.broker_holdings() == {BTC: D("1.5"), "ETH/USD": D("0.00003")}
+    broker.held = []
+    assert await engine.broker_holdings() == {}
+
+
+async def test_broker_holdings_raises_on_a_broker_error_and_timeout(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    failing = make_engine_(_sim(FailingPositions), sessions, gate, monotonic=Mono())
+    with pytest.raises(BrokerError):
+        await failing.broker_holdings()
+
+    broker = cast(FixedPositions, _sim(FixedPositions))
+    broker.held = [_pos(BTC, "1")]
+    spent = make_engine_(broker, sessions, gate, io_timeout_s=0.0, monotonic=Mono())
+    with pytest.raises(TimeoutError):  # a spent budget refuses the call
+        await spent.broker_holdings()
+    assert broker.calls == 0
+
+    # 0.05 s: `_within` waits the remaining budget in real time (a frozen Mono cannot expire
+    # it mid-call); the outer 10 s is a bound, not a timing assertion.
+    hung = make_engine_(_sim(HangingPositions), sessions, gate, io_timeout_s=0.05, monotonic=Mono())
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(hung.broker_holdings(), 10)
 
 
 # --- held positions without a trustworthy price ----------------------------------------

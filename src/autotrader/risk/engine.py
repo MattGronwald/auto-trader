@@ -63,7 +63,9 @@ spent is not called: its timeout outcome applies, and a submit that was never at
 is `not_submitted`. `asyncio.CancelledError` is never caught.
 
 `cancel_open_entries()` cancels resting entry (buy) orders under the exit lock with its own
-budget, and `sellable_positions()` reads the non-dust broker holdings lock-free with its own.
+budget, `sellable_positions()` reads the non-dust broker holdings lock-free with its own, and
+`broker_holdings()` reads the total qty per symbol (dust included) lock-free with its own, for
+the admission holdings check (`core/admission.py`, WP 1.5d-3).
 """
 
 import asyncio
@@ -900,6 +902,16 @@ class RiskEngine:
         failure."""
         deadline = self._monotonic() + self._io_timeout
         return tuple(p for p in await self._broker_positions(deadline) if not p.is_dust)
+
+    async def broker_holdings(self) -> dict[str, Decimal]:
+        """The total broker qty per symbol, dust included, with its own budget; lock-free;
+        raises on failure. The holdings check reads the total qty (not `qty_available`);
+        SPEC 0.1 keeps the broker here. One `get_positions` read, no `asset_rules` calls."""
+        deadline = self._monotonic() + self._io_timeout
+        totals: dict[str, Decimal] = {}
+        for p in await self._within(deadline, self._broker.get_positions):
+            totals[p.symbol] = totals.get(p.symbol, Decimal(0)) + p.qty
+        return totals
 
     # --- equity snapshots ------------------------------------------------------------
 
