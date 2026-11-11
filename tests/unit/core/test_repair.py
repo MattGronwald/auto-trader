@@ -262,7 +262,7 @@ async def test_link_refuses_a_failing_lookup(r: Rig) -> None:
     async def broken(cid: str) -> BrokerOrderView | None:
         raise TimeoutError
 
-    with pytest.raises(RepairRefused, match=r"lookup of .* failed"):
+    with pytest.raises(RepairRefused, match=r"broker lookup failed: "):
         await prepare_link(r.sessions, row, "sim-1", broken)
 
 

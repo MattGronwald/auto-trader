@@ -112,7 +112,7 @@ async def prepare_link(
     try:
         view = await lookup(cid)
     except Exception as e:  # a failed broker read refuses; CancelledError propagates
-        raise RepairRefused(f"broker lookup of {cid} failed: {e!r}") from e
+        raise RepairRefused(f"broker lookup failed: {type(e).__name__}: {e}") from e
     if view is None:
         raise RepairRefused(f"the broker has no order with client id {cid}")
     differences = list(

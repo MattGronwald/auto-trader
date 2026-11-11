@@ -17,6 +17,7 @@ import typer
 
 from autotrader.broker.alpaca import AlpacaBroker
 from autotrader.broker.alpaca_data import AlpacaBarSource
+from autotrader.cli_repair import repair_app
 from autotrader.core import flatten as flatten_ops
 from autotrader.core import lock as journal_lock
 from autotrader.core import runtime as core_runtime
@@ -50,6 +51,7 @@ run_app = typer.Typer(help="Run a long-lived process.", no_args_is_help=True)
 app.add_typer(run_app, name="run")
 db_app = typer.Typer(help="Database migrations.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+app.add_typer(repair_app, name="repair")
 
 ConfigOption = Annotated[Path, typer.Option("--config", "-c", help="Path to config.yaml.")]
 
