@@ -586,7 +586,9 @@ async def _teardown(
         await bounded("stream", stream_task)
     await bounded("bus.close", bus.close(budget_s=control.remaining()))
     # A floor even after the deadline (inside the watchdog's 5 s grace): a forced teardown
-    # must still close the journal's connections (dry run, spec revision 2026-10-14).
+    # still disposes the journal's pool (dry run, spec revision 2026-10-14). That holds at this
+    # moment only: a task abandoned earlier (an uncancelled `check()`) may reopen a connection
+    # before the process exits, bounded by the watchdog.
     await bounded("engine.dispose", engine.dispose(), floor_s=1.0)
     if forced:
         log.error("core.shutdown_forced", steps=forced, cause=control.cause)
