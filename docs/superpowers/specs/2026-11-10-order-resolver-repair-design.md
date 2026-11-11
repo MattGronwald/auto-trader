@@ -316,6 +316,9 @@ id, and otherwise a new `get_order_view(order_id) -> BrokerOrderView` **(builder
   asks for confirmation (`--yes` skips the prompt) **(builder call)**.
 - Each command writes its row change and an `OperatorRepair` event (`action`, `order_row_id`,
   `before`, `after`, `evidence`, `operator` = the local OS user name) in one `publish_tx` unit.
+  *Added 2026-11-11 (PR #35 review):* `link` also records `broker_view`, the broker order the
+  lookup returned; and repair never migrates: it refuses a missing journal file and a schema that
+  is not at head.
 - Exit codes: 0 done, 1 refused (precondition or lock), 2 usage. Refusals print the reason.
 - Repair never resumes the manual pause. The operator resumes it (runbook) after the next core run
   shows the row settled.

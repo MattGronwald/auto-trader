@@ -219,6 +219,12 @@ async def test_link_writes_the_id_and_one_operator_repair(r: Rig) -> None:
         "resolve_since": None,
     }
     assert (event["evidence"], event["operator"]) == ("checked the broker UI at 10:00", "op")
+    # The audit keeps the broker order that proved the match, as the lookup returned it.
+    view = await r.sim.get_order_by_client_id(cid)
+    assert view is not None
+    assert plan.broker_view == view.model_dump(mode="json")
+    assert event["broker_view"] == plan.broker_view
+    assert (event["broker_view"]["order_id"], event["broker_view"]["client_order_id"]) == (oid, cid)
 
 
 @pytest.mark.parametrize("cid", [None, "at-o5", "at-c7-e", "at-deadbeef-c1-e"])
@@ -466,6 +472,7 @@ async def test_not_submitted_then_sync_settles_with_zero_fill(r: Rig) -> None:
         "incident_at": (NOW + 80 * SEC).isoformat(),
     }
     assert event["after"] == {"status": "not_submitted", "incident": None, "incident_at": None}
+    assert event["broker_view"] is None  # only `link` reads the broker
     r.clock.now = NOW + 82 * SEC
     await r.ledger.apply_all(await r.engine.sync_orders())
     settled = await tr.order(r.sessions, row.id)

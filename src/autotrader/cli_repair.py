@@ -1,8 +1,10 @@
 """`autotrader repair link | not-submitted | oversell` (WP 1.5d-2, spec 2026-11-10 5.1).
 
-A thin wrapper over `core/repair.py`: the commands only parse; `_run_repair` takes the
-journal lock (so no core runs), prepares the repair, shows the row and the change, asks
-for confirmation, commits and prints the exit hint. For `link` the CLI connects the broker
+A thin wrapper over `core/repair.py`: the commands only parse; `_run_repair` refuses a
+journal that does not exist, takes the journal lock (so no core runs), refuses a journal whose
+schema is not at head (it never migrates: run `autotrader db upgrade` first), prepares the
+repair, shows the row, the change and (for `link`) the broker order, asks for confirmation,
+commits and prints the exit hint. For `link` the CLI connects the broker
 and hands it straight to `risk.engine.read_order_by_client_id` (SPEC 0.1); `core/repair.py`
 only receives the lookup callable. The lock is held for the whole run: process exit releases
 it (tests call `release()`).
@@ -57,6 +59,10 @@ def _show(plan: RepairPlan) -> None:
     typer.echo("change to:")
     for column, value in plan.after.items():
         typer.echo(f"  {column} = {value}")
+    if plan.broker_view is not None:
+        typer.echo("broker order found by client id:")
+        for field, value in plan.broker_view.items():
+            typer.echo(f"  {field} = {value}")
 
 
 async def _prepare(
@@ -93,7 +99,8 @@ def _run_repair(
     evidence: str,
     yes: bool,
     acquire: Callable[..., journal_lock.JournalLock] = journal_lock.acquire,
-    upgrade: Callable[[str], None] = db.upgrade,
+    revision: Callable[[str], str | None] = db.current_revision,
+    head: Callable[[], str | None] = db.head_revision,
     connect_broker: ConnectBroker = AlpacaBroker.connect,
     confirm: Callable[[str], bool] = typer.confirm,
     operator: Callable[[], str] = getpass.getuser,
@@ -103,6 +110,10 @@ def _run_repair(
         typer.echo("--evidence must not be blank", err=True)
         return 2
     try:
+        _, db_path = journal_lock.canonical_journal(cfg.database.url)
+        if not db_path.is_file():  # a wrong --config or path: never create a journal
+            typer.echo(f"no journal at {db_path}", err=True)
+            return 1
         lock = acquire(cfg.database.url, wait_s=0)
     except journal_lock.JournalLockError as e:
         text = str(e)
@@ -111,7 +122,13 @@ def _run_repair(
         else:
             typer.echo(text, err=True)
         return 1
-    upgrade(lock.url)
+    at, want = revision(lock.url), head()
+    if at != want:  # repair reads and writes the current schema only; it never migrates
+        typer.echo(
+            f"journal schema at {at}, code expects {want}: run `autotrader db upgrade` first",
+            err=True,
+        )
+        return 1
 
     async def go() -> int:
         engine = db.make_engine(lock.url)

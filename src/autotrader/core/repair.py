@@ -3,7 +3,8 @@
 Each operation is two steps. `prepare_*` reads the order row, checks the command's
 preconditions and returns a `RepairPlan` (the columns it will change, their current values
 and the new ones); any failed precondition raises `RepairRefused` with the reason the CLI
-prints. `commit` writes the plan's row change and one `OperatorRepair` audit event in one
+prints. `commit` writes the plan's row change and one `OperatorRepair` audit event (for `link`
+also the broker order that proved the match, `broker_view`) in one
 `EventBus.publish_tx` unit, and only while every planned column still holds the value the
 plan read (conditional `UPDATE`; `not_submitted` also re-checks that the row still has no
 broker id); otherwise nothing is written and it raises `RepairRefused`.
@@ -59,6 +60,8 @@ class RepairPlan:
     order_row_id: int
     before: dict[str, Value]  # column -> value read by prepare (datetimes as ISO strings)
     after: dict[str, Value]  # column -> new value; also the event's `after`
+    # `link` only: the broker order (JSON form) the lookup returned and the checks matched.
+    broker_view: dict[str, Any] | None = None
 
 
 class OperatorRepair(LedgerEvent):
@@ -70,6 +73,7 @@ class OperatorRepair(LedgerEvent):
     after: dict[str, Any]
     evidence: str
     operator: str
+    broker_view: dict[str, Any] | None = None  # `link`: the broker order that proved the match
 
 
 def _value(order: Order, column: str) -> Value:
@@ -77,9 +81,16 @@ def _value(order: Order, column: str) -> Value:
     return raw.isoformat() if isinstance(raw, datetime) else cast(Value, raw)
 
 
-def _plan(order: Order, action: Action, after: dict[str, Value]) -> RepairPlan:
+def _plan(
+    order: Order,
+    action: Action,
+    after: dict[str, Value],
+    broker_view: dict[str, Any] | None = None,
+) -> RepairPlan:
     before = {column: _value(order, column) for column in after}
-    return RepairPlan(action=action, order_row_id=order.id, before=before, after=after)
+    return RepairPlan(
+        action=action, order_row_id=order.id, before=before, after=after, broker_view=broker_view
+    )
 
 
 async def _row(sessions: async_sessionmaker[AsyncSession], row_id: int) -> Order:
@@ -141,6 +152,7 @@ async def prepare_link(
             "incident_at": None,
             "resolve_since": None,
         },
+        broker_view=view.model_dump(mode="json"),
     )
 
 
@@ -222,6 +234,7 @@ async def commit(
             after=plan.after,
             evidence=evidence,
             operator=operator,
+            broker_view=plan.broker_view,
         )
 
     await bus.publish_tx(build, verify_unit)

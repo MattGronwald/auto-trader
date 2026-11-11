@@ -168,6 +168,49 @@ def test_refuses_while_core_holds_the_lock(rig: Rig, capsys: pytest.CaptureFixtu
     assert rig.rows() == []
 
 
+def test_missing_journal_is_refused_and_not_created(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A wrong --config or path: refused before the lock, so neither journal nor lock appears.
+    cfg = load_config(_tmp_config(tmp_path), SETTINGS)
+    _, path = journal_lock.canonical_journal(cfg.database.url)
+    assert not path.exists()
+
+    def no_lock(url: str, **kw: Any) -> journal_lock.JournalLock:
+        raise AssertionError("lock must not be taken")
+
+    code = _run_repair(
+        cfg,
+        SETTINGS,
+        "not_submitted",
+        1,
+        broker_order_id=None,
+        evidence=EVIDENCE,
+        yes=True,
+        acquire=no_lock,
+    )
+
+    assert code == 1
+    assert f"no journal at {path}" in capsys.readouterr().err
+    assert not path.exists() and not path.with_name(path.name + ".lock").exists()
+
+
+def test_journal_behind_head_is_refused_and_not_migrated(
+    rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    row = rig.insert(cid=None)
+    head = db.head_revision()
+    db.downgrade(rig.cfg.database.url, "-1")
+    behind = db.current_revision(rig.cfg.database.url)
+    assert behind != head
+
+    code = rig.run("not_submitted", row, yes=True)
+
+    assert code == 1
+    assert "run `autotrader db upgrade` first" in capsys.readouterr().err
+    assert db.current_revision(rig.cfg.database.url) == behind  # repair never migrates
+
+
 def test_blank_evidence_exits_2(rig: Rig) -> None:
     row = rig.insert(cid=None)
 
@@ -221,6 +264,8 @@ def test_link_applies_and_records_the_operator(
     assert rig.order(row).broker_order_id == oid
     (event,) = rig.rows()
     assert event.payload["operator"] == "bob" and event.payload["evidence"] == EVIDENCE
+    assert "broker order found by client id:" in out and f"order_id = {oid}" in out
+    assert event.payload["broker_view"]["order_id"] == oid
 
 
 def test_yes_skips_confirm_and_declined_confirm_writes_nothing(rig: Rig) -> None:

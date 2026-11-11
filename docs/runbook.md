@@ -247,8 +247,10 @@ uv run autotrader repair oversell <order_row> --evidence "..."
 All take `--evidence TEXT` (required: what you checked and when), `--yes` (skip the confirmation)
 and `--config/-c`. Each prints the row before and after, asks to confirm, then writes the row
 change and an `OperatorRepair` event (`action`, `order_row_id`, `before`, `after`, `evidence`,
-`operator`) in one unit. Exit 0 done, 1 refused (reason printed), 2 usage. A repair never
-resumes the manual pause.
+`operator`, and for `link` `broker_view`: the broker order that proved the match) in one unit.
+Exit 0 done, 1 refused (reason printed), 2 usage. A repair never resumes the manual pause and
+never migrates: it refuses a journal path that does not exist (`no journal at <path>`, check
+`--config`) and a journal whose schema is not at head (run `autotrader db upgrade` first).
 
 1. Read the row and its incident:
    ```sql

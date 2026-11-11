@@ -7,6 +7,7 @@ from typing import Any
 from alembic import command
 from alembic.config import Config
 from alembic.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from sqlalchemy import event
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
@@ -61,6 +62,11 @@ def upgrade(url: str, revision: str = "head") -> None:
     """Migrate the DB at `url`. Sync: runs its own event loop, call outside async code."""
     _ensure_sqlite_dir(url)
     command.upgrade(_alembic_config(url), revision)
+
+
+def head_revision() -> str | None:
+    """The newest migration revision shipped with this code."""
+    return ScriptDirectory.from_config(_alembic_config("")).get_current_head()
 
 
 def current_revision(url: str) -> str | None:
