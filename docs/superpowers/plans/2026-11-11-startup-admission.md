@@ -372,7 +372,10 @@ text:
      omits that entry. Once `T_b` is set, the entries come
      from `"no position manager step since the cash check"`, `"positions not evaluated"`,
      `"holdings short"` and `"holdings check not completed"`; the last covers a discarded or
-     failed read without a shortfall. The threshold is `>=`. Also log `positions`, a list of
+     failed read without a shortfall. *(Note 2026-11-12, Fable review of PR #39, I2:)* a check
+     skipped or discarded on an unsettled row or a moved generation now reports
+     `"unsettled order rows"`; `"holdings check not completed"` means a failed read. The
+     threshold is `>=`. Also log `positions`, a list of
      `{position_id, symbol, outcome}` for every non-evaluated/latched position in the last report,
      and `short: list[str]`. Return `False`.
 - Test doubles in `test_admission.py` (define the journal fixtures locally; `db_url`/`sessions`

@@ -80,10 +80,13 @@ exit. Check `mode` against `ALPACA_PAPER` in `.env`; nothing runs until they agr
 - **Cash fault, `cash check not completed: <fault>`** (`risk.cash_fault_set`,
   `ledger.cash_check_failed`): see `cash reconciliation failed` in "Entries rejected". A sticky
   fault (a `CommitUncertain` error) holds until the core is restarted: fix the cause and restart.
-- **`unsettled order rows`:** an order row with `settled_at` NULL keeps admission closed after a
-  restart, as it keeps the cash check skipped. A resolver incident stays until `autotrader repair`
-  settles it (see "Resolving an order incident"; stop the core, repair, restart). This also holds
-  for an exit placed after the cash check that never settles.
+- **`unsettled order rows`:** an order row with `settled_at` NULL keeps admission closed. After a
+  restart it keeps the cash check skipped, so the line names it next to the cash fault. After the
+  cash check (an exit the Position Manager placed, or one that never settles) the holdings check
+  is skipped or discarded while the row is unsettled, without reading the broker, and the line
+  names `unsettled order rows` instead of a holdings cause. A row that settles clears it on the
+  next tick. A resolver incident stays until `autotrader repair` settles it (see "Resolving an
+  order incident"; stop the core, repair, restart).
 - **`positions not evaluated`** (`positions` lists each position with `no_bid` or `failed`):
   - `no_bid`: no trusted bid for a held symbol. If the feed is down or stale, wait for it to
     return. A symbol outside the profile's universe is never quoted; `admission.unquoted_holdings`
@@ -110,10 +113,12 @@ exit. Check `mode` against `ALPACA_PAPER` in `.env`; nothing runs until they agr
   automatically. A symbol is logged once per distinct set of figures and again if it stops being
   short and comes back; after a cash-fault reset the same shortfall is not logged again, but the
   waiting log still names it under `short`.
-- **`holdings check not completed`:** the broker or journal read raised
-  (`admission.holdings_read_failed`, warning, once per failure streak) and is retried every tick;
-  or an order was in flight, which is retried silently. Fix the broker connection if the line
-  persists.
+- **`holdings check not completed`:** a read of the holdings check failed: the broker, journal or
+  cash-guard read raised (`admission.holdings_read_failed`, warning, once per failure streak) and
+  is retried every tick. Check the broker connection (and the journal database) if the line
+  persists. An order in flight is not reported here but as `unsettled order rows`. Without a
+  read-failed line it can also appear for one tick after a passed check was dropped because an
+  order changed the journal; it re-runs on the next tick.
 
 Known costs (revisited in WP 1.6):
 
@@ -123,10 +128,12 @@ Known costs (revisited in WP 1.6):
   closed. One whose exits are rejected (`rejected` or `not_submitted`, logged
   `positions.exit_failing`) reports `latched` and does not block admission.
 - `cycle.admission_waiting` repeats every 10 min and names the current causes, including
-  unsettled order rows; the per-cause lines (`admission.holdings_short`, `positions.*`,
+  unsettled order rows before and after the cash check; the per-cause lines
+  (`admission.holdings_short`, `admission.holdings_read_failed`, `positions.*`,
   `risk.cash_fault_set`) have the details.
-- The holdings check reads the broker's positions every tick until it passes. A cash fault set and
-  cleared between two ticks is not seen.
+- The holdings check reads the broker's positions every tick until it passes, except while an
+  order row is unsettled at its first guard read. A cash fault set and cleared between two ticks
+  is not seen.
 
 ## Entries rejected
 

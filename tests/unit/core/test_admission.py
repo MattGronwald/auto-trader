@@ -492,13 +492,82 @@ async def test_waiting_names_the_unmet_conditions_after_t_b(rig: Rig) -> None:
         await rig.manage("evaluated")
         rig.ledger.default = CashGuard(G, unsettled=True)
         rig.clock.advance(WAITING_REPEAT_S)
-        assert await rig.tracker.ready() is False  # discarded: no step issue left
+        assert await rig.tracker.ready() is False  # skipped on g1: no step issue left
     first, second = events(logs, "cycle.admission_waiting")
     assert first["unmet"] == [
         "no position manager step since the cash check",
         "holdings check not completed",
     ]
-    assert second["unmet"] == ["holdings check not completed"]
+    assert second["unmet"] == ["unsettled order rows"]
+
+
+async def test_unsettled_first_guard_skips_the_broker_read(rig: Rig) -> None:
+    rig.risk.cash_fault = None
+    rig.ledger.default = CashGuard(G, unsettled=True)
+    for _ in range(3):
+        assert await rig.tracker.ready() is False
+    assert rig.risk.reads == 0
+    rig.ledger.default = CashGuard(G, unsettled=False)
+    await rig.manage()
+    assert await rig.tracker.ready() is True
+    assert rig.risk.reads == 1
+
+
+@pytest.mark.parametrize(
+    "guards",
+    [
+        [CashGuard(G, unsettled=True)],
+        [CashGuard(G, unsettled=False), CashGuard(G, unsettled=True)],
+        [CashGuard(G, unsettled=False), CashGuard((5, 8), unsettled=False)],
+    ],
+    ids=["g1_unsettled", "g2_unsettled", "generation_moved"],
+)
+async def test_waiting_names_unsettled_rows_when_the_holdings_check_was_skipped(
+    rig: Rig, guards: list[CashGuard]
+) -> None:
+    rig.risk.cash_fault = None
+    rig.risk.holdings_error = RuntimeError("broker down")
+    assert await rig.tracker.ready() is False  # T_b; a failed read first
+    await rig.manage()
+    rig.risk.holdings_error = None
+    rig.clock.advance(180)
+    rig.ledger.queue = list(guards)
+    with capture_logs() as logs:
+        assert await rig.tracker.ready() is False
+    (line,) = events(logs, "cycle.admission_waiting")
+    assert line["unmet"] == ["unsettled order rows"]
+    assert events(logs, "admission.holdings_read_failed") == []
+
+
+async def test_a_skipped_check_ends_a_read_failure_streak(rig: Rig) -> None:
+    rig.risk.cash_fault = None
+    rig.risk.holdings_error = RuntimeError("broker down")
+    with capture_logs() as logs:
+        assert await rig.tracker.ready() is False
+        rig.ledger.queue = [CashGuard(G, unsettled=True)]  # the guard read completes
+        assert await rig.tracker.ready() is False
+        assert await rig.tracker.ready() is False
+    assert len(events(logs, "admission.holdings_read_failed")) == 2
+
+
+@pytest.mark.parametrize("then", ["read_failed", "short"])
+async def test_a_later_completed_or_failed_check_replaces_the_unsettled_cause(
+    rig: Rig, then: str
+) -> None:
+    rig.risk.cash_fault = None
+    rig.ledger.queue = [CashGuard(G, unsettled=True)]
+    assert await rig.tracker.ready() is False  # T_b; skipped on g1
+    await rig.manage()
+    rig.clock.advance(180)
+    if then == "read_failed":
+        rig.risk.holdings_error = RuntimeError("broker down")
+    else:
+        rig.journal.value = {BTC: (D(1), D(0))}
+    with capture_logs() as logs:
+        assert await rig.tracker.ready() is False
+    (line,) = events(logs, "cycle.admission_waiting")
+    expected = "holdings check not completed" if then == "read_failed" else "holdings short"
+    assert line["unmet"] == [expected]
 
 
 async def _t_b_then_step(rig: Rig) -> None:

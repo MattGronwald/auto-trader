@@ -14,14 +14,20 @@ holdings result, so (c) and (d) must hold again after the next clear observation
 
 The holdings check: per symbol with an open journal position or a `symbol_dust` balance,
 `open qty + dust <= broker total qty` (a larger broker holding is legitimate and not checked). It
-reads the ledger's cash guard before the broker read and again after the journal read, and
-discards the result silently on an unsettled row or a moved generation. A shortfall logs
+reads the ledger's cash guard before the broker read and again after the journal read. An
+unsettled row at the first read skips the check without reading the broker; an unsettled row
+at the second read or a moved generation discards the result. Both are silent (no log line of
+their own), and `cycle.admission_waiting` then names `unsettled order rows`. A shortfall logs
 `admission.holdings_short` once per figures; a raising read logs
-`admission.holdings_read_failed` once per failure streak. A pass is tied to the generation it
-passed on: before saying ready, the tracker reads the guard once more, and after that read it
-decides with no await until `return True` (the fault and the latest report are re-read there),
-so an exit placed after a cached pass must settle first, and a moved generation re-runs the
-check. Once ready, the caller opens admission for good (D21.3).
+`admission.holdings_read_failed` once per failure streak (the waiting log names `holdings check
+not completed`). A pass is tied to the generation it passed on: before saying ready, the tracker
+reads the guard once more, and after that read it decides with no await until `return True`
+(the fault and the latest report are re-read there), and a moved generation re-runs the check.
+So an exit placed after a cached pass must settle first only if it is in the journal by that
+final guard read: the read closes its session and so yields to the loop a few turns before the
+decision, and an exit committed in that gap is not seen. That gap is milliseconds, the exit
+lowers the journal and the broker together, and `check()` rejects an entry on a symbol with an
+unsettled sell (check 5a). Once ready, the caller opens admission for good (D21.3).
 """
 
 import time
@@ -102,6 +108,7 @@ class AdmissionReadiness:
         self._last: tuple[int, StepReport] | None = None
         self._passed: tuple[int, int] | None = None  # the generation the holdings check passed on
         self._short: list[str] = []  # short symbols of the last completed comparison
+        self._skipped = False  # the last holdings check was skipped on an unsettled guard
         self._logged_short: dict[str, tuple[Decimal, Decimal, Decimal]] = {}
         self._read_failing = False
 
@@ -124,6 +131,7 @@ class AdmissionReadiness:
         self._t_b = None
         self._passed = None
         self._short = []
+        self._skipped = False
 
     def _eligible(self) -> bool:
         """(c) on the latest report: a step that started after `T_b` and is complete."""
@@ -176,15 +184,22 @@ class AdmissionReadiness:
     async def _check_holdings(self) -> None:
         try:
             g1 = await self._ledger.cash_guard()
+            if g1.unsettled:
+                self._read_failing = False  # a completed read ends a failure streak
+                self._skipped = True  # an order in flight: no broker read, retried next tick
+                return
             broker = await self._risk.broker_holdings()
             journal = await self._journal()
             g2 = await self._ledger.cash_guard()
         except Exception as e:
+            self._skipped = False
             self._read_failed(e)
             return
         self._read_failing = False
-        if g1.unsettled or g2.unsettled or g1.generation != g2.generation:
-            return  # an order in flight: retried on the next tick, no log
+        if g2.unsettled or g1.generation != g2.generation:
+            self._skipped = True  # an order in flight: retried on the next tick, no log
+            return
+        self._skipped = False
         short: dict[str, tuple[Decimal, Decimal, Decimal]] = {}
         for symbol, (open_qty, dust) in journal.items():
             held = broker.get(symbol, Decimal(0))
@@ -231,7 +246,10 @@ class AdmissionReadiness:
             elif not self._last[1].complete:
                 unmet.append(_NOT_EVALUATED)
             if self._passed is None:
-                unmet.append(_SHORT if self._short else _NOT_COMPLETED)
+                if self._skipped:
+                    unmet.append(_UNSETTLED)
+                else:
+                    unmet.append(_SHORT if self._short else _NOT_COMPLETED)
             elif note is not None:
                 unmet.append(note)
         positions = [] if self._last is None else self._last[1].positions
