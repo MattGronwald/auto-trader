@@ -83,9 +83,11 @@ exit. Check `mode` against `ALPACA_PAPER` in `.env`; nothing runs until they agr
 - **`unsettled order rows`:** an order row with `settled_at` NULL keeps admission closed. After a
   restart it keeps the cash check skipped, so the line names it next to the cash fault. After the
   cash check (an exit the Position Manager placed, or one that never settles) the holdings check
-  is skipped or discarded while the row is unsettled, without reading the broker, and the line
-  names `unsettled order rows` instead of a holdings cause. A row that settles clears it on the
-  next tick. A resolver incident stays until `autotrader repair` settles it (see "Resolving an
+  is skipped while the row is unsettled at its first guard read, without reading the broker, or
+  discarded after the broker read when a row is unsettled at its second guard read or the
+  generation moved. The line then names `unsettled order rows` instead of a holdings cause. A
+  discard on a moved generation with nothing left unsettled (an order settled during the check)
+  carries the same label for one tick. A row that settles clears it on the next tick. A resolver incident stays until `autotrader repair` settles it (see "Resolving an
   order incident"; stop the core, repair, restart).
 - **`positions not evaluated`** (`positions` lists each position with `no_bid` or `failed`):
   - `no_bid`: no trusted bid for a held symbol. If the feed is down or stale, wait for it to

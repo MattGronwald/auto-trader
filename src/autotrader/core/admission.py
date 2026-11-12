@@ -17,7 +17,9 @@ The holdings check: per symbol with an open journal position or a `symbol_dust` 
 reads the ledger's cash guard before the broker read and again after the journal read. An
 unsettled row at the first read skips the check without reading the broker; an unsettled row
 at the second read or a moved generation discards the result. Both are silent (no log line of
-their own), and `cycle.admission_waiting` then names `unsettled order rows`. A shortfall logs
+their own), and `cycle.admission_waiting` then names `unsettled order rows` (for a moved
+generation with nothing left unsettled, an order that settled during the check, only until the
+next tick re-runs it). A shortfall logs
 `admission.holdings_short` once per figures; a raising read logs
 `admission.holdings_read_failed` once per failure streak (the waiting log names `holdings check
 not completed`). A pass is tied to the generation it passed on: before saying ready, the tracker
