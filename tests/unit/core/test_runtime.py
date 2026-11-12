@@ -1689,11 +1689,19 @@ class BreakoutSource(QuotingSource):
     def __init__(self, bids: dict[str, float]) -> None:
         super().__init__(bids)
         self.breakout_ts: datetime | None = None
+        self.skew = timedelta(0)
+
+    def clock(self) -> datetime:
+        """Wall time moved back so that the backfill ran exactly when the breakout bar ended.
+        The bar then stays fresh for one full period whatever the wall clock: a run that
+        crosses a 5m boundary would otherwise find it obsolete (scanner) or stale (runner)."""
+        return datetime.now(UTC) - self.skew
 
     async def history(self, symbols: Sequence[str], start: datetime, end: datetime) -> list[Bar]:
         five = timedelta(minutes=5)
         closed_until = bucket_start(end, five)  # the feed's grace is 0 (see _record_feed)
         self.breakout_ts = closed_until - five
+        self.skew = end - closed_until
         bars: list[Bar] = []
         ts = max(start, end - timedelta(hours=6))
         n = 0
@@ -1718,8 +1726,8 @@ class BreakoutSource(QuotingSource):
 
 
 def _record_feed(monkeypatch: pytest.MonkeyPatch) -> list[MarketFeed]:
-    """The core's feed, built with a 0 s grace: its last closed 5m bar then ended less than
-    one period ago whatever the wall clock, so the scanner never finds it obsolete."""
+    """The core's feed, built with a 0 s grace: its last closed 5m bar then ends at the start
+    of the current 5m window, so `BreakoutSource.clock` can place the backfill at its end."""
     feeds: list[MarketFeed] = []
 
     class RecordingFeed(MarketFeed):
@@ -1730,6 +1738,21 @@ def _record_feed(monkeypatch: pytest.MonkeyPatch) -> list[MarketFeed]:
 
     monkeypatch.setattr(runtime, "MarketFeed", RecordingFeed)
     return feeds
+
+
+def _pin_signal_clocks(monkeypatch: pytest.MonkeyPatch, clock: Callable[[], datetime]) -> None:
+    """The scanner's obsolete-bar rule and the runner's stale-signal rule read `clock`."""
+
+    class ClockedScanner(Scanner):
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            super().__init__(*a, clock=clock, **kw)
+
+    class ClockedRunner(CycleRunner):
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            super().__init__(*a, clock=clock, **kw)
+
+    monkeypatch.setattr(runtime, "Scanner", ClockedScanner)
+    monkeypatch.setattr(runtime, "CycleRunner", ClockedRunner)
 
 
 async def test_candidate_before_readiness_is_dropped_and_after_is_admitted(
@@ -1744,6 +1767,7 @@ async def test_candidate_before_readiness_is_dropped_and_after_is_admitted(
     feeds = _record_feed(monkeypatch)
     hold = _hold_first_snapshot(monkeypatch)
     source = BreakoutSource(UNIVERSE_BIDS)
+    _pin_signal_clocks(monkeypatch, source.clock)
     control, _ = make_control()
     task = start_core(
         cfg,
