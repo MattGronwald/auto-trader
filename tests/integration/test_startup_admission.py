@@ -154,21 +154,34 @@ async def test_restart_reconciles_before_admission_opens(
         r = await restart(h)
         h.quote(BTC, 90.0)
         h.quote(ETH, 100.0)
+        # A Position Manager step before the cash check (the loops run concurrently): its
+        # report is complete but predates T_b and misses ETH, which is not booked yet.
+        await r.tick("manage")
+        assert r.outcomes() == {1: "evaluated"}
         before_open: dict[str, Any] | None = None
         filled = False
+        admits = 0
         for _ in range(6):
-            await r.tick("sync", "snapshot", "manage")
             if not filled and await h.sells(BTC):
                 h.bar(BTC, 90.0)
                 filled = True
+            await r.tick("sync", "snapshot")
             state = await journal_state(h, [stuck_id, eth_cycle])
             await r.tick("admit")
+            admits += 1
+            if admits == 1:  # the cash check passed, but no step started after it
+                assert not r.runner.admission_open
             if r.runner.admission_open:
                 before_open = state
                 break
+            await r.tick("manage")
 
     assert r.runner.admission_open
+    assert admits == 2
     assert before_open == {"states": ["ERROR", "FILLED"], "open": [ETH], "btc_sells": 1}
+    report = r.readiness.last_report  # the step that counted saw ETH, booked by then
+    assert report is not None
+    assert [(p.symbol, p.outcome) for p in report.positions] == [(ETH, "evaluated")]
     assert index(logs, "positions.exit_triggered") < index(logs, "cycle.admission_open")
 
 
