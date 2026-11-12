@@ -38,6 +38,7 @@ from autotrader.core.kill import PAUSED_KEY, ControlGate, ControlStatus
 from autotrader.core.ledger import CashGuard, CashResult, Ledger
 from autotrader.core.lock import JournalLock, acquire
 from autotrader.core.logging import configure_logging
+from autotrader.core.resample import bucket_start
 from autotrader.core.runtime import ControlPoller, _snapshot_step, _sync_step, run_core
 from autotrader.core.scanner import CandidateSignal, Scanner
 from autotrader.core.shutdown import EXIT_CLEAN, EXIT_FAILED, ShutdownControl
@@ -1680,38 +1681,113 @@ def _hold_first_snapshot(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
     return hold
 
 
+class BreakoutSource(QuotingSource):
+    """Six hours of 1m history around 100 with an alternating volume, and a breakout (close
+    110, 50x volume) in the last 5m window the backfill closes, so the profile's
+    `breakout_donchian20_volspike` rule fires on that 5m bar."""
+
+    def __init__(self, bids: dict[str, float]) -> None:
+        super().__init__(bids)
+        self.breakout_ts: datetime | None = None
+
+    async def history(self, symbols: Sequence[str], start: datetime, end: datetime) -> list[Bar]:
+        five = timedelta(minutes=5)
+        closed_until = bucket_start(end, five)  # the feed's grace is 0 (see _record_feed)
+        self.breakout_ts = closed_until - five
+        bars: list[Bar] = []
+        ts = max(start, end - timedelta(hours=6))
+        n = 0
+        while ts < end:
+            spike = self.breakout_ts <= ts < closed_until
+            for symbol in symbols:
+                bars.append(
+                    Bar(
+                        symbol=symbol,
+                        timeframe="1m",
+                        ts=ts,
+                        open=100,
+                        high=110 if spike else 101,
+                        low=99,
+                        close=110 if spike else 100,
+                        volume=50 if spike else 1 + n % 2,
+                    )
+                )
+            ts += timedelta(minutes=1)
+            n += 1
+        return bars
+
+
+def _record_feed(monkeypatch: pytest.MonkeyPatch) -> list[MarketFeed]:
+    """The core's feed, built with a 0 s grace: its last closed 5m bar then ended less than
+    one period ago whatever the wall clock, so the scanner never finds it obsolete."""
+    feeds: list[MarketFeed] = []
+
+    class RecordingFeed(MarketFeed):
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            kw.setdefault("grace", timedelta(0))
+            super().__init__(*a, **kw)
+            feeds.append(self)
+
+    monkeypatch.setattr(runtime, "MarketFeed", RecordingFeed)
+    return feeds
+
+
 async def test_candidate_before_readiness_is_dropped_and_after_is_admitted(
     cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Spec test 12 through the scanner: BarClosed -> scanner -> CandidateSignal -> runner.
+    The 5m BarClosed is published on the core's bus (the feed announces a 5m bar only when
+    a wall-clock window closes), for a breakout bar the backfill put in the feed's history."""
     buf = io.StringIO()
     configure_logging(stream=buf)
     buses = _record_bus(monkeypatch)
+    feeds = _record_feed(monkeypatch)
     hold = _hold_first_snapshot(monkeypatch)
+    source = BreakoutSource(UNIVERSE_BIDS)
     control, _ = make_control()
     task = start_core(
         cfg,
         lock,
         control,
-        source=QuotingSource(UNIVERSE_BIDS),
+        source=source,
         connect_broker=sim_connect(make_sim()),
         snapshot_s=0.05,
         sync_s=0.01,
         manage_s=0.01,
     )
+
+    async def close_bar(symbol: str) -> None:
+        (bar,) = [b for b in feeds[0].history(symbol, "5m") if b.ts == source.breakout_ts]
+        assert bar.close == 110
+        await buses[0].publish(
+            BarClosed(symbol=symbol, timeframe="5m", bar_ts=bar.ts, close=bar.close)
+        )
+
     try:
         await _wait_for(lambda: bool(_named(buf, "core.started")))
-        await buses[0].publish(_candidate())
+        await _wait_for(lambda: source.streamed)  # the quotes: spread known, symbol fresh
+        await close_bar("BTC/USD")
         await _wait_for(lambda: bool(_named(buf, "cycle.dropped")))
         hold.set()
         await _wait_for(lambda: bool(_named(buf, "cycle.admission_open")))
-        await buses[0].publish(_candidate())
+        await close_bar("ETH/USD")
         await _wait_for(lambda: bool(_named(buf, "cycle.admitted")))
     finally:
         control.begin("stop")
-        assert await asyncio.wait_for(task, timeout=5) in (EXIT_CLEAN, EXIT_FAILED)
-    assert [d["reason"] for d in _named(buf, "cycle.dropped")] == ["startup reconciliation pending"]
+        code = await asyncio.wait_for(task, timeout=5)
+    candidates = _named(buf, "scanner.candidate")
+    assert [(c["symbol"], c["rule_id"]) for c in candidates] == [
+        ("BTC/USD", "breakout_donchian20_volspike"),
+        ("ETH/USD", "breakout_donchian20_volspike"),
+    ]
+    assert [(d["symbol"], d["reason"]) for d in _named(buf, "cycle.dropped")] == [
+        ("BTC/USD", "startup reconciliation pending")
+    ]
+    (admitted,) = _named(buf, "cycle.admitted")
+    assert admitted["symbol"] == "ETH/USD"
     assert _named(buf, "cycle.admission_disabled") == []
     assert await _count(cfg, m.Cycle) == 1  # only its admission is asserted (it expires)
+    assert code == EXIT_CLEAN
 
 
 async def test_held_symbol_outside_the_universe_is_logged(
