@@ -64,6 +64,7 @@ Volume tiers (30-day volume in USD → maker / taker bps):
 - **The docs' BTC example (`0.0001` / `0.0001` / `1`) is outdated.** Use the API values.
 - `min_order_size` differs per asset and looks like **~1 USD at current prices**. This is inferred, not documented, so it likely moves with price. Fetch it at sizing time; don't cache it for long.
 - **No minimum notional is published.** There is a **maximum of $200k notional per order**, irrelevant at PoC size. `AssetRules.min_notional` is therefore `0` for Alpaca.
+  *Corrected 2026-11-12 (WP 1.6a probes):* paper refuses a **buy** worth under $10 (403, "cost basis must be >= minimal amount of order 10"), measured at qty × limit price; market sells under $10 were accepted. See "Order endpoint probes (WP 1.6a)". `AssetRules.min_notional` is still `0` for Alpaca until 1.6c.
 - `price_increment` is mapped into `AssetRules.price_increment` (WP 1.3) and used to round the marketable entry limit up.
 - **The API returns these as strings.** The `alpaca-py` models turn them into floats, so `AlpacaBroker` uses `raw_data=True` and reads them as exact `Decimal`s.
 
@@ -140,6 +141,28 @@ Raw payloads (order ids replaced): `tests/fixtures/alpaca/fee_check_cfee_2026101
 - **The sell fee was charged once, as the `CFEE`.** The 9.68 credit seen in step 2 is the gross 9.71 less this -0.03 record, not a separate deduction. A reconciliation that subtracted the `CFEE` from the already-netted cash delta would double count it.
 - **Alternative reading of the step-2 "cash truncated to cents" note (one sample, inference):** the data also fit gross amounts rounded to cents (9.8027 -> 9.80, 9.7105 -> 9.71) plus a sell fee rounded *up* to a cent (0.0243 -> 0.03). The two readings can't be told apart from one fill.
 
+## Order endpoint probes (WP 1.6a, 2026-11-12, paper)
+
+Two owner-run probe runs against the paper trading API, plain HTTP with 3 s connect / 5 s read timeouts and no retries. One sample per symbol (BTC/USD, ETH/USD, SOL/USD) per probe, about $15 per order; every position was closed again. Raw responses (order ids replaced): `tests/fixtures/alpaca/order_probes_20261112.json`.
+
+| Probe | Observed (all three symbols unless noted) |
+|---|---|
+| Marketable IOC limit buy (entry shape) | 200, ack status `pending_new`; `qty`, `limit_price`, `type`, `time_in_force` echoed **exactly** as sent; `filled` on the first lookup (fill ~2 ms after creation) |
+| Market sell of the full `qty_available` (exit shape) | 200, `qty` echoed exactly; filled; no position left (no dust) |
+| Client-id lookup after submit | found on the **first** lookup, 0.22–0.30 s after the POST was sent |
+| Same `client_order_id` submitted again | **422** "client_order_id must be unique", no order in the body. The body's `code` differed by symbol (`40010001` BTC/SOL, `42210000` ETH) |
+| Buy worth under $10 at its limit price | **403** `40310000` "cost basis must be >= minimal amount of order 10" (also for qty below `min_order_size`: the $10 check answers first) |
+| Market sell worth about $6 (partial, then the full remaining holding) | accepted and filled; the holding closed with nothing left |
+| Non-marketable IOC limit buy | ack `pending_new`, final **`canceled`** (`canceled_at` set, `expired_at` null), zero fill |
+| Resting GTC limit buy | `pending_new` → `new`; cancel **204**, status `canceled` on the next read (no `pending_cancel` seen); cancelling it again **204** |
+| Cancel of a filled order | **422** `42210000` "order is already in \"filled\" state" |
+| Unknown order id (get, cancel) and unknown client id (lookup) | **404** `40410000` "order not found for ..." |
+
+- **The $10 minimum applies to buys, measured at the limit price.** A $15 qty priced at half the market was refused. `min_order_size` (about $1) never decides. Market sells of about $6 were not refused, so in these samples a holding under $10 stays sellable. Limit sells were not probed. *Bounded:* one sample per symbol, paper only.
+- **A duplicate client id is refused with 422 and does not return the existing order.** The first order is unaffected. The error `code` is not stable across requests, so the adapter must not branch on it.
+- **Status codes, not body codes, carry the meaning.** 403 and 422 on submit were refusals (no order created). 404 means unknown. Cancel is idempotent for a cancelled order (204) but not for a filled one (422).
+- **Visibility within 0.3 s is three samples, not a guarantee.** The 60 s `order_visibility_allowance_s` stays an operational bound.
+
 ## Market data (2026-10-11)
 
 - **REST bars** (`raw_data=True`): `{symbol: [{"t": "…Z", "o", "h", "l", "c", "v", "n", "vw"}]}`, prices as floats. Fine for bars, which are indicator input.
@@ -175,4 +198,5 @@ Raw payloads (order ids replaced): `tests/fixtures/alpaca/fee_check_cfee_2026101
 - **Exact cash rounding rule** (truncate vs round) at sizes where the difference exceeds one cent. One $10 sample can't settle it.
 - **Stop-limit behaviour** on crypto (trigger price source, gaps). Paper-test in WP 1.5 if a broker-side backup stop is wanted.
 - **Order placement for WP 1.6 (order resolver, WP 1.5d-2, 2026-11-11).** Exits are now a market sell of an exact qty through `submit_order`, not `close_position`. 1.6 must verify, per traded symbol, that an exact-qty sell of the free holding closes cleanly (the 2026-10-12 probe was one BTC sample), confirm the `qty_available` mapping in `AlpacaBroker.positions` (already read from the API), and document what Alpaca does on a duplicate `client_order_id` at submit (rejection text, whether the existing order is returned). 1.6 also implements `get_order_by_client_id` (today `repair link` fails with `OrderMethodsUnavailable`) and must check the lookup is visible for `order_visibility_allowance_s` (60 s) after a submit. *Added 2026-11-11 (PR #35 review, m2):* when mapping the lookup to `BrokerOrderView`, also map order type, limit price and time in force (the match check needs them), and verify the order's `qty` comes back exactly as submitted for market and limit orders on each traded symbol: the match is exact, so any normalisation must be found here, not at the first lost response (PLAN 1.6 row).
+  *Partly answered 2026-11-12 (WP 1.6a probes, section above): exact-qty sells closed cleanly on BTC, ETH and SOL, qty is echoed unchanged for the entry and exit shapes, a duplicate client id is a 422 without the existing order, the lookup saw each order within 0.3 s. Still open: the `qty_available` mapping under a resting sell, and behaviour beyond one sample per symbol.*
 - **Live availability for German residents** (SPEC §2, open risk). Unchanged; not checkable from a paper account.
