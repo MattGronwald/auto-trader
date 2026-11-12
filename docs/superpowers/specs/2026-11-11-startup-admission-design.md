@@ -251,7 +251,13 @@ catches a missing holding only indirectly. 1.5d-3 adds a **one-sided** check to 
   it books, which only delays the check. *(Note 2026-11-11, Codex review of plan PR #38:)* a
   passed check is tied to the generation it passed on; before admission opens, the step reads the
   guard once more and stays closed on an unsettled row, and re-runs the check if the generation
-  moved, so an exit placed after a cached pass must settle first.
+  moved, so an exit placed after a cached pass must settle first. *(Note 2026-11-12, Fable review
+  of PR #39, findings I2, M2 and M3:)* an unsettled row at the first guard read now skips the
+  check without the broker read, and `cycle.admission_waiting` names `unsettled order rows` when
+  the last check was skipped or discarded this way (it named `holdings check not completed`,
+  which now means a failed read only). "Must settle first" holds only for an exit in the journal
+  by the final guard read: that read yields to the loop a few turns before the decision; `check()`
+  still rejects an entry on a symbol with an unsettled sell.
 - **On a shortfall:** admission stays closed; `admission.holdings_short` (error) is logged once per
   symbol, with journal qty, dust and broker qty, and re-logged only if the figures change. No
   manual pause is committed **(Claude's call)**: admission is already closed, and the check

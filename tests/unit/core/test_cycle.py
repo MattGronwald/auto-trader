@@ -192,7 +192,7 @@ async def strategy_id(sessions: async_sessionmaker[AsyncSession]) -> int:
         return (await repo.register_strategy(s, profile(), "yaml")).id
 
 
-def make_runner(
+async def make_runner(
     sessions: async_sessionmaker[AsyncSession],
     bus: EventBus,
     gate: Any,
@@ -204,8 +204,9 @@ def make_runner(
     clock: Clock | None = None,
     decide: Callable[[CandidateSignal, CycleSnapshot], Awaitable[Decision]] | None = None,
     step_timeout_s: float = 30.0,
+    admit: bool = True,
 ) -> CycleRunner:
-    return CycleRunner(
+    runner = CycleRunner(
         profile=profile(max_cycles),
         strategy_id=strategy_id,
         market=market or Market(),
@@ -217,6 +218,10 @@ def make_runner(
         clock=clock or Clock(),
         step_timeout_s=step_timeout_s,
     )
+    if admit:
+        await runner.recover()
+        runner.open_admission()
+    return runner
 
 
 async def new_cycle(
@@ -280,7 +285,7 @@ async def test_approved_entry_ends_submitted_with_a_full_audit_trail(
     strategy_id: int,
 ) -> None:
     risk = FakeRisk(approved("new"))
-    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    runner = await make_runner(sessions, bus, gate, risk, strategy_id)
     cid = await new_cycle(sessions, strategy_id)
 
     await runner._run(cid, candidate())
@@ -317,7 +322,7 @@ async def test_order_status_mapping(
     gate: ControlGate,
     strategy_id: int,
 ) -> None:
-    runner = make_runner(sessions, bus, gate, FakeRisk(approved(status)), strategy_id)
+    runner = await make_runner(sessions, bus, gate, FakeRisk(approved(status)), strategy_id)
     cid = await new_cycle(sessions, strategy_id)
     await runner._run(cid, candidate())
     row = await cycle_row(sessions, cid)
@@ -331,7 +336,7 @@ async def test_risk_rejection_ends_rejected_with_the_first_reason(
     strategy_id: int,
 ) -> None:
     rejected = OrderResult(RiskDecision(approved=False, reasons=("expectancy -1 <= 0", "x")))
-    runner = make_runner(sessions, bus, gate, FakeRisk(rejected), strategy_id)
+    runner = await make_runner(sessions, bus, gate, FakeRisk(rejected), strategy_id)
     cid = await new_cycle(sessions, strategy_id)
     await runner._run(cid, candidate())
     row = await cycle_row(sessions, cid)
@@ -345,7 +350,7 @@ async def test_check_exception_is_error_and_never_retried(
     strategy_id: int,
 ) -> None:
     risk = FakeRisk(RuntimeError("boom"))
-    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    runner = await make_runner(sessions, bus, gate, risk, strategy_id)
     cid = await new_cycle(sessions, strategy_id)
     await runner._run(cid, candidate())
     row = await cycle_row(sessions, cid)
@@ -360,7 +365,7 @@ async def test_stub_skip_is_rejected(
     strategy_id: int,
 ) -> None:
     risk = FakeRisk()
-    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    runner = await make_runner(sessions, bus, gate, risk, strategy_id)
     cid = await new_cycle(sessions, strategy_id)
     await runner._run(cid, candidate(score=0.3))
     row = await cycle_row(sessions, cid)
@@ -402,7 +407,7 @@ async def test_enrichment_failures_expire(
     else:
         market.series[BTC] = bars(BTC, spread=0.0)
     risk = FakeRisk()
-    runner = make_runner(sessions, bus, gate, risk, strategy_id, market=market)
+    runner = await make_runner(sessions, bus, gate, risk, strategy_id, market=market)
     cid = await new_cycle(sessions, strategy_id)
     await runner._run(cid, candidate())
     row = await cycle_row(sessions, cid)
@@ -425,7 +430,9 @@ async def test_signal_gone_stale_while_deciding_expires_without_check(
         )
 
     risk = FakeRisk()
-    runner = make_runner(sessions, bus, gate, risk, strategy_id, clock=clock, decide=slow_decide)
+    runner = await make_runner(
+        sessions, bus, gate, risk, strategy_id, clock=clock, decide=slow_decide
+    )
     cid = await new_cycle(sessions, strategy_id)
     await runner._run(cid, candidate())
     row = await cycle_row(sessions, cid)
@@ -449,7 +456,7 @@ async def test_step_timeout_is_error_and_not_retried(
         return StubSkip("unreachable")
 
     # 1.0 s: real-time headroom for the non-hanging steps; only decide should time out.
-    runner = make_runner(
+    runner = await make_runner(
         sessions, bus, gate, FakeRisk(), strategy_id, decide=hang, step_timeout_s=1.0
     )
     cid = await new_cycle(sessions, strategy_id)
@@ -483,7 +490,7 @@ async def test_write_failure_before_check_falls_back_to_error(
 ) -> None:
     fail_transition_to(monkeypatch, "ANALYZING")
     risk = FakeRisk()
-    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    runner = await make_runner(sessions, bus, gate, risk, strategy_id)
     cid = await new_cycle(sessions, strategy_id)
     await runner._run(cid, candidate())
     row = await cycle_row(sessions, cid)
@@ -506,7 +513,7 @@ async def test_write_failure_after_check_keeps_the_last_committed_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fail_transition_to(monkeypatch, failing)
-    runner = make_runner(sessions, bus, gate, FakeRisk(approved(status)), strategy_id)
+    runner = await make_runner(sessions, bus, gate, FakeRisk(approved(status)), strategy_id)
     cid = await new_cycle(sessions, strategy_id)
     with capture_logs() as logs:
         await runner._run(cid, candidate())
@@ -522,7 +529,7 @@ async def test_uncertain_commit_on_a_transition_suspends_admission_without_fallb
     gate: ControlGate,
     strategy_id: int,
 ) -> None:
-    runner = make_runner(sessions, hbus, gate, FakeRisk(), strategy_id)
+    runner = await make_runner(sessions, hbus, gate, FakeRisk(), strategy_id)
     cid = await new_cycle(sessions, strategy_id)
     hook.fail_before = 1  # NEW -> ENRICHING does not commit; read-back sees NEW
     await runner._run(cid, candidate())
@@ -575,7 +582,7 @@ async def test_admitted_candidate_gets_a_row_an_event_and_a_task(
     gate: ControlGate,
     strategy_id: int,
 ) -> None:
-    runner = make_runner(sessions, bus, gate, FakeRisk(approved("new")), strategy_id)
+    runner = await make_runner(sessions, bus, gate, FakeRisk(approved("new")), strategy_id)
     await runner.on_candidate(candidate())
     await runner.join()
 
@@ -594,7 +601,7 @@ async def test_concurrency_cap_holds_for_simultaneous_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entered, release = hold_admission(monkeypatch)
-    runner = make_runner(
+    runner = await make_runner(
         sessions, bus, OpenGate(), FakeRisk(approved("new")), strategy_id, max_cycles=1
     )
     with capture_logs() as logs:
@@ -617,7 +624,7 @@ async def test_one_open_cycle_per_symbol(
     gate: ControlGate,
     strategy_id: int,
 ) -> None:
-    runner = make_runner(sessions, bus, gate, FakeRisk(approved("new")), strategy_id)
+    runner = await make_runner(sessions, bus, gate, FakeRisk(approved("new")), strategy_id)
     with capture_logs() as logs:
         await runner.on_candidate(candidate(BTC))
         await runner.on_candidate(candidate(BTC))
@@ -649,7 +656,7 @@ async def test_open_entry_order_of_an_error_cycle_blocks_its_symbol(
             status="pending",
             now=NOW,
         )
-    runner = make_runner(sessions, bus, gate, FakeRisk(), strategy_id)
+    runner = await make_runner(sessions, bus, gate, FakeRisk(), strategy_id)
     with capture_logs() as logs:
         await runner.on_candidate(candidate(BTC))
     assert dropped(logs) == ["open entry order on symbol"]
@@ -662,7 +669,7 @@ async def test_stale_candidate_is_dropped(
     gate: ControlGate,
     strategy_id: int,
 ) -> None:
-    runner = make_runner(sessions, bus, gate, FakeRisk(), strategy_id)
+    runner = await make_runner(sessions, bus, gate, FakeRisk(), strategy_id)
     with capture_logs() as logs:
         await runner.on_candidate(candidate(bar_ts=NOW - 3 * FIVE))
     assert dropped(logs) == ["signal stale"]
@@ -704,7 +711,7 @@ async def test_gate_blocks_admission_fail_closed(
     # Only the gate that never answers needs the tiny budget; the real gate (kill file + DB)
     # and the raising gate get the default budget, so only the hung read can time out.
     budget = 0.01 if gate_kind == "hangs" else 30.0
-    runner = make_runner(sessions, bus, use, FakeRisk(), strategy_id, step_timeout_s=budget)
+    runner = await make_runner(sessions, bus, use, FakeRisk(), strategy_id, step_timeout_s=budget)
     with capture_logs() as logs:
         await runner.on_candidate(candidate())
     (reason,) = dropped(logs)
@@ -723,7 +730,7 @@ async def test_db_error_at_admission_is_logged_not_raised(
         raise OperationalError("INSERT", None, Exception("database is locked"))
 
     monkeypatch.setattr(repo, "insert_cycle", broken)
-    runner = make_runner(sessions, bus, gate, FakeRisk(), strategy_id)
+    runner = await make_runner(sessions, bus, gate, FakeRisk(), strategy_id)
     with capture_logs() as logs:
         await runner.on_candidate(candidate())  # must not raise
     assert any(e["event"] == "cycle.admission_failed" for e in logs)
@@ -739,7 +746,7 @@ async def test_uncertain_admission_suspends_and_a_late_landing_insert_never_brea
 ) -> None:
     risk = FakeRisk(approved("filled"))
     risk.release = asyncio.Event()
-    runner = make_runner(sessions, hbus, gate, risk, strategy_id, max_cycles=2)
+    runner = await make_runner(sessions, hbus, gate, risk, strategy_id, max_cycles=2)
 
     await runner.on_candidate(candidate(SOL))  # a running cycle, held inside check()
     await risk.started.wait()
@@ -768,7 +775,7 @@ async def test_suspension_is_checked_inside_the_admission_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entered, release = hold_admission(monkeypatch)
-    runner = make_runner(sessions, bus, OpenGate(), FakeRisk(approved("new")), strategy_id)
+    runner = await make_runner(sessions, bus, OpenGate(), FakeRisk(approved("new")), strategy_id)
     real_publish = runner._bus.publish_tx
     publish_calls = 0
 
@@ -803,7 +810,7 @@ async def test_suspension_by_a_surviving_unit_stops_an_admission_queued_on_the_b
 ) -> None:
     """Review P1 (2026-10-11): an admission that passed the admission-lock check and
     waits for the bus lock must still see a suspension set by the unit ahead of it."""
-    runner = make_runner(sessions, hbus, OpenGate(), FakeRisk(approved("new")), strategy_id)
+    runner = await make_runner(sessions, hbus, OpenGate(), FakeRisk(approved("new")), strategy_id)
     sol = await new_cycle(sessions, strategy_id, symbol=SOL)
     release = asyncio.Event()
     hook.block_before = release  # SOL's NEW -> ENRICHING unit parks holding the bus lock
@@ -871,7 +878,7 @@ async def test_recover(
                 status="pending",
                 now=NOW,
             )
-    await make_runner(sessions, bus, gate, FakeRisk(), strategy_id).recover()
+    await (await make_runner(sessions, bus, gate, FakeRisk(), strategy_id, admit=False)).recover()
     row = await cycle_row(sessions, cid)
     assert (row.state, row.reject_reason) == (after, reason)
 
@@ -892,7 +899,7 @@ async def test_close_cancels_a_cycle_before_check_and_recover_ends_it(
         await asyncio.Event().wait()
         return StubSkip("unreachable")
 
-    runner = make_runner(sessions, bus, gate, FakeRisk(), strategy_id, decide=hang)
+    runner = await make_runner(sessions, bus, gate, FakeRisk(), strategy_id, decide=hang)
     await runner.on_candidate(candidate())
     await deciding.wait()
     report = await runner.close(budget_s=5)
@@ -900,7 +907,7 @@ async def test_close_cancels_a_cycle_before_check_and_recover_ends_it(
     (row,) = await all_cycles(sessions)
     assert row.state == "DECIDING"
 
-    await make_runner(sessions, bus, gate, FakeRisk(), strategy_id).recover()
+    await (await make_runner(sessions, bus, gate, FakeRisk(), strategy_id, admit=False)).recover()
     assert (await cycle_row(sessions, row.id)).state == "ERROR"
 
 
@@ -912,7 +919,7 @@ async def test_close_drains_a_check_that_finishes_in_time(
 ) -> None:
     risk = FakeRisk(approved("new"))
     risk.release = asyncio.Event()
-    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    runner = await make_runner(sessions, bus, gate, risk, strategy_id)
     await runner.on_candidate(candidate())
     await risk.started.wait()
     closing = asyncio.create_task(runner.close(budget_s=5, cancel_wait_s=1))
@@ -934,7 +941,7 @@ async def test_close_forces_a_check_past_the_drain_deadline(
 ) -> None:
     risk = FakeRisk(approved("new"))
     risk.release = asyncio.Event()  # never set: check() only ends by cancellation
-    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    runner = await make_runner(sessions, bus, gate, risk, strategy_id)
     await runner.on_candidate(candidate())
     await risk.started.wait()
     with capture_logs() as logs:
@@ -957,7 +964,7 @@ async def test_close_reports_a_task_that_ignores_cancellation(
     risk = FakeRisk(approved("new"))
     risk.release = asyncio.Event()
     risk.swallow_cancel = True
-    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    runner = await make_runner(sessions, bus, gate, risk, strategy_id)
     await runner.on_candidate(candidate())
     await risk.started.wait()
     with capture_logs() as logs:
@@ -977,7 +984,7 @@ async def test_close_does_not_wait_for_an_admission_and_that_cycle_never_starts(
 ) -> None:
     entered, release = hold_admission(monkeypatch)
     risk = FakeRisk()
-    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    runner = await make_runner(sessions, bus, gate, risk, strategy_id)
     admitting = asyncio.create_task(runner.on_candidate(candidate(BTC)))
     await entered.wait()
     report = await asyncio.wait_for(runner.close(budget_s=5), timeout=5)  # safety net only
@@ -990,7 +997,7 @@ async def test_close_does_not_wait_for_an_admission_and_that_cycle_never_starts(
     assert dropped(logs) == ["shutting down"]
     (row,) = await all_cycles(sessions)
     assert row.state == "NEW" and risk.calls == []
-    await make_runner(sessions, bus, gate, FakeRisk(), strategy_id).recover()
+    await (await make_runner(sessions, bus, gate, FakeRisk(), strategy_id, admit=False)).recover()
     assert (await cycle_row(sessions, row.id)).state == "ERROR"
 
 
@@ -1012,7 +1019,7 @@ async def test_a_step_that_swallows_cancellation_never_starts_check_after_close(
         return StubBuy(D("98"), D("104"), D("0.6"), D("1"))
 
     risk = FakeRisk()
-    runner = make_runner(sessions, bus, gate, risk, strategy_id, decide=stubborn)
+    runner = await make_runner(sessions, bus, gate, risk, strategy_id, decide=stubborn)
     await runner.on_candidate(candidate())
     await deciding.wait()
     closing = asyncio.create_task(runner.close(budget_s=5))
@@ -1024,7 +1031,7 @@ async def test_a_step_that_swallows_cancellation_never_starts_check_after_close(
     (row,) = await all_cycles(sessions)
     assert row.state == "DECIDING"  # RISK_CHECK was never written
 
-    await make_runner(sessions, bus, gate, FakeRisk(), strategy_id).recover()
+    await (await make_runner(sessions, bus, gate, FakeRisk(), strategy_id, admit=False)).recover()
     assert (await cycle_row(sessions, row.id)).state == "ERROR"
 
 
@@ -1035,7 +1042,7 @@ async def test_risk_check_entered_after_close_started_never_calls_check(
     strategy_id: int,
 ) -> None:
     risk = FakeRisk()
-    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    runner = await make_runner(sessions, bus, gate, risk, strategy_id)
     cid = await new_cycle(sessions, strategy_id, state="RISK_CHECK")
     intent = EntryIntent(
         cycle_id=cid,
@@ -1049,7 +1056,7 @@ async def test_risk_check_entered_after_close_started_never_calls_check(
     await runner._risk_check(_Cursor(cid, CycleState.RISK_CHECK), intent)
     assert risk.calls == []
     assert (await cycle_row(sessions, cid)).state == "RISK_CHECK"
-    await make_runner(sessions, bus, gate, FakeRisk(), strategy_id).recover()
+    await (await make_runner(sessions, bus, gate, FakeRisk(), strategy_id, admit=False)).recover()
     assert (await cycle_row(sessions, cid)).state == "ERROR"
 
 
@@ -1061,7 +1068,7 @@ async def test_recover_must_run_before_admission(
 ) -> None:
     risk = FakeRisk()
     risk.release = asyncio.Event()  # keeps the admitted cycle's task alive
-    runner = make_runner(sessions, bus, gate, risk, strategy_id)
+    runner = await make_runner(sessions, bus, gate, risk, strategy_id)
     await runner.on_candidate(candidate())
     await risk.started.wait()
     with pytest.raises(RuntimeError, match="before admission"):
@@ -1093,7 +1100,7 @@ async def test_a_cycle_the_ledger_completed_first_is_not_stuck(
     gate: ControlGate,
     strategy_id: int,
 ) -> None:
-    runner = make_runner(sessions, bus, gate, LedgerFirstRisk(sessions), strategy_id)
+    runner = await make_runner(sessions, bus, gate, LedgerFirstRisk(sessions), strategy_id)
     cid = await new_cycle(sessions, strategy_id)
     with capture_logs() as logs:
         await runner._run(cid, candidate())
@@ -1101,3 +1108,108 @@ async def test_a_cycle_the_ledger_completed_first_is_not_stuck(
     names = [e["event"] for e in logs]
     assert "cycle.completed_elsewhere" in names
     assert "cycle.stuck" not in names and "bus.unit_failed" not in names
+
+
+# --- startup admission (WP 1.5d-3) ---------------------------------------------------
+
+
+def admission_opened(logs: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    return [e for e in logs if e["event"] == "cycle.admission_open"]
+
+
+async def test_new_runner_drops_with_reconciliation_pending(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    runner = await make_runner(sessions, bus, gate, FakeRisk(), strategy_id, admit=False)
+    with capture_logs() as logs:
+        await runner.on_candidate(candidate())
+    assert dropped(logs) == ["startup reconciliation pending"]
+    assert await all_cycles(sessions) == []
+
+
+async def test_disabled_runner_drops_with_all_reasons(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    runner = await make_runner(sessions, bus, gate, FakeRisk(), strategy_id, admit=False)
+    await runner.recover()
+    runner.disable_admission("backfill failed")
+    runner.disable_admission("recover failed")
+    runner.disable_admission("backfill failed")
+    runner.open_admission()
+    assert runner.admission_disabled == ("backfill failed", "recover failed")
+    assert not runner.admission_open
+    with capture_logs() as logs:
+        await runner.on_candidate(candidate())
+    assert dropped(logs) == ["admission disabled: backfill failed, recover failed"]
+    assert await all_cycles(sessions) == []
+
+
+async def test_open_admission_requires_a_clean_recover(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = await make_runner(sessions, bus, gate, FakeRisk(), strategy_id, admit=False)
+    with pytest.raises(RuntimeError, match="clean recover"):
+        runner.open_admission()
+
+    async def broken(session: AsyncSession) -> list[m.Cycle]:
+        raise OperationalError("SELECT", None, Exception("database is locked"))
+
+    monkeypatch.setattr(repo, "open_cycles", broken)
+    with pytest.raises(OperationalError):
+        await runner.recover()
+    with pytest.raises(RuntimeError, match="clean recover"):
+        runner.open_admission()
+    assert not runner.admission_open
+
+
+async def test_open_admission_is_idempotent_and_logs_once(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    runner = await make_runner(sessions, bus, gate, FakeRisk(), strategy_id, admit=False)
+    await runner.recover()
+    with capture_logs() as logs:
+        runner.open_admission()
+        runner.open_admission()
+    assert len(admission_opened(logs)) == 1
+    assert runner.admission_open is True
+
+
+async def test_open_admission_after_close_is_a_noop(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    runner = await make_runner(sessions, bus, gate, FakeRisk(), strategy_id, admit=False)
+    await runner.recover()
+    await runner.close(budget_s=1)
+    with capture_logs() as logs:
+        runner.open_admission()
+        await runner.on_candidate(candidate())
+    assert admission_opened(logs) == []
+    assert dropped(logs) == ["shutting down"]
+
+
+async def test_recover_after_a_closed_runner_dropped_a_candidate_raises(
+    sessions: async_sessionmaker[AsyncSession],
+    bus: EventBus,
+    gate: ControlGate,
+    strategy_id: int,
+) -> None:
+    runner = await make_runner(sessions, bus, gate, FakeRisk(), strategy_id, admit=False)
+    await runner.on_candidate(candidate())
+    with pytest.raises(RuntimeError, match="before admission"):
+        await runner.recover()

@@ -7,16 +7,18 @@ Requirements live in `SPEC.md`, delivery status in `PLAN.md`.
 The examples assume the default `config.yaml` (journal `data/autotrader.db`, SQLite). Run SQL with
 `sqlite3 data/autotrader.db`. Never delete journal rows; change only the columns a procedure names.
 
-## Current limits (WP 1.5d-2)
+## Current limits (WP 1.5d-3)
 
 - `run core` connects `AlpacaBroker`, which cannot place orders until WP 1.6: its order methods
   raise `OrderMethodsUnavailable` and `can_place_orders()` is false. The Position Manager still
   evaluates and latches triggers (`positions.exit_triggered`) and logs
   `positions.broker_cannot_trade` once, but sends no exits and no cancels. A flatten stays pending
   with `reason: "broker cannot place orders"`.
-- `run core` places no entries until the Cycle Runner is wired in WP 1.5d-3 (it calls no
-  `check()` yet). The rejection reasons in "Entries rejected" below are enforced by
-  `RiskEngine.check()` and apply once it is wired.
+- With `SimBroker` the Cycle Runner places entries once admission opens; with `AlpacaBroker`
+  admission stays disabled until WP 1.6 (`cycle.admission_disabled`, reason `broker cannot place
+  orders`), so `run core` places no entries there. The rejection reasons in "Entries rejected"
+  below are enforced by `RiskEngine.check()` for every admitted candidate. How admission opens
+  is in "Startup and admission".
 - An order the engine cannot account for (no broker id, or one the broker no longer knows) is
   looked up by its client id for 80 s, then becomes an incident. The resolver never marks
   `not_submitted` by itself and never retries the order: the operator repairs it with
@@ -32,18 +34,122 @@ The examples assume the default `config.yaml` (journal `data/autotrader.db`, SQL
 - The flatten-state guards rely on SQLite's write lock. Postgres needs `SELECT ... FOR UPDATE`
   (WP 3.5 ownership work).
 
+## Startup and admission
+
+`run core` builds the Cycle Runner with admission closed, runs `recover()` (it settles cycles the
+previous process left open) before the feed stream starts, and subscribes the runner to
+`CandidateSignal`. Exits, kill polling and the order sync never depend on admission. A supervised
+loop, `admission.ready` (every second), opens admission, once and for good, when all of these hold:
+
+1. Nothing disabled it (see "Admission disabled" below).
+2. The ledger cash check completed and no cash fault is set (the same condition as
+   `cash reconciliation failed` in "Entries rejected"). The first clear observation starts the
+   proof; a fault seen again before admission opens restarts it.
+3. A Position Manager step that started after that observation evaluated every open position
+   (`evaluated` or `latched`; none open also counts).
+4. The holdings check passed: for every symbol with an open journal position or a dust balance,
+   journal qty + dust is at most the broker's total qty. A larger broker holding is fine.
+   It runs only until admission opens; the cash check keeps running every 60 s regardless.
+
+Open admission logs `cycle.admission_open` (info). If it is still closed 3 x the snapshot interval
+after the start (3 min by default), `cycle.admission_waiting` (warning) logs `unmet` (the open
+conditions), `positions` (the open positions that are not `evaluated` or `latched`, with their
+outcome) and `short` (symbols failing the holdings check), then repeats every 10 min while
+admission stays closed. It is never logged while admission is disabled (`ready()` returns
+before any logging); the `cycle.admission_disabled` startup line is the signal then. Until it
+opens, a candidate is dropped with `cycle.dropped`
+(`admission disabled: ...` or `startup reconciliation pending`).
+
+### Admission disabled
+
+These disable admission until the next restart; the exits keep running. Each logs
+`cycle.admission_disabled` with the reason:
+
+| Reason | Level | What to do |
+|---|---|---|
+| `broker cannot place orders` | warning | Expected with `AlpacaBroker` before WP 1.6. Nothing to fix. |
+| `backfill failed` | error | The history backfill raised (`feed.backfill_failed`) and the scanner is not subscribed. Restart once the data API answers. |
+| `recover failed` | error | `recover()` raised (traceback in the log). Fix the cause (usually the journal or a hung database), then restart. Candidates are logged as dropped meanwhile. |
+
+A broker whose mode differs from `mode` in `config.yaml` stops the startup with
+`broker mode '...' does not match config mode '...'`: with a mismatch `exit()` would reject every
+exit. Check `mode` against `ALPACA_PAPER` in `.env`; nothing runs until they agree.
+
+### Admission waiting: what to do per cause
+
+- **Cash fault, `cash check not completed: <fault>`** (`risk.cash_fault_set`,
+  `ledger.cash_check_failed`): see `cash reconciliation failed` in "Entries rejected". A sticky
+  fault (a `CommitUncertain` error) holds until the core is restarted: fix the cause and restart.
+- **`unsettled order rows`:** an order row with `settled_at` NULL keeps admission closed. After a
+  restart it keeps the cash check skipped, so the line names it next to the cash fault. After the
+  cash check (an exit the Position Manager placed, or one that never settles) the holdings check
+  is skipped while the row is unsettled at its first guard read, without reading the broker, or
+  discarded after the broker read when a row is unsettled at its second guard read or the
+  generation moved. The line then names `unsettled order rows` instead of a holdings cause. A
+  discard on a moved generation with nothing left unsettled (an order settled during the check)
+  carries the same label for one tick. A row that settles clears it on the next tick. A resolver incident stays until `autotrader repair` settles it (see "Resolving an
+  order incident"; stop the core, repair, restart).
+- **`positions not evaluated`** (`positions` lists each position with `no_bid` or `failed`):
+  - `no_bid`: no trusted bid for a held symbol. If the feed is down or stale, wait for it to
+    return. A symbol outside the profile's universe is never quoted; `admission.unquoted_holdings`
+    (warning, at startup) names such symbols. The clean fix is to add the symbol to the universe
+    and restart. Without a bid only the time exit (`max_hold_min`) and, when enabled, the stale
+    exit can fire; they latch without a price, and a latched position counts as evaluated, so
+    the blocker clears on its own once that exit latches (it still has to be sent and settled,
+    which `unsettled order rows` below covers). Closing the position by hand is not enough: the
+    ledger books only sells the journal placed, so the position stays open and the next holdings
+    check reports `holdings short`; that needs the manual journal correction described there.
+  - `failed`: the position's step raised (`positions.step_failed`, with the traceback) or its
+    trigger could not be latched. A position whose exit keeps raising stays `failed` and keeps
+    admission closed until it is exited or the cause is fixed. An exit that is only REJECTED
+    (`exit()` returns `rejected` or `not_submitted`) does not raise: the position stays
+    `latched`, the Position Manager backs off and logs `positions.exit_failing`, and admission
+    is not blocked by it.
+- **`no position manager step since the cash check`** (`unmet`): transient, clears on the next
+  `positions.manage` step. If it persists, look for `positions.manage` stalls or
+  `positions.step_failed`.
+- **`holdings short`** (`admission.holdings_short`, error: `symbol`, `journal_qty`, `dust`,
+  `broker_qty`): the journal claims more than the broker holds. Investigate (a manual sale, a
+  missed fill, a withdrawal) and correct the journal by hand; this includes a dust-only symbol
+  whose coins were sold by hand (no open position, `broker_qty` 0). Nothing flattens or sells
+  automatically. A symbol is logged once per distinct set of figures and again if it stops being
+  short and comes back; after a cash-fault reset the same shortfall is not logged again, but the
+  waiting log still names it under `short`.
+- **`holdings check not completed`:** a read of the holdings check failed: the broker, journal or
+  cash-guard read raised (`admission.holdings_read_failed`, warning, once per failure streak) and
+  is retried every tick. Check the broker connection (and the journal database) if the line
+  persists. An order in flight is not reported here but as `unsettled order rows`. Without a
+  read-failed line it can also appear for one tick after a passed check was dropped because an
+  order changed the journal; it re-runs on the next tick.
+
+Known costs (revisited in WP 1.6):
+
+- An exit left unsettled after the cash check (an incident, or a sell that never settles) keeps
+  admission closed until it settles or is repaired.
+- A latched position whose exit attempts keep raising reports `failed` and keeps admission
+  closed. One whose exits are rejected (`rejected` or `not_submitted`, logged
+  `positions.exit_failing`) reports `latched` and does not block admission.
+- `cycle.admission_waiting` repeats every 10 min and names the current causes, including
+  unsettled order rows before and after the cash check; the per-cause lines
+  (`admission.holdings_short`, `admission.holdings_read_failed`, `positions.*`,
+  `risk.cash_fault_set`) have the details.
+- The holdings check reads the broker's positions every tick until it passes, except while an
+  order row is unsettled at its first guard read. A cash fault set and cleared between two ticks
+  is not seen.
+
 ## Entries rejected
 
 `RiskEngine.check()` rejects an entry with one of these reasons. Each reason in the table
 below is a gather-time rejection: a persisted risk decision, no pause is set and no order row is
-written (the pre-submit case after the table is different). Exits are never affected. `run core` calls
-no `check()` until WP 1.5d-3, so today these describe what the engine will do.
+written (the pre-submit case after the table is different). Exits are never affected. With
+`AlpacaBroker` `run core` calls no `check()` until WP 1.6 (admission is disabled), so there these
+describe what the engine will do.
 
 | Reason | Meaning | Clears when |
 |---|---|---|
 | `daily-loss baseline unavailable` | No equity snapshot in [trading-day start - 120 s, trading-day start] (2 x the 60 s snapshot interval). | The next trading day that has such a snapshot. Nothing to fix. |
 | `equity snapshot overdue` | The snapshot loop has not committed a snapshot yet in this process, or the last one is older than 120 s. | A snapshot loop commit (within 60 s once the loop is healthy). |
-| `cash reconciliation failed` | The ledger cash check has not completed since startup, or its guard, snapshot or check stage raised. | A completed cash check with result baseline, ok or discrepancy (not `skipped`). After a `CommitUncertain` error it holds until the core is restarted. A completed check can also be `skipped`: the ledger skips the comparison when any order row has `settled_at` NULL (at either guard read) or the order/fill generation (`max(orders.id)`, fill watermark) moved between the reads. A skipped check neither sets nor clears the fault and logs no `ledger.cash_check_failed`, so after a restart one stuck unsettled row keeps entries rejected. Find it with `SELECT id, symbol, side, status FROM orders WHERE settled_at IS NULL;` and settle it (see below). |
+| `cash reconciliation failed` | The ledger cash check has not completed since startup, or its guard, snapshot or check stage raised. | A completed cash check with result baseline, ok or discrepancy (not `skipped`). After a `CommitUncertain` error it holds until the core is restarted. A completed check can also be `skipped`: the ledger skips the comparison when any order row has `settled_at` NULL (at either guard read) or the order/fill generation (`max(orders.id)`, fill watermark) moved between the reads. A skipped check neither sets nor clears the fault and logs no `ledger.cash_check_failed`, so after a restart one stuck unsettled row keeps entries rejected, and keeps admission closed (see "Startup and admission"). Find it with `SELECT id, symbol, side, status FROM orders WHERE settled_at IS NULL;` and settle it (see below). |
 | `unsettled sell on <SYM>` | An order row with side `sell` and `settled_at` NULL exists on that symbol. | The ledger settles the row. A `pending`/`unknown` sell without a broker id is linked by the resolver, or becomes an incident that stays until `autotrader repair` (see "Resolving an order incident") settles it. |
 
 Pre-submit re-check: a fault, an overdue snapshot or `trading day changed` that appears after
@@ -166,7 +272,9 @@ lift the pause and does not un-latch triggers already set. Cancel a request that
 after a resume.
 
 `shutdown.flatten: true` in `config.yaml` runs the same request on every graceful stop after a
-completed startup and waits up to half the remaining shutdown budget. On timeout it logs
+completed startup. It runs after `runner.close` (up to 20 s, so no entry starts during the
+flatten) and waits up to half the remaining shutdown budget: with the 30 s default and a close that
+used its full 20 s, about 5 s. On timeout it logs
 `core.shutdown_flatten_incomplete` and teardown continues; whatever is left is handled at the next
 start.
 
@@ -322,8 +430,8 @@ WHERE id = <row>;
 This does not undo bookings made after the mark: check the symbol's position, fills and cash
 against the broker by hand and expect to correct them.
 
-With `AlpacaBroker` in 1.5d-2 no order is ever placed (`can_place_orders()` is false, nothing
-places entries before 1.5d-3), so none of this arises in production yet.
+With `AlpacaBroker` no order is ever placed before 1.6 (`can_place_orders()` is false and
+admission is disabled), so none of this arises in production yet.
 
 ## Accounting for an external sale
 

@@ -86,6 +86,9 @@ text:
   from a `BarClosed` through the scanner. A real signal needs a full indicator warm-up for one of
   the profile's rules. The scanner -> `CandidateSignal` leg is already covered by
   `tests/integration/test_scanner_feed.py`.
+  *(Note 2026-11-12, Fable review of PR #39, M4:)* superseded: test 12 now runs the scanner
+  leg too. A warm history puts a breakout in the last closed 5m bar and the test publishes the 5m
+  `BarClosed` on the core's bus (the feed announces one only when a wall-clock window closes).
 
 ## Global Constraints
 
@@ -372,7 +375,10 @@ text:
      omits that entry. Once `T_b` is set, the entries come
      from `"no position manager step since the cash check"`, `"positions not evaluated"`,
      `"holdings short"` and `"holdings check not completed"`; the last covers a discarded or
-     failed read without a shortfall. The threshold is `>=`. Also log `positions`, a list of
+     failed read without a shortfall. *(Note 2026-11-12, Fable review of PR #39, I2:)* a check
+     skipped or discarded on an unsettled row or a moved generation now reports
+     `"unsettled order rows"`; `"holdings check not completed"` means a failed read. The
+     threshold is `>=`. Also log `positions`, a list of
      `{position_id, symbol, outcome}` for every non-evaluated/latched position in the last report,
      and `short: list[str]`. Return `False`.
 - Test doubles in `test_admission.py` (define the journal fixtures locally; `db_url`/`sessions`
