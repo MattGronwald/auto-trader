@@ -32,14 +32,14 @@ from autotrader.core.admission import AdmissionReadiness
 from autotrader.core.bus import CommitUncertain, EventBus
 from autotrader.core.config import AppConfig, Settings, load_config, load_profile
 from autotrader.core.cycle import CloseReport, CycleRunner
-from autotrader.core.feed import Latest, MarketFeed
+from autotrader.core.feed import BarClosed, Latest, MarketFeed
 from autotrader.core.flatten import request_flatten
 from autotrader.core.kill import PAUSED_KEY, ControlGate, ControlStatus
 from autotrader.core.ledger import CashGuard, CashResult, Ledger
 from autotrader.core.lock import JournalLock, acquire
 from autotrader.core.logging import configure_logging
 from autotrader.core.runtime import ControlPoller, _snapshot_step, _sync_step, run_core
-from autotrader.core.scanner import CandidateSignal
+from autotrader.core.scanner import CandidateSignal, Scanner
 from autotrader.core.shutdown import EXIT_CLEAN, EXIT_FAILED, ShutdownControl
 from autotrader.core.supervise import Supervisor
 from autotrader.core.types import Bar, Quote
@@ -1570,6 +1570,27 @@ async def test_recover_failure_keeps_exits_running(
     assert await _count(cfg, m.Order, m.Order.side == "buy") == entries
 
 
+def _sim_bar(symbol: str, price: float) -> Bar:
+    return Bar(
+        symbol=symbol,
+        timeframe="1m",
+        ts=datetime.now(UTC).replace(second=0, microsecond=0),
+        open=price,
+        high=price,
+        low=price,
+        close=price,
+        volume=1,
+    )
+
+
+async def _wait_for_settled_sell(cfg: AppConfig) -> None:
+    async with asyncio.timeout(5):
+        while not await _count(
+            cfg, m.Order, m.Order.side == "sell", m.Order.settled_at.is_not(None)
+        ):
+            await asyncio.sleep(0.01)
+
+
 async def test_backfill_failure_disables_admission_and_keeps_exits(
     cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1578,6 +1599,8 @@ async def test_backfill_failure_disables_admission_and_keeps_exits(
     cycles = await _count(cfg, m.Cycle)
     buf = io.StringIO()
     configure_logging(stream=buf)
+    buses = _record_bus(monkeypatch)
+    admits = _spy(monkeypatch, "_admission_step")
     ticks: list[int] = []
     real_tick = MarketFeed.tick
 
@@ -1586,6 +1609,12 @@ async def test_backfill_failure_disables_admission_and_keeps_exits(
         await real_tick(self)
 
     monkeypatch.setattr(MarketFeed, "tick", tick)
+    scanned: list[BarClosed] = []  # the bound method is taken at subscribe time
+
+    async def on_bar_closed(self: Scanner, event: BarClosed) -> None:
+        scanned.append(event)
+
+    monkeypatch.setattr(Scanner, "on_bar_closed", on_bar_closed)
     control, _ = make_control()
     task = start_core(
         cfg,
@@ -1593,6 +1622,7 @@ async def test_backfill_failure_disables_admission_and_keeps_exits(
         control,
         source=QuotingSource(fail_history=True),
         connect_broker=sim_connect(sim),
+        snapshot_s=0.05,  # readiness would get its chance to open within the test
         sync_s=0.01,
         manage_s=0.01,
     )
@@ -1601,6 +1631,16 @@ async def test_backfill_failure_disables_admission_and_keeps_exits(
         await _wait_for_sell(cfg)
         seen = len(ticks)
         await _wait_for(lambda: len(ticks) >= seen + 3)  # feed.tick keeps beating
+        sim.process_bar(_sim_bar("BTC/USD", 100.0))  # fills the exit
+        await _wait_for_settled_sell(cfg)
+        # A cash check after the settled exit, then many readiness ticks: with admission
+        # enabled, readiness would open here (no position left, nothing to hold).
+        seen = len(_named(buf, "risk.snapshot_written"))
+        await _wait_for(lambda: len(_named(buf, "risk.snapshot_written")) >= seen + 2)
+        seen = len(admits)
+        await _wait_for(lambda: len(admits) >= seen + 20)
+        await buses[0].publish(_candidate())
+        await _wait_for(lambda: bool(_named(buf, "cycle.dropped") or _named(buf, "cycle.admitted")))
     finally:
         control.begin("stop")
         assert await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN
@@ -1608,7 +1648,14 @@ async def test_backfill_failure_disables_admission_and_keeps_exits(
     assert failed["level"] == "error" and "data API down" in failed["exception"]
     (disabled,) = _named(buf, "cycle.admission_disabled")
     assert (disabled["reason"], disabled["level"]) == ("backfill failed", "error")
+    assert _named(buf, "cycle.admission_open") == []
+    assert [d["reason"] for d in _named(buf, "cycle.dropped")] == [
+        "admission disabled: backfill failed"
+    ]
     assert _named(buf, "scanner.subscribed") == []
+    # The live bars were announced, and the scanner never received one.
+    assert await _count(cfg, m.Event, m.Event.type == "BarClosed") == 2
+    assert scanned == []
     assert _named(buf, "feed.tick.task_died") == []
     (triggered,) = _named(buf, "positions.exit_triggered")
     assert triggered["reason"] == "time"
