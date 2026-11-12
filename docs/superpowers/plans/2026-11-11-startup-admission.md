@@ -86,6 +86,9 @@ text:
   from a `BarClosed` through the scanner. A real signal needs a full indicator warm-up for one of
   the profile's rules. The scanner -> `CandidateSignal` leg is already covered by
   `tests/integration/test_scanner_feed.py`.
+  *(Note 2026-11-12, Fable review of PR #39, M4:)* superseded: test 12 now runs the scanner
+  leg too. A warm history puts a breakout in the last closed 5m bar and the test publishes the 5m
+  `BarClosed` on the core's bus (the feed announces one only when a wall-clock window closes).
 
 ## Global Constraints
 
