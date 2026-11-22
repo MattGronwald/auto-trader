@@ -10,6 +10,9 @@ never retried, and that a thread-based transport cannot stop a cancelled caller 
 keep hung threads from starving exits. Owner decisions on that review: async `httpx` instead of
 `requests` (D22.1, revised) and provably unsent requests become `not_submitted` (D22.5, revised).
 The review's other findings are folded in and marked "Fable".
+Owner review of PR #41 (2026-11-22, three P2 findings, decided "go"): trading DNS shares the
+default thread pool with market data (1, 3.1); a persistent unknown status had no repair path
+(3.4); clients leaked on a failed or cancelled startup (3.5, 3.7). Marked "PR #41".
 
 ## 1. Scope and intent
 
@@ -39,9 +42,17 @@ What it does **not** do (later sub-WPs):
 - Buying power, broker max notional, quote/snapshot age, the $10 buy minimum in
   `AssetRules.min_notional` and full-close `min_notional` are 1.6c.
 - The market-data client (`broker/alpaca_data.py`) stays on alpaca-py, which has no HTTP timeout
-  and runs in asyncio's default thread pool. Once trading calls no longer use that pool, a hung
-  market-data call can no longer delay an exit; it can still stall the feed's REST refresh. Fixing
-  it is added to 1.6c (PLAN 1.6 row), before 1.6d enables orders.
+  and runs in asyncio's default thread pool. Trading calls no longer use that pool for requests,
+  but their DNS lookups still do: asyncio's `loop.getaddrinfo()` runs in the default executor, and
+  the write client opens a fresh connection (so a fresh lookup) per write. Hung market-data calls
+  that fill the pool (`min(32, cpus + 4)` workers) therefore delay a write's DNS until its 3 s
+  connect budget is spent; the exit becomes `not_submitted` and is retried, but every retry meets
+  the same full pool (PR #41, finding 1). Fixed in 1.6c, not here (PLAN 1.6 row): the market-data
+  client gets a timeout **and its own thread pool**, so nothing but DNS uses the default executor,
+  plus a test that fills the market-data pool with hung calls and shows a write still connects
+  within budget. Both are preconditions of 1.6d enabling paper writes. Isolating DNS inside the
+  trading transport (a custom httpcore network backend that resolves in a dedicated pool) was
+  considered and not chosen: more code on the order path for what one dedicated pool also solves.
 
 **Why own the transport.** alpaca-py 0.44's `TradingClient` is synchronous `requests` code
 (the package's only async code is the websocket streams). It sends every request without a
@@ -65,7 +76,7 @@ to private attributes that an upgrade can silently undo.
 - **Chosen: `httpx.AsyncClient`.** The request runs as a coroutine on the event loop, so the
   engine's `asyncio.wait_for` (and any cancellation) stops it where it is; a request whose
   connection is not yet established is never written. The connect timeout covers DNS and TCP/TLS
-  setup. `httpx.MockTransport` is a built-in test seam. Cost: new dependencies (`httpx` with
+  setup (DNS runs in the default thread pool, so it is bounded but not isolated; 1 above). `httpx.MockTransport` is a built-in test seam. Cost: new dependencies (`httpx` with
   `httpcore`, `anyio`, `h11`, `certifi`, `idna`).
 
 ## 2. Evidence (paper probes, 2026-11-12)
@@ -229,10 +240,27 @@ operator needs its id.
 `OrderNotFound` fails the row on every 2 s pass, forever, and the row never becomes a resolver
 candidate (`engine.py` `_read`). `_read` catches `UnknownOrderStatus` like `OrderNotFound`: the
 row becomes a type (b) candidate (clock `resolve_since`), logged `risk.order_status_unknown` with
-the raw status. The resolver's client-id lookup meets the same status and reports `lookup_failed`,
-so after `order_resolution_timeout_s` the row is an incident with the existing reminder and
-`repair` path **(builder call:** a dedicated incident reason such as `unknown_status`, if it fits
-the existing reasons without a migration). The runbook gets a line on recognising it.
+the raw status. The resolver's client-id lookup meets the same status; that outcome is recorded
+as the new incident reason **`unknown_status`** (fits `orders.incident`, `String(24)`, no
+migration), so after `order_resolution_timeout_s` the row is an incident with the existing
+reminder.
+
+**Recovering an `unknown_status` incident** (PR #41, finding 2). The existing commands could not:
+`repair link` turns any lookup exception into a refusal (`core/repair.py` `prepare_link`), and
+`repair not-submitted` refuses rows with a broker id. No new command; instead:
+
+- `unknown_status` joins `LINKABLE_INCIDENTS`.
+- For an `unknown_status` row, `repair link` additionally requires the broker order to be
+  **final** (`filled`, `canceled` or `rejected` after mapping), else it refuses ("broker order is
+  not final: <status>"). The usual checks (ownership by client id, `mismatches`, fresh lookup,
+  conditional commit) are unchanged. Requiring a final state keeps a row from being re-linked
+  while the order can still move, and from bouncing between linked and incident.
+- Runbook procedure (stop the core first, as for every repair): find the order at the broker by
+  its broker id; bring it to a final state (cancel it in the Alpaca dashboard, or wait for it to
+  finish); then `repair link <row> <same broker id>`. While Alpaca keeps the order in an unmapped
+  state (`held`, `suspended`, ...), escalate to Alpaca support; meanwhile the row stays an incident
+  and keeps its symbol blocked, the fail-closed outcome. The ledger books the row's fills from the
+  final state on the next pass after restart.
 
 `OrderAck.submitted_at` is the response's `submitted_at` (else `created_at`); `OrderStatus.reason`
 is null. `avg_fill_price` from `filled_avg_price` (null until filled). Symbols map through the
@@ -245,6 +273,7 @@ existing `_slash_symbol` (orders use `BTC/USD`, positions `BTCUSD`).
 `_make_client` and `_call` (the `to_thread` wrapper) go. Startup's broker check
 (`core/runtime.py` `_check_broker`: `connect()` then `get_account()`) gets one overall timeout of
 `io_timeout_s` **(builder call)**, so a hung connect no longer blocks startup unbounded (Fable M7).
+Both steps close the clients on failure (3.7).
 
 ### 3.6 Match check: `BrokerOrderView` and `mismatches`
 
@@ -264,6 +293,17 @@ mismatch.) `repair link` gets the same comparison through `mismatches`. SimBroke
 the Position Manager and the bus are closed; `cli_repair` calls it when done. SimBroker gets a
 no-op `aclose()` and the `Broker` protocol gains it **(builder call:** or the runtime calls it only
 when present).
+
+**Startup ownership** (PR #41, finding 3). Teardown can close only a broker it was handed, so each
+handoff before that closes what it created on any failure, cancellation included
+(`BaseException`, re-raised):
+
+- `AlpacaBroker.connect()` creates both clients, then validates the account (`crypto_status`,
+  `crypto_tier`). If validation fails or is cancelled, it closes both clients before re-raising.
+- `_check_broker` (`core/runtime.py`) receives the broker from `connect()`, then calls
+  `get_account()` under the startup timeout. If that fails, times out or is cancelled, it calls
+  `aclose()` before re-raising. Only a broker that passed both steps reaches the runtime's
+  teardown.
 
 ### 3.8 Writes stay off (defence in depth)
 
@@ -316,7 +356,8 @@ Acceptance (all against `MockTransport` unless noted):
    `alpaca.ack_mismatch` with the broker id; the recorded probe acks pass unchanged.
 5. Every status in the 3.4 table maps as listed; an unlisted status raises `UnknownOrderStatus`,
    and through `sync_orders` the row becomes a type (b) candidate and, after the resolution
-   timeout, an incident.
+   timeout, an `unknown_status` incident. `repair link` on that row refuses while the lookup still
+   raises and while the broker order is not final, and links it once the order is final.
 6. No retries: a 429, a 503 and a `ReadTimeout` each reach the mock handler exactly once.
 7. Clients carry the specified timeouts, `trust_env=False`, no redirects, no keep-alive on the
    write client; secrets appear in no log line and no exception message (captured logs and
@@ -337,7 +378,10 @@ Acceptance (all against `MockTransport` unless noted):
 13. The three removed methods are gone from the protocol; mypy proves no caller remains.
 14. SimBroker `cancel_order`: canceled returns, filled raises `BrokerError`, unknown raises
     `OrderNotFound`.
-15. Opt-in `smoke` (read-only, places no orders): account, positions and asset rules through the
+15. Startup cleanup: with a `MockTransport` handler that blocks, cancelling `connect()` during its
+    account check, and failing or cancelling `_check_broker`'s `get_account()`, each leaves both
+    clients closed (`is_closed`); a failed `crypto_status` check does too.
+16. Opt-in `smoke` (read-only, places no orders): account, positions and asset rules through the
     new transport; `get_order` of a random UUID raises `OrderNotFound`; `get_order_by_client_id` of
     an unknown id returns `None`.
 
@@ -355,8 +399,9 @@ Claims this falsifies or narrows, to correct when the code lands:
 - SPEC §4.6 interface listing and "`AlpacaBroker` is currently read-only"; SPEC §5 step 6 "fill
   stream" (fills are pulled, D17.3).
 - `docs/runbook.md`: lines saying `repair link` / client-id lookup is unavailable until 1.6 (now
-  available); "cannot place orders until WP 1.6" → 1.6d; recognising an unknown-status incident;
-  the `alpaca.http` log line and where the request id is.
+  available); "cannot place orders until WP 1.6" → 1.6d; the `unknown_status` incident and its
+  recovery procedure (3.4), `unknown_status` in the `repair link` list of linkable incidents; the
+  `alpaca.http` log line and where the request id is.
 - `docs/alpaca-notes.md`: the transport facts (alpaca-py has no timeout and retries POST; trading
   calls no longer use it), the rate limit, and "re-check on httpx/httpcore upgrade".
 - SimBroker docstrings (cancel contract, removed methods).
