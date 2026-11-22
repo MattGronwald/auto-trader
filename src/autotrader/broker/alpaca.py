@@ -11,7 +11,8 @@ API; see docs/alpaca-notes.md for sources, raw values and open questions.
   exception as `__cause__`. Messages carry only the exception type, never the SDK's
   message. Cancellation is not an `Exception` and passes through untouched.
 - Fees are volume-tiered; `fee_schedule()` follows the account's `crypto_tier`.
-- No minimum notional is published (only a $200k maximum per order).
+- None is published, but paper refuses buys worth under $10 at their limit price (probed
+  2026-11-12, docs/alpaca-notes.md); `min_notional` stays 0 until WP 1.6c. Max $200k/order.
 """
 
 import asyncio
