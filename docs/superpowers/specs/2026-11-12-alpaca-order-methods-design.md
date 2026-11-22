@@ -14,7 +14,8 @@ Owner review of PR #41 (2026-11-22, three P2 findings, decided "go"): trading DN
 default thread pool with market data (1, 3.1); a persistent unknown status had no repair path
 (3.4); clients leaked on a failed or cancelled startup (3.5, 3.7). Marked "PR #41". A second
 owner review (2026-11-22, one P2, decided "go") found that teardown never receives the broker at
-all (3.7, "Runtime ownership").
+all (3.7, "Runtime ownership"); a third (one P2, decided "go") that teardown must read the
+holder only after its startup step (same section).
 
 ## 1. Scope and intent
 
@@ -320,6 +321,15 @@ stop request, or any later startup error. So:
 - `_teardown` takes the broker and closes it as its own bounded step `broker`, after the runner,
   the Position Manager (supervisor), the stream and the bus, so no exit or cancel still in flight
   loses its client. Like every step, a forced or failed close makes the exit unclean.
+- `_teardown` receives the **holder (or an accessor), not its value**, and reads it only in the
+  `broker` step (PR #41, third review). A stop can win the startup race while `_check_broker` is
+  still in `get_account()`; the value at call time is then `None`, but teardown's first step waits
+  for the unfinished startup, which can finish the check, fill the holder and return `None`
+  because a stop was requested.
+- If the `startup` step itself runs out of budget, teardown cancels it once and leaves it (forced,
+  so the exit is already unclean). The cancellation lands either before the holder is filled,
+  where `connect()` / `_check_broker` close the clients in their own cleanup (best effort, not
+  awaited by teardown), or after, where the `broker` step closes it.
 
 ### 3.8 Writes stay off (defence in depth)
 
@@ -397,8 +407,9 @@ Acceptance (all against `MockTransport` unless noted):
 15. Startup cleanup: with a `MockTransport` handler that blocks, cancelling `connect()` during its
     account check, and failing or cancelling `_check_broker`'s `get_account()`, each leaves both
     clients closed (`is_closed`); a failed `crypto_status` check does too. Through `run_core`:
-    a shutdown requested while the backfill blocks, a broker/config mode mismatch, and a clean
-    shutdown each leave both clients closed; a refused `repair link` closes them in `cli_repair`.
+    a shutdown requested while the backfill blocks, a shutdown requested while `get_account()`
+    blocks and the check then succeeds within the shutdown budget, a broker/config mode mismatch,
+    and a clean shutdown each leave both clients closed; a refused `repair link` closes them in `cli_repair`.
 16. Opt-in `smoke` (read-only, places no orders): account, positions and asset rules through the
     new transport; `get_order` of a random UUID raises `OrderNotFound`; `get_order_by_client_id` of
     an unknown id returns `None`.
