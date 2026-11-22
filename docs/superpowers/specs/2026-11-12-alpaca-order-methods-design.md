@@ -279,7 +279,9 @@ existing `_slash_symbol` (orders use `BTC/USD`, positions `BTCUSD`).
 
 `get_account`, `get_positions`, `asset_rules` and the `connect` checks (`crypto_status`,
 `crypto_tier`) move to the read client with their current parsing unchanged; `RawTradingClient`,
-`_make_client` and `_call` (the `to_thread` wrapper) go. Startup's broker check
+`_make_client` and `_call` (the `to_thread` wrapper) go. **2026-11-22 correction (plan dry
+run):** `_call` does not go: the market-data client (`broker/alpaca_data.py`) still uses it, so
+it moves there unchanged until 1.6c. Startup's broker check
 (`core/runtime.py` `_check_broker`: `connect()` then `get_account()`) gets one overall timeout of
 `io_timeout_s` **(builder call)**, so a hung connect no longer blocks startup unbounded (Fable M7).
 Both steps close the clients on failure (3.7).

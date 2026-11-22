@@ -40,6 +40,27 @@ an isolated worktree, every task verbatim) comes after that review, then the pla
 - Every other finding (I1-I8, M1-M12) is folded in and marked "review" where it changed a
   task.
 
+**Dry run 2026-11-22** (agent in an isolated worktree, branch `dryrun-1.6a`, every task as
+written). Result:
+- All 8 tasks green: 1409 passed, `risk/` 100 % branch coverage after every task that touched
+  it.
+- The loopback file passed 5/5 twice and the full suite 2/2.
+- Facts 1-5 and every condition held for httpx 0.28.1, httpcore 1.0.9, anyio 4.16.0 and
+  h11 0.16.0.
+- A mutation check confirmed the TLS-cancel test: removing the closing backend makes both of
+  its cases fail.
+
+Its findings are folded in and marked "dry run":
+- **One hard defect.** `_call` is still imported by `alpaca_data.py` (Task 5).
+- **One contradiction**, resolved by the owner: `OrderNotFound` now carries the request id.
+- **About 25 sketch details** (helpers, fixtures, wrong "Expected" lines, Task 8 doc lines).
+
+Owner decisions on the result:
+- `OrderNotFound` from a response carries the request id.
+- `anyio>=4.16,<5` becomes a direct dependency.
+- A docstring warns that a test transport serves both clients.
+- PLAN gets a 1.6d note on client-id echoing mocks.
+
 **Which code blocks are binding.** Complete test functions (Tasks 1, 2, 4, 5) are normative:
 the dry run writes them as they stand. Blocks with `...` or comment bodies (Tasks 3, 6, 7) are
 sketches. Their test names and assertions are binding; their setup uses the helpers the target
@@ -106,8 +127,9 @@ file already has, which each task names.
 - Order ids are checked against `[A-Za-z0-9-]+` before they go into a path (in `get_order`,
   `cancel_order` and the ack check). Anything else raises `BrokerError` before any I/O: httpx
   normalises `/orders/../account`, and `DELETE /v2/orders` is Alpaca's cancel-all (review M6).
-- Every `BrokerError` raised from a response carries the request id, `UnknownOrderStatus` and
-  parse errors included (spec 3.1, review M4).
+- Every `BrokerError` raised from a response carries the request id: `UnknownOrderStatus`,
+  parse errors and `OrderNotFound` included (spec 3.1, review M4; `OrderNotFound` owner
+  decision after the dry run).
 - `cancel_order`: any 2xx returns (the probes saw 204). Spec 3.3 lists only 204 and "other
   non-2xx".
 - `get_order` also checks that the response's `id` equals the requested id; a different id is
@@ -260,7 +282,8 @@ Expected: 3 failed.
   - `base.py`: remove the three protocol methods and the now-unused `AsyncIterator` import;
     add `aclose`.
   - `sim.py`: remove `close_position`, `close_all`, `stream_fills`, `redeliver`, the `_fills`
-    queue and its `put_nowait`. Keep `_fill_log`; `fills()` returns its values.
+    queue and its `put_nowait`. Also drop the `structlog` import and `log`: their only user
+    was `close_all` (dry run). Keep `_fill_log`; `fills()` returns its values.
     `cancel_order` follows the new contract. Add `async def aclose(self) -> None` (no-op).
     Update the module docstring: the `redeliver` sentence goes; the `close_position` bullet
     becomes "a `submit_order` sell of the full free qty"; one line on the cancel contract.
@@ -280,7 +303,8 @@ Expected: 3 failed.
     `return sim.take_fills()`, a second test hook that returns the fills emitted since its last
     call (a cursor index into `_fill_log` kept by the sim) (review M1). Tests that expect `OrderRejected` from cancelling a
     final order expect `BrokerError`. In `test_alpaca.py`, drop the removed names from the two
-    "not implemented" tests. Add `async def aclose(self) -> None` to `test_runtime.FakeBroker`.
+    "not implemented" tests; the second one used `close_position` as its write call, so it now
+    uses a lazy `submit_order` call (dry run). Add `async def aclose(self) -> None` to `test_runtime.FakeBroker`.
 - [ ] **Step 4: Full check** (Global Constraints order). Expected: all green, `risk/` 100 %.
 - [ ] **Step 5: Commit**
 
@@ -339,19 +363,26 @@ def test_unknown_row_type_is_a_mismatch() -> None:
     assert "time_in_force ioc != none for type stop" in check(view(), order_type="stop")
 ```
 
-Plus one engine resolver test in `test_resolver.py`: a type (a) row whose broker view differs
-only in `limit_price` becomes a `client_id_mismatch` incident. Plus one repair test in
-`test_repair.py`: `prepare_link` refuses with "limit_price" in the reason.
+Plus one engine resolver test in `test_resolver.py`,
+`test_client_id_hit_differing_only_in_limit_price_is_a_mismatch`: a type (a) row whose broker
+view differs only in `limit_price` becomes a `client_id_mismatch` incident. Plus one repair test
+in `test_repair.py`, `test_link_refuses_a_limit_price_mismatch`: `prepare_link` refuses with
+"limit_price" in the reason. Setup for both (dry run):
+- `tr.insert_row` gains `type_` and `limit_price` keyword arguments (today it hard-codes a
+  market row).
+- The sim order is an IOC limit buy, qty 0.01 at 100; the row says 101. Prices of 10/11 fail
+  the sim's `min_notional` of 1.
 
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `uv run pytest tests/unit/risk/test_resolve.py -q`
-Expected: FAIL (`BrokerOrderView` rejects the new fields: `extra="forbid"`).
+Expected: FAIL (collection ImportError on `expected_tif`) (dry run).
 
 - [ ] **Step 3: Implement** the fields, `expected_tif`, the `mismatches` lines (after `qty`,
   before `created_at`), both callers, and SimBroker's view (`type`, `limit_price`,
   `time_in_force` from the stored `BrokerOrder`). Fix every test that builds a
-  `BrokerOrderView` (mypy lists them). Update the `mismatches` docstring and the
+  `BrokerOrderView`. pytest finds them, mypy does not:
+  `test_sim.py::test_get_order_by_client_id_returns_view_or_none` fails only at runtime (dry run). Update the `mismatches` docstring and the
   `core/repair.py` module docstring ("matched symbol, side, qty, type, limit price, time in
   force and the `created_at` bound").
 - [ ] **Step 4: Full check.** Expected: green, `risk/` 100 %.
@@ -420,9 +451,14 @@ async def test_an_unsent_entry_is_not_submitted(...) -> None:
     assert (row.status, row.broker_order_id) == ("not_submitted", None)
 
 async def test_an_unsent_exit_is_not_submitted(...) -> None: ...  # same through exit()
+    # Seed the BTC holding with SimBroker.submit_order(broker, <market buy>), which bypasses
+    # the raising override (dry run).
 
-async def test_a_failure_after_the_write_stays_unknown(...) -> None:
-    # submit raises BrokerError("... WriteError"): row "unknown"; a TimeoutError from _within too
+@pytest.mark.parametrize("cls", [WrittenThenFailed, HangingSubmit])
+async def test_a_failure_after_the_write_stays_unknown(cls: type[SimBroker], ...) -> None:
+    # WrittenThenFailed: submit raises BrokerError("... WriteError"); HangingSubmit (existing):
+    # submit outlives io_timeout_s=0.1 on a Mono() clock. One fresh journal per case. Each row
+    # ends "unknown" (dry run: a second check() on the same journal sees the first unknown row)
 ```
 
 `test_resolver.py` (sketch; use the file's `Rig` and its `sync_at`, which applies each result
@@ -472,9 +508,14 @@ async def test_an_unsent_exit_is_retried_after_its_backoff(sessions, bus) -> Non
     assert [s.status for s in await h.sells()] == ["not_submitted", "new"]
 ```
 
-`test_repair.py` (sketch; the row comes from the file's `own_cid` + `submit` helpers, then is set
-to incident `unknown_status` the way `test_type_b_lookup_failed_incident_is_repairable` sets
-its incident; the lookups are inline async functions):
+`test_repair.py` sketch:
+- The row is inserted with
+  `tr.insert_row(r.sessions, cid=cid, status="new", broker_order_id=oid)` for an order
+  submitted on `r.sim`.
+- It is then set to the incident directly:
+  `update(m.Order).values(incident="unknown_status", incident_at=NOW)`. Driving 80 s of sync
+  passes is unnecessary here (dry run).
+- The lookups are inline async functions. `sim` below is `r.sim`.
 
 ```python
 async def test_link_of_an_unknown_status_incident_needs_a_final_broker_order(r: Rig) -> None:
@@ -518,8 +559,10 @@ Spec 3.1, 3.2 (invariants, mapping table), acceptance 6, 7, 8, 9 (transport part
 Pre-implementation verification first.
 
 **Files:**
-- Modify: `pyproject.toml`, `uv.lock` (`uv add "httpx>=0.28.1,<0.29" "httpcore>=1.0.9,<1.1"`;
-  httpcore is listed directly only to pin the verified minor)
+- Modify: `pyproject.toml`, `uv.lock`
+  (`uv add "httpx>=0.28.1,<0.29" "httpcore>=1.0.9,<1.1" "anyio>=4.16,<5"`). httpcore and anyio
+  are listed directly only to pin what the safety facts were verified against (owner, after
+  the dry run).
 - Create: `src/autotrader/broker/alpaca_http.py`
 - Test: `tests/unit/broker/test_alpaca_http.py`, `tests/unit/broker/loopback.py` (test servers)
 
@@ -578,7 +621,9 @@ async def start_tls(self, ssl_context, server_hostname=None, timeout=None):  # _
   Fully typed in the real file. The review validated this in a scratch venv: 3 runs green under
   `filterwarnings=error`, for both the `task.cancel()` and the `wait_for` case.
 - `transport=None` builds both clients' transports with `make_transport` (`READ_LIMITS` /
-  `WRITE_LIMITS`). A given `transport` (tests) serves both clients. Both clients:
+  `WRITE_LIMITS`). A given `transport` (tests) serves both clients, so the write client then
+  keeps alive whatever that transport keeps alive. The `AlpacaHttp` and `connect()` docstrings
+  say: "tests only; one transport serves both clients" (dry run design point 4). Both clients:
   `trust_env=False`, `follow_redirects=False`, `timeout=timeout`, the raw cookie jar.
 - `get` uses the read client; `post` and `delete` use the write client.
 - Exception mapping (spec 3.2 table, widened by review I7). The message never includes
@@ -599,9 +644,9 @@ async def start_tls(self, ssl_context, server_hostname=None, timeout=None):  # _
 - HTTP status codes are returned, never raised: the status contract lives in `alpaca.py`.
 
 - [ ] **Step 1: Pre-implementation verification** (section above). Run
-  `uv add "httpx>=0.28.1,<0.29" "httpcore>=1.0.9,<1.1"`, then confirm facts 1-5 and the
-  conditions in `.venv/lib/python3.12/site-packages/{httpcore,httpx}` for the resolved
-  versions. Record the anyio version from `uv.lock`. Keep the findings (file, function,
+  `uv add "httpx>=0.28.1,<0.29" "httpcore>=1.0.9,<1.1" "anyio>=4.16,<5"`, then confirm facts
+  1-5 and the conditions in `.venv/lib/python3.12/site-packages/{httpcore,httpx}` for the
+  resolved versions. Record the anyio and h11 versions. Keep the findings (file, function,
   versions) for Task 8. Stop if facts 1-4 or a condition fail.
 
 - [ ] **Step 2: Write the failing tests** in `tests/unit/broker/test_alpaca_http.py`
@@ -772,6 +817,8 @@ Loopback tests. `tests/unit/broker/loopback.py` provides two servers:
   on EOF. It also has `record_types() -> set[int]`, which walks the TLS records.
 - `KeepAliveHttp` is a minimal HTTP/1.1 responder. It counts accepted connections and answers
   each request with `200 {}`.
+- Both servers close their accepted writers before `Server.wait_closed()`, which waits for open
+  connections on Python 3.12. Use `contextlib.suppress` there (ruff SIM105) (dry run).
 
 `free_port()` binds port 0 and closes the socket again. Each server closes its client
 transports on `__aexit__`. Every `await` on a server event sits inside `asyncio.timeout(10)`.
@@ -871,6 +918,9 @@ Spec 3.3, 3.4, 3.5 (adapter part), 3.7 (`connect` and `aclose`), 3.8, acceptance
 **Files:**
 - Modify: `src/autotrader/broker/alpaca.py` (rewrite the transport part; keep `FEE_TIERS`,
   `_slash_symbol`, `_parsing`)
+- Modify: `src/autotrader/broker/alpaca_data.py`. It imports `_call` from `alpaca.py`, so
+  `_call` moves here unchanged with its `asyncio` and `BrokerError` imports. Market data stays
+  on alpaca-py and `to_thread` until 1.6c (dry run defect; spec 3.5 gets a dated correction)
 - Rewrite: `tests/unit/broker/test_alpaca.py`
 - Create: `tests/unit/broker/alpaca_mock.py` (fixture loader + routing `MockTransport`)
 - Modify: `tests/smoke/test_alpaca_paper.py` (fixture closes the broker; read-only order
@@ -899,8 +949,12 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
     # 3.4 table; raises UnknownOrderStatus(raw, request_id)
 ```
 
-- `_parsing(what: str, request_id: str | None)` puts `(request {request_id})` into its
-  `BrokerError` message (review M4).
+- `_parsing(what: str, request_id: str | None)` turns the `TypeError` / `ValueError` /
+  `KeyError` / `ArithmeticError` from parsing into `BrokerError` with ` (request <id>)`, and
+  appends the id to a nested `BrokerError` (`_slash_symbol`, ack mismatch) whose message lacks
+  one (review M4, dry run). `_decimal(raw: object) -> Decimal` and
+  `_aware(raw: object) -> datetime` raise `TypeError` / `ValueError`, so they take no `what`
+  argument.
 - `aclose()` delegates to `AlpacaHttp.aclose()`. A test asserts that both clients are closed
   afterwards (review M11).
 
@@ -922,8 +976,9 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
     - 403 with a parsed body raises `OrderRejected(f"alpaca rejected the order: {message}
       (request {rid})")`, with message `"<no message>"` when absent.
     - Anything else raises `BrokerError`.
-  - `get_order`: 2xx is parsed; 404 raises `OrderNotFound(order_id)`; anything else raises
-    `BrokerError`.
+  - `get_order`: 2xx is parsed; 404 raises `OrderNotFound(f"{order_id} (request {rid})")`;
+    anything else raises `BrokerError`. `cancel_order`'s 404 raises the same. Callers branch
+    only on the type (owner, after the dry run).
   - `get_order_by_client_id`: 2xx is parsed into a `BrokerOrderView`; 404 returns `None`;
     anything else raises `BrokerError`.
   - `cancel_order`: any 2xx returns; 404 raises `OrderNotFound`; anything else (422 included)
@@ -945,10 +1000,10 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
     `BrokerError(f"alpaca ack does not match the order (request {rid})")`.
   - `OrderAck.status = order_state(status, filled_qty)`; `submitted_at` is `submitted_at`, or
     `created_at` if absent.
-- Decimal parsing: one helper `_decimal(raw: object, what: str) -> Decimal` accepts only `str`
-  (Review Focus 1) and is used for every money/qty field, reads included. Timestamps:
-  `_aware(raw: object, what: str) -> datetime` uses `datetime.fromisoformat` and refuses naive
-  values (Review Focus 3).
+- Decimal parsing: one helper `_decimal(raw: object) -> Decimal` accepts only `str` (Review
+  Focus 1) and is used for every money/qty field, reads included. Timestamps:
+  `_aware(raw: object) -> datetime` uses `datetime.fromisoformat` and refuses naive values
+  (Review Focus 3). Both run inside `_parsing`.
 - `orders_enabled=False`: `submit_order` and `cancel_order` raise
   `OrderMethodsUnavailable("AlpacaBroker order writes are disabled until WP 1.6d")` before any
   I/O. `can_place_orders()` returns `self._orders_enabled`. `order_fills` keeps raising
@@ -973,6 +1028,15 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
       ends with `assert router.unrouted == []`, so a mis-keyed route cannot pass as an
       `unknown` (review I6).
     - `.transport` is the `httpx.MockTransport` over it.
+    - Every response carries `X-Request-ID: rid-<n>`, where n is the 1-based request count
+      (dry run).
+    - `add(..., raises: type[httpx.TransportError] | None = None)`: the route records the
+      request, then raises that error (Task 6 and the ported transport-error tests). Tests
+      that block use a plain `httpx.MockTransport(handler)` through
+      `AlpacaBroker.connect(settings, transport=...)` or an `AlpacaHttp` built on it:
+      cancellation and the connect-cleanup case (b) (dry run).
+  - Connect tests build `Settings(_env_file=None, alpaca_api_key_id=KEY,
+    alpaca_api_secret_key=SECRET)` (dry run).
 
   In `test_alpaca.py`, three module constants: `CHANGED: dict[str, str]` holds one wrong value
   per ack field (another client id, `"ETH/USD"`, `"sell"`, `"market"`, `"gtc"`, qty plus one
@@ -1142,8 +1206,9 @@ dropped with its reason:
 Run: `uv run pytest tests/unit/broker/test_alpaca.py -q`
 Expected: FAIL (`AlpacaBroker` has no `http` constructor).
 
-- [ ] **Step 4: Implement** per Interfaces. Delete `RawTradingClient`, `_make_client`, `_call`
-  and the `asyncio` import. Module docstring: the transport (`alpaca_http`, no SDK, no
+- [ ] **Step 4: Implement** per Interfaces. Delete `RawTradingClient`, `_make_client` and the
+  `asyncio` import. Move `_call` into `broker/alpaca_data.py`, its only remaining user (dry
+  run). Module docstring: the transport (`alpaca_http`, no SDK, no
   threads), the error contract by reference to the spec 3.3 table, writes refused until 1.6d,
   `order_fills` until 1.6b, and the `asset_rules` cache. `cli.py` still passes
   `AlpacaBroker.connect` (signature-compatible).
@@ -1159,7 +1224,7 @@ Expected: FAIL (`AlpacaBroker` has no `http` constructor).
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/autotrader/broker/alpaca.py tests/unit/broker/ tests/smoke/test_alpaca_paper.py
+git add src/autotrader/broker/alpaca.py src/autotrader/broker/alpaca_data.py tests/unit/broker/ tests/smoke/test_alpaca_paper.py
 git commit -m "feat: implement Alpaca order methods on the owned transport, writes switched off (WP 1.6a)"
 ```
 
@@ -1174,9 +1239,11 @@ contract gaps between Tasks 3 and 5 that each task's own stubs cannot.
 - Create: `tests/integration/test_alpaca_engine.py`
 
 **Interfaces:**
-- Consumes: `make_engine_`-style construction (copy the minimal parts from
-  `tests/unit/risk/test_engine.py`: sessions fixture, gate, baseline, `FakeView`), `Router`
-  (Task 5), `AlpacaBroker(..., orders_enabled=True)`.
+- Consumes: `make_engine_`-style construction. Copy `db_url` (a **sync** fixture: `upgrade()`
+  calls `asyncio.run`), `sessions` and `gate` from `tests/unit/risk/test_engine.py`; `exit()`
+  and `sync_orders()` need no `FakeView` or baseline. Also `Router` with `raises=` (Task 5) and
+  `AlpacaBroker(..., orders_enabled=True)`. Type the mixed `outcome` tuple as
+  `tuple[Any, ...]` (dry run).
 
 - [ ] **Step 1: Write the tests** (sketch: names and assertions binding). Setup reuses the
   construction from `test_exit_submits_a_namespaced_market_sell_of_the_free_qty`: its
@@ -1215,7 +1282,10 @@ async def test_submit_outcomes_through_the_engine(outcome, row_status, cause, ..
     assert router.unrouted == []
 
 async def test_an_unknown_status_row_becomes_an_unknown_status_incident(...) -> None:
-    # row with broker id; GET /v2/orders/{id} and the client-id lookup answer status "held"
+    # Insert the row directly: tr.insert_row(..., status="new", broker_order_id=oid,
+    # type_="limit", limit_price=...). A recorded ack carries the probe's client id, not
+    # at-{jid}-o{row}, so engine.exit cannot produce it (dry run).
+    # GET /v2/orders/{id} and the client-id lookup answer status "held"
     # (repeat=True). Pass 1 and a pass after order_resolution_timeout_s, each followed by
     # `ledger.apply_all(result)` so start_clock is persisted (review M9): the row's incident
     # is "unknown_status"; router.unrouted == [].
@@ -1261,9 +1331,10 @@ part).
 
 - [ ] **Step 1: Write the failing tests** (sketch: names and assertions binding).
   `test_runtime.py` helpers:
-  - `FakeBroker` gets `closed: bool`, set by `aclose`.
+  - `FakeBroker` gets a class attribute `closed = False`, which `aclose` sets on the instance.
+    Its subclasses define their own `__init__` without calling `super()` (dry run).
   - Existing: `sim_connect(broker)` (the connect callable), `LiveBroker` (mode `"live"`),
-    `make_control(timeout_s=...)`, `start_core`, `StopRaceSource`.
+    `make_control(timeout_s=...)`, `start_core`.
   - New: `GatedAccount(FakeBroker)`. Its first `get_account` call (the startup check) waits on
     an event; later calls answer at once.
 
@@ -1279,7 +1350,10 @@ async def test_a_mode_mismatch_closes_the_broker(...) -> None:
         await start_core(cfg, lock, control, connect_broker=sim_connect(broker))
     assert broker.closed
 
-async def test_a_stop_during_the_backfill_closes_the_broker(...) -> None:  # StopRaceSource-style
+async def test_a_stop_during_the_backfill_closes_the_broker(...) -> None:
+    # the MarketFeed.backfill monkeypatch of
+    # test_startup_finishing_after_the_stop_request_starts_nothing (StopRaceSource fails the
+    # stream instead) (dry run)
 async def test_a_stop_while_the_check_blocks_then_succeeds_closes_the_broker(...) -> None:
     # GatedAccount: request stop while get_account waits; release it inside the shutdown
     # budget; startup returns None (stop requested); teardown's broker step closes it
@@ -1298,8 +1372,9 @@ async def test_a_forced_broker_close_makes_the_exit_unclean(...) -> None:
 
 ```python
 def test_link_closes_the_broker_on_refusal_and_success(rig: Rig) -> None:
-    # a SimBroker subclass whose aclose sets `closed`; a refused link (qty mismatch) and an
-    # applied link each leave it closed. A failing connect has nothing to close (unchanged).
+    # a SimBroker subclass whose aclose sets `closed` (`sim_with` gains a `cls` parameter);
+    # a refused link (qty mismatch) and an applied link, on two client ids (rig.cid(1),
+    # rig.cid(2)), each leave it closed. A failing connect has nothing to close (unchanged).
 ```
 
 - [ ] **Step 2: Run them to see them fail**
@@ -1328,10 +1403,15 @@ git commit -m "feat: bound the startup broker check and close the broker's clien
 Spec section 4, plus the user rule: correct every claim the change falsified, first.
 
 **Files:**
-- Modify: `SPEC.md` (§4.6 interface listing and "`AlpacaBroker` is currently read-only"; §5
-  step 6 "fill stream" becomes "fills are pulled per order (D17.3)")
-- Modify: `docs/runbook.md` (lines 12, 18, 26, 70, 125, 145, 271, 392, 433 as found today: "until
-  WP 1.6" becomes 1.6d for orders and admission. `repair link` and the client-id lookup work
+- Modify: `SPEC.md`:
+  - the §4.6 interface listing and "`AlpacaBroker` is currently read-only";
+  - §5 step 6: "fill stream" becomes "fills are pulled per order (D17.3)";
+  - line 7, "Implementation boundary": add a new dated "Update 2026-11-22 (WP 1.6a)" sentence
+    and leave the old dated text untouched (dry run).
+- Modify: `docs/runbook.md`, lines 12, 18, 26, 70, 145, 271, ~295 (`close_position`), 392 and
+  433 as found today, plus the "Current limits (WP 1.5d-3)" header, which becomes 1.6a. Line 125
+  ("Known costs (revisited in WP 1.6)") is still true and stays (dry run). Changes: "until WP 1.6"
+  becomes 1.6d for orders and admission. `repair link` and the client-id lookup work
   from 1.6a. New `unknown_status` row in the incident table, with the spec 3.4 recovery
   procedure. `unknown_status` joins the list of linkable incidents. The `alpaca.http` line and
   where the request id appears.)
@@ -1345,7 +1425,13 @@ Spec section 4, plus the user rule: correct every claim the change falsified, fi
 - Modify: `CLAUDE.md` (`run core` line: "no orders until WP 1.6" becomes 1.6d; "disabled with
   Alpaca until 1.6" becomes 1.6d)
 - Modify: `PLAN.md` (dated 2026-11-22 note on the 1.6 row: 1.6a implemented, plan path; the
-  "Current repo state" sentence on `AlpacaBroker`)
+  two stale "Current repo state" sentences, "read-only `AlpacaBroker`" and "cannot place
+  orders until 1.6" (dry run))
+- Leave unchanged (checked in the dry run, still accurate or requirement text):
+  - PLAN §3.2 items 3 and 5;
+  - the WP 0.7 source list in alpaca-notes (`raw_data=True`);
+  - the `core/ledger.py:555` comment;
+  - the fake exception strings "until 1.6" in `test_engine.py` and `test_cli_repair.py`.
 
 - [ ] **Step 1: Find falsified claims.** Run each and fix **every** hit that the change
   falsified (code comments included):
