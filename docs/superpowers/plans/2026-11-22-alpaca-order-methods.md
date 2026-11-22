@@ -40,6 +40,14 @@ an isolated worktree, every task verbatim) comes after that review, then the pla
 - Every other finding (I1-I8, M1-M12) is folded in and marked "review" where it changed a
   task.
 
+**Revised 2026-11-23 after the owner's Codex review of PR #42** (three P2s, owner "go"; marked
+"Codex"):
+1. No `BrokerError` raised by the adapter chains its cause (`from None`), and Alpaca's response
+   text is sanitised.
+2. The request budget is corrected, with a measured-headroom precondition for 1.6d at 80 % of
+   the limit.
+3. An unmapped status from the direct read is no longer downgraded by an inconclusive lookup.
+
 **Dry run 2026-11-22** (agent in an isolated worktree, branch `dryrun-1.6a`, every task as
 written). Result:
 - All 8 tasks green: 1409 passed, `risk/` 100 % branch coverage after every task that touched
@@ -92,7 +100,18 @@ file already has, which each task names.
 - Base URLs: paper `https://paper-api.alpaca.markets/v2`, live `https://api.alpaca.markets/v2`
   (live only through the existing `ALLOW_LIVE` gate in `connect`, unchanged).
 - Headers `APCA-API-KEY-ID` and `APCA-API-SECRET-KEY` are set once per client. Headers or keys
-  never appear in a log line or an exception message.
+  never appear in a log line or an exception message. **Rendered** log lines count too
+  (Codex P2-1):
+  - `format_exc_info` renders the whole `__cause__` chain, so every `BrokerError` /
+    `RequestNotSent` / `OrderRejected` / `OrderNotFound` / `UnknownOrderStatus` that
+    `alpaca_http.py` or `alpaca.py` raises uses `from None`.
+  - The safe metadata is carried explicitly instead: the cause's type name in the message and
+    as the `alpaca.http` `error` field, plus the request id.
+  - Text that came from Alpaca (`message`) passes through
+    `sanitize(text: object, secrets: Sequence[str]) -> str` in `alpaca_http.py` before it goes
+    into a log field or an exception message. It is `str(text)` with every occurrence of the
+    key id and the secret replaced by `[redacted]`, control characters removed, and the result
+    capped at 200 characters plus `...`. A non-str `message` is converted with `str()` first.
 - Decimals go out as `format(d, "f")`. Numbers in responses must be JSON strings; a JSON number
   where a decimal is expected raises `BrokerError` (Review Focus 1).
 - Never branch on Alpaca's body `code` (spec 3.3).
@@ -151,11 +170,29 @@ Alpaca allows 200 trading-API requests per minute per account. With the `asset_r
   `get_positions`, and asset rules about once per symbol every 5 min. About **2-4 per minute**.
 - **Startup until admission opens:** `admission.ready` reads `get_positions` once per 1 s tick
   (`broker_holdings`). At most **60 per minute**, only until it opens.
-- **Peak:** 3 unsettled orders read every 2 s (`get_order`, 90/min), a flatten in progress
-  (`sellable_positions` per 1 s Position Manager step, 60/min), plus submits and cancels. About
-  **155-165 per minute**. Without the cache, every sync read and position read also fetches
-  asset rules, which exceeds 200. `order_fills` (1.6b) adds a read only when `filled_qty`
-  grew.
+- **Peak (corrected 2026-11-23, Codex P2-2):** a pending flatten makes every 1 s Position
+  Manager step read `get_positions` **twice**: `_control_phase` → `_sell_external` and
+  `_flat_check`, each through `sellable_positions()`; the cache removes neither. Counted:
+  - flatten position reads: **120/min**;
+  - 3 unsettled orders read every 2 s (`get_order`): **90/min**;
+  - **210/min** together, over the 200 limit before anything else;
+  - on top: each exit attempt's own `get_positions` and its submit, entry cancels
+    (`cancel_open_entries`, once per step while a cancel is due), and resolver lookups.
+
+  Without the cache every sync read and position read would also fetch asset rules.
+  `order_fills` (1.6b) adds a read only when `filled_qty` grew.
+- **Consequence.** 1.6a sends no writes, so nothing reaches this peak yet. 1.6d may enable
+  writes only after a measured run shows headroom. This is recorded as a 1.6d precondition on
+  the PLAN 1.6 row:
+  - the scenario: a pending flatten, three unsettled orders and a failing exit;
+  - the measurement: the request rate over a full minute;
+  - the threshold: at most **80 % of the limit (160/min)**;
+  - if it is higher: reduce the reads first, for example one `get_positions` per Position
+    Manager step shared by `_sell_external` and `_flat_check`, or slower status polls while a
+    flatten is pending.
+
+  A 429 is `unknown` for a submit and a failed read for everything else. Running into the limit
+  would crowd out reconciliation and protective exits.
 
 ### Pre-implementation verification (spec 3.2, owner condition; done in the dry run)
 
@@ -433,6 +470,16 @@ here so the engine is complete before the adapter raises them.
     and to `candidates` as type `"b"`.
   - `_decide`: `except UnknownOrderStatus` before the generic `except Exception`: log
     `risk.order_status_unknown` and set `outcome = "unknown_status"`.
+  - **The direct read's evidence is kept (Codex P2-3).**
+    - `_Read` gains `unknown_status: set[int]`, the rows whose `get_order` raised
+      `UnknownOrderStatus` in this pass. `_resolve` hands `status_unknown=row.id in
+      read.unknown_status` to `_decide`.
+    - In `_decide`, for such a row every inconclusive outcome becomes `"unknown_status"`, both
+      this pass's and the remembered one: `lookup_failed`, `not_found`,
+      `lookup_inconsistent`, or not looked up because the budget was spent.
+    - Only `client_id_mismatch`, which is returned at once, still wins.
+    - So a 429 or timeout on the client-id lookup at the bound cannot turn the incident into
+      `lookup_failed`. That reason is linkable without the finality check.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -481,8 +528,21 @@ async def test_an_unknown_status_read_makes_a_type_b_candidate_then_an_incident(
     assert (await order(r.sessions, row_id)).incident == "unknown_status"
 ```
 
+```python
+class HeldButLookupFails(HeldStatus):  # Codex P2-3: the lookup is inconclusive at the bound
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        raise BrokerError("alpaca GET /orders:by_client_order_id returned 429 (request rid-3)")
+
+async def test_a_failed_lookup_cannot_downgrade_an_unknown_status(...) -> None:
+    # same flow as above on HeldButLookupFails
+    await r.sync_at(0)
+    later = await r.sync_at(80)
+    assert (row_id, "incident", "unknown_status") in actions(later)  # not "lookup_failed"
+```
+
 `actions()` returns `(row, action, reason)` triples. Check its exact tuple shape in the file and
-adapt only that.
+adapt only that. The new `status_unknown` branch in `_decide` is covered by this test (`risk/`
+100 %).
 
 `test_position_manager.py` (Harness, as in `test_failed_exits_back_off_and_alert_after_three`):
 
@@ -627,19 +687,22 @@ async def start_tls(self, ssl_context, server_hostname=None, timeout=None):  # _
   `trust_env=False`, `follow_redirects=False`, `timeout=timeout`, the raw cookie jar.
 - `get` uses the read client; `post` and `delete` use the write client.
 - Exception mapping (spec 3.2 table, widened by review I7). The message never includes
-  `str(e)`. `CancelledError` (a `BaseException`) passes through.
+  `str(e)`, and every raise uses `from None`, so the rendered log has no cause chain (Codex
+  P2-1). `CancelledError` (a `BaseException`) passes through.
   - A call on a closed client (`client.is_closed`, checked first, before any I/O) raises
     `RequestNotSent(f"alpaca {method} {template} not sent: client closed")`. A task that
     teardown left behind and that submits after the broker step is provably unsent, not
     `unknown`.
   - `httpx.ConnectError`, `httpx.ConnectTimeout` and `httpx.PoolTimeout` raise
-    `RequestNotSent(f"alpaca {method} {template} not sent: {type(e).__name__}")` from `e`.
+    `RequestNotSent(f"alpaca {method} {template} not sent: {type(e).__name__}")` from None.
   - **Any other `Exception`** raises
-    `BrokerError(f"alpaca {method} {template} failed: {type(e).__name__}")` from `e`. That
+    `BrokerError(f"alpaca {method} {template} failed: {type(e).__name__}")` from None. That
     includes other httpx errors, a bare `OSError` (anyio maps only some), and a `RuntimeError`.
 - `alpaca.http` log line per call: `method`, `path` (the template), `order_id` (when given),
   `status` or `error` (exception type name), `elapsed_ms` (int, monotonic), `request_id`, and
-  for non-2xx `message` (`body.get("message")` when the body is a dict). Levels: `info` for
+  for non-2xx `message` (`sanitize(body.get("message"), (key_id, secret_key))` when the body is
+  a dict; `AlpacaHttp` exposes `sanitize_message(text) -> str` bound to its own keys for
+  `alpaca.py`). Levels: `info` for
   every 2xx, `warning` otherwise.
 - HTTP status codes are returned, never raised: the status contract lives in `alpaca.py`.
 
@@ -736,6 +799,32 @@ async def test_transport_errors_map_by_whether_bytes_may_have_left(
         await http(handler).post("/orders", "/orders", {})
     assert type(e.value) is raised and len(seen) == 1  # exact class, no retry
     assert KEY not in str(e.value) and SECRET not in str(e.value)
+
+
+async def test_a_rendered_exception_log_carries_no_cause_text_or_secret() -> None:  # Codex P2-1
+    def handler(r: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError(f"MARKER-cause {SECRET}", request=r)
+
+    buf = io.StringIO()
+    configure_logging(stream=buf)  # production chain; tests/conftest.py restores the config
+    try:
+        await http(handler).post("/orders", "/orders", {})
+    except BrokerError:
+        structlog.get_logger("t").exception("risk.order_unknown")
+    rendered = buf.getvalue()
+    assert "ReadError" in rendered and "risk.order_unknown" in rendered
+    assert "MARKER-cause" not in rendered and SECRET not in rendered and KEY not in rendered
+
+
+async def test_alpaca_message_text_is_sanitised() -> None:  # Codex P2-1
+    echoed = f"bad key {KEY} / {SECRET}\n" + "x" * 500
+    h = http(lambda r: httpx.Response(403, json={"message": echoed}))
+    with capture_logs() as logs:
+        await h.post("/orders", "/orders", {})
+    (line,) = [x for x in logs if x["event"] == "alpaca.http"]
+    assert KEY not in line["message"] and SECRET not in line["message"]
+    assert "[redacted]" in line["message"] and "\n" not in line["message"]
+    assert len(line["message"]) <= 203
 
 
 @pytest.mark.parametrize("error", [OSError("reset"), RuntimeError("odd")])
@@ -974,7 +1063,8 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
   - `submit_order`:
     - 200 with a parsed body goes through ack validation.
     - 403 with a parsed body raises `OrderRejected(f"alpaca rejected the order: {message}
-      (request {rid})")`, with message `"<no message>"` when absent.
+      (request {rid})")`, with message `"<no message>"` when absent. `message` is
+      `http.sanitize_message(...)` (Codex P2-1).
     - Anything else raises `BrokerError`.
   - `get_order`: 2xx is parsed; 404 raises `OrderNotFound(f"{order_id} (request {rid})")`;
     anything else raises `BrokerError`. `cancel_order`'s 404 raises the same. Callers branch
