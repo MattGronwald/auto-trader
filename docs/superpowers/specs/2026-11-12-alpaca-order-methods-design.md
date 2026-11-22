@@ -12,7 +12,9 @@ keep hung threads from starving exits. Owner decisions on that review: async `ht
 The review's other findings are folded in and marked "Fable".
 Owner review of PR #41 (2026-11-22, three P2 findings, decided "go"): trading DNS shares the
 default thread pool with market data (1, 3.1); a persistent unknown status had no repair path
-(3.4); clients leaked on a failed or cancelled startup (3.5, 3.7). Marked "PR #41".
+(3.4); clients leaked on a failed or cancelled startup (3.5, 3.7). Marked "PR #41". A second
+owner review (2026-11-22, one P2, decided "go") found that teardown never receives the broker at
+all (3.7, "Runtime ownership").
 
 ## 1. Scope and intent
 
@@ -289,10 +291,10 @@ mismatch.) `repair link` gets the same comparison through `mismatches`. SimBroke
 
 ### 3.7 Lifecycle
 
-`AlpacaBroker.aclose()` closes both clients. The runtime's teardown calls it after the runner,
-the Position Manager and the bus are closed; `cli_repair` calls it when done. SimBroker gets a
-no-op `aclose()` and the `Broker` protocol gains it **(builder call:** or the runtime calls it only
-when present).
+`AlpacaBroker.aclose()` closes both clients. The runtime's teardown calls it (below);
+`cli_repair` calls it in a `finally`, so a refused or failed repair closes it too. SimBroker gets
+a no-op `aclose()` and the `Broker` protocol gains it **(builder call:** or the runtime calls it
+only when present).
 
 **Startup ownership** (PR #41, finding 3). Teardown can close only a broker it was handed, so each
 handoff before that closes what it created on any failure, cancellation included
@@ -304,6 +306,20 @@ handoff before that closes what it created on any failure, cancellation included
   `get_account()` under the startup timeout. If that fails, times out or is cancelled, it calls
   `aclose()` before re-raising. Only a broker that passed both steps reaches the runtime's
   teardown.
+
+**Runtime ownership** (PR #41, second review). Today `start()` (`core/runtime.py` `run_core`)
+keeps the broker in a local and `_Started` does not carry it, so `_teardown` never sees it on any
+path. After `_check_broker` returns, `start()` can still lose it: the mode-mismatch raise, a stop
+during the backfill (teardown cancels the unfinished startup task), the `return None` after a
+stop request, or any later startup error. So:
+
+- `run_core` keeps a `broker` holder next to `supervisor` and `runner`. `start()` assigns it in
+  the statement right after `_check_broker` returns, with no `await` in between; from then on the
+  holder owns the broker. Ownership is one chain: `connect()`, then `_check_broker`, then the
+  holder.
+- `_teardown` takes the broker and closes it as its own bounded step `broker`, after the runner,
+  the Position Manager (supervisor), the stream and the bus, so no exit or cancel still in flight
+  loses its client. Like every step, a forced or failed close makes the exit unclean.
 
 ### 3.8 Writes stay off (defence in depth)
 
@@ -380,7 +396,9 @@ Acceptance (all against `MockTransport` unless noted):
     `OrderNotFound`.
 15. Startup cleanup: with a `MockTransport` handler that blocks, cancelling `connect()` during its
     account check, and failing or cancelling `_check_broker`'s `get_account()`, each leaves both
-    clients closed (`is_closed`); a failed `crypto_status` check does too.
+    clients closed (`is_closed`); a failed `crypto_status` check does too. Through `run_core`:
+    a shutdown requested while the backfill blocks, a broker/config mode mismatch, and a clean
+    shutdown each leave both clients closed; a refused `repair link` closes them in `cli_repair`.
 16. Opt-in `smoke` (read-only, places no orders): account, positions and asset rules through the
     new transport; `get_order` of a random UUID raises `OrderNotFound`; `get_order_by_client_id` of
     an unknown id returns `None`.
