@@ -48,6 +48,11 @@ an isolated worktree, every task verbatim) comes after that review, then the pla
    the limit.
 3. An unmapped status from the direct read is no longer downgraded by an inconclusive lookup.
 
+Second Codex round (2026-11-23, two P2s, owner "go"; marked "Codex r2"):
+- Every response-derived value that reaches a log or exception text goes through
+  `AlpacaHttp.diag`, not only `message`.
+- The `unknown_status` evidence lasts the whole resolution window, kept in memory (owner).
+
 **Dry run 2026-11-22** (agent in an isolated worktree, branch `dryrun-1.6a`, every task as
 written). Result:
 - All 8 tasks green: 1409 passed, `risk/` 100 % branch coverage after every task that touched
@@ -112,6 +117,20 @@ file already has, which each task names.
     into a log field or an exception message. It is `str(text)` with every occurrence of the
     key id and the secret replaced by `[redacted]`, control characters removed, and the result
     capped at 200 characters plus `...`. A non-str `message` is converted with `str()` first.
+  - **Every other response-derived value** that reaches a log field or an exception message goes
+    through `AlpacaHttp.diag(value: object, pattern: re.Pattern[str]) -> str` (Codex r2).
+    - The value is shown only if `str(value)` fully matches the pattern for its kind; otherwise
+      it becomes `<withheld: N chars>`. The key id and secret are then redacted as in
+      `sanitize`. The pattern alone is not enough: the key id is uppercase letters and digits
+      and would pass the request-id pattern.
+    - Patterns, as module constants in `alpaca_http.py`:
+      - `STATUS_RE = [a-z_]{1,32}`: Alpaca order statuses;
+      - `REQUEST_ID_RE = [A-Za-z0-9-]{1,64}`: `X-Request-ID`, applied in `_send` before the
+        id enters `HttpResult`, so every later use is already clean;
+      - `FIELD_RE = [A-Za-z0-9/._:-]{1,64}`: ack fields (ids, symbols, sides, types, TIF,
+        decimals).
+    - Comparisons and status mapping always use the raw values. Only diagnostics are
+      filtered.
 - Decimals go out as `format(d, "f")`. Numbers in responses must be JSON strings; a JSON number
   where a decimal is expected raises `BrokerError` (Review Focus 1).
 - Never branch on Alpaca's body `code` (spec 3.3).
@@ -470,10 +489,17 @@ here so the engine is complete before the adapter raises them.
     and to `candidates` as type `"b"`.
   - `_decide`: `except UnknownOrderStatus` before the generic `except Exception`: log
     `risk.order_status_unknown` and set `outcome = "unknown_status"`.
-  - **The direct read's evidence is kept (Codex P2-3).**
-    - `_Read` gains `unknown_status: set[int]`, the rows whose `get_order` raised
-      `UnknownOrderStatus` in this pass. `_resolve` hands `status_unknown=row.id in
-      read.unknown_status` to `_decide`.
+  - **The direct read's evidence is kept (Codex P2-3, widened by Codex r2).**
+    - The engine keeps `self._status_unknown: set[int]`, an in-memory set like `_last_outcome`.
+      `_read` adds a row when its `get_order` raises `UnknownOrderStatus`. The row is removed
+      only when a successful direct read clears it (the `clear_clock` path), or when the row
+      leaves resolution (`_resolve` prunes it to `live` rows, as it does `_last_outcome`).
+    - A direct read that later raises `OrderNotFound` or fails does not clear the evidence.
+      `_resolve` hands `status_unknown=row.id in self._status_unknown` to `_decide`.
+    - **Restart limitation (owner, accepted):** the set is in memory, so a restart inside the
+      resolution window forgets the evidence. That run behaves as before this change (an
+      inconclusive lookup can end as `lookup_failed`). The runbook says so in the
+      `unknown_status` section (Task 8).
     - In `_decide`, for such a row every inconclusive outcome becomes `"unknown_status"`, both
       this pass's and the remembered one: `lookup_failed`, `not_found`,
       `lookup_inconsistent`, or not looked up because the budget was spent.
@@ -538,6 +564,26 @@ async def test_a_failed_lookup_cannot_downgrade_an_unknown_status(...) -> None:
     await r.sync_at(0)
     later = await r.sync_at(80)
     assert (row_id, "incident", "unknown_status") in actions(later)  # not "lookup_failed"
+
+
+class HeldThenGone(HeldButLookupFails):  # Codex r2: the evidence outlives the pass
+    reads = 0
+    async def get_order(self, order_id: str) -> OrderStatus:
+        self.reads += 1
+        if self.reads == 1:
+            raise UnknownOrderStatus("held", "rid-1")
+        raise OrderNotFound(f"{order_id} (request rid-4)")
+
+async def test_unknown_status_evidence_lasts_the_resolution_window(...) -> None:
+    # pass 1: direct read "held"; pass 2 (at the bound): direct read 404, lookup 429
+    await r.sync_at(0)
+    later = await r.sync_at(80)
+    assert (row_id, "incident", "unknown_status") in actions(later)
+
+async def test_a_successful_read_clears_the_unknown_status_evidence(...) -> None:
+    # pass 1 "held"; pass 2 the direct read succeeds (row readable again, clear_clock);
+    # pass 3 a fresh 404 plus a 429 lookup at that window's bound -> "lookup_failed", not
+    # "unknown_status" (the evidence was cleared)
 ```
 
 `actions()` returns `(row, action, reason)` triples. Check its exact tuple shape in the file and
@@ -827,6 +873,17 @@ async def test_alpaca_message_text_is_sanitised() -> None:  # Codex P2-1
     assert len(line["message"]) <= 203
 
 
+async def test_response_derived_diagnostics_are_filtered() -> None:  # Codex r2
+    h = http(lambda r: httpx.Response(500, json={}, headers={"X-Request-ID": f"rid {SECRET}"}))
+    with capture_logs() as logs:
+        result = await h.get("/account", "/account")
+    assert result.request_id == "<withheld: " + str(len(f"rid {SECRET}")) + " chars>"
+    assert SECRET not in repr(logs)
+    assert h.diag("held", STATUS_RE) == "held"
+    assert h.diag(f"held{SECRET}", STATUS_RE).startswith("<withheld")
+    assert h.diag(KEY, REQUEST_ID_RE) == "[redacted]"  # the pattern alone would let it through
+
+
 @pytest.mark.parametrize("error", [OSError("reset"), RuntimeError("odd")])
 async def test_any_other_exception_is_a_broker_error(error: Exception) -> None:  # review I7
     def handler(r: httpx.Request) -> httpx.Response:
@@ -1038,6 +1095,11 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
     # 3.4 table; raises UnknownOrderStatus(raw, request_id)
 ```
 
+- `order_state` stays pure. Every caller in `alpaca.py` catches its `UnknownOrderStatus` and
+  re-raises `UnknownOrderStatus(http.diag(e.status, STATUS_RE), rid) from None`, so the status
+  the engine logs (`risk.order_status_unknown`, `status=e.status`) is already filtered (Codex
+  r2).
+
 - `_parsing(what: str, request_id: str | None)` turns the `TypeError` / `ValueError` /
   `KeyError` / `ArithmeticError` from parsing into `BrokerError` with ` (request <id>)`, and
   appends the id to a nested `BrokerError` (`_slash_symbol`, ack mismatch) whose message lacks
@@ -1086,7 +1148,8 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
     `time_in_force`, `Decimal` `qty` (equality), and `limit_price` (equality; both null for
     market).
   - Any difference logs `alpaca.ack_mismatch` at error level, with `order_id` and
-    `fields=[...]` (each `"name: sent != got"`), then raises
+    `fields=[...]` (each `"name: sent != got"`), then raises. `got` and the response `id` pass
+    through `http.diag(..., FIELD_RE)`; `sent` is ours (Codex r2). The raise is
     `BrokerError(f"alpaca ack does not match the order (request {rid})")`.
   - `OrderAck.status = order_state(status, filled_qty)`; `submitted_at` is `submitted_at`, or
     `created_at` if absent.
@@ -1262,6 +1325,16 @@ async def test_connect_closes_the_clients_when_validation_fails_or_is_cancelled(
 
 Plus the Review Focus tests named above (JSON number, HTML 2xx, nanosecond/naive timestamps,
 `BTCUSD` ack symbol, ack with `held`).
+
+Plus `test_a_malformed_status_or_ack_leaks_no_secret_into_the_rendered_log` (Codex r2, sketch
+with binding assertions). It uses `configure_logging(stream=buf)` as in the Task 4 rendered-log
+test, with two cases:
+1. `get_order` answers `status: f"held{SECRET}"`. The engine-side line
+   `log.warning("risk.order_status_unknown", status=e.status)` is rendered.
+2. A submit ack has `symbol: f"BTC/USD{SECRET}"`.
+
+In both, `SECRET` and `KEY` are absent from the rendered output and from `str(exc)`, and
+`<withheld` is present.
 
 **Existing `test_alpaca.py` tests (review I8)**. Every one is kept, ported to the Router, or
 dropped with its reason:
@@ -1503,7 +1576,10 @@ Spec section 4, plus the user rule: correct every claim the change falsified, fi
   ("Known costs (revisited in WP 1.6)") is still true and stays (dry run). Changes: "until WP 1.6"
   becomes 1.6d for orders and admission. `repair link` and the client-id lookup work
   from 1.6a. New `unknown_status` row in the incident table, with the spec 3.4 recovery
-  procedure. `unknown_status` joins the list of linkable incidents. The `alpaca.http` line and
+  procedure, plus its restart limitation: the evidence is kept in memory, so after a restart
+  inside the resolution window an inconclusive lookup can end the row as `lookup_failed`.
+  Before linking such a row, check the order's status at the broker and treat it as
+  `unknown_status` if it is unmapped (Codex r2). `unknown_status` joins the list of linkable incidents. The `alpaca.http` line and
   where the request id appears.)
 - Modify: `docs/alpaca-notes.md` (transport facts: alpaca-py has no timeout and retries POST,
   and trading calls no longer use it; rate limit 200/min; the request-budget numbers above; the
