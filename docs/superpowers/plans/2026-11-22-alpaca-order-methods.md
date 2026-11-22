@@ -12,7 +12,9 @@ compares order type, limit price and time in force. Writes stay switched off
 **Architecture:** A new `broker/alpaca_http.py` owns two `httpx.AsyncClient`s: reads keep
 connections alive, writes open a fresh connection every time. It turns transport failures into
 `RequestNotSent` (nothing was written) or `BrokerError` (bytes may have been written) and logs
-one `alpaca.http` line per call. `broker/alpaca.py` keeps the endpoint semantics: the status-code
+one `alpaca.http` line per call. A thin httpcore network backend closes the socket when a
+request is cancelled during the TLS handshake. httpcore itself does not, so without it the
+socket leaks (Fable plan review C1, owner decision D22 (9)). `broker/alpaca.py` keeps the endpoint semantics: the status-code
 contract, order and status mapping, ack validation, the `asset_rules` cache and the
 `orders_enabled` switch. The engine maps `RequestNotSent` to `not_submitted` and
 `UnknownOrderStatus` to a type (b) resolver candidate with the new incident reason
@@ -29,6 +31,19 @@ section numbers below refer to it. Decisions: PLAN.md D22 (1)-(8).
 
 **Status:** written 2026-11-22. The owner reviews it before the dry run; the dry run (agent in
 an isolated worktree, every task verbatim) comes after that review, then the plan PR.
+**Revised 2026-11-22 after a Fable review of this plan** (verdict "ready with fixes").
+- The review verified the four httpcore facts against the httpcore 1.0.9 / httpx 0.28.1 source
+  and by experiment, and reproduced a socket leak on a cancel during TLS setup (C1).
+- Owner decisions:
+  - C1 is fixed with a closing network backend (D22 (9), spec dated note in 3.1).
+  - `alpaca.http` logs every 2xx at `info`.
+- Every other finding (I1-I8, M1-M12) is folded in and marked "review" where it changed a
+  task.
+
+**Which code blocks are binding.** Complete test functions (Tasks 1, 2, 4, 5) are normative:
+the dry run writes them as they stand. Blocks with `...` or comment bodies (Tasks 3, 6, 7) are
+sketches. Their test names and assertions are binding; their setup uses the helpers the target
+file already has, which each task names.
 
 ## Global Constraints
 
@@ -46,6 +61,13 @@ an isolated worktree, every task verbatim) comes after that review, then the pla
 - Timeouts (spec 3.1): `httpx.Timeout(connect=3.0, write=5.0, read=5.0, pool=2.0)`.
   `follow_redirects=False`, `trust_env=False`, TLS verify on, no retries (`retries=0`, no
   loop), no cookies kept.
+  - `trust_env=False` and `verify=True` go to the hand-built transports too. An
+    `AsyncHTTPTransport` has its own `trust_env=True` and would load `SSL_CERT_FILE` /
+    `SSL_CERT_DIR` even under a `trust_env=False` client (review I2).
+  - The connect timeout applies to TCP (with DNS) and to TLS separately, so a `RequestNotSent`
+    can take up to 6 s, still inside the 10 s engine budget (review).
+- Test credentials: use the module constants `KEY` / `SECRET`, never inline `"s"` (ruff S106).
+  Use no single-letter `l` variables (E741) (review I5).
 - Base URLs: paper `https://paper-api.alpaca.markets/v2`, live `https://api.alpaca.markets/v2`
   (live only through the existing `ALLOW_LIVE` gate in `connect`, unchanged).
 - Headers `APCA-API-KEY-ID` and `APCA-API-SECRET-KEY` are set once per client. Headers or keys
@@ -61,16 +83,31 @@ an isolated worktree, every task verbatim) comes after that review, then the pla
 - Module `broker/alpaca_http.py`; class `AlpacaHttp`; result type `HttpResult`.
 - Pool sizes: read `httpx.Limits(max_connections=4, max_keepalive_connections=4)`, write
   `httpx.Limits(max_connections=4, max_keepalive_connections=0)`. Pool timeout 2 s.
-- Cookies: `httpx.Cookies(http.cookiejar.CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])))`.
-  An empty allow list accepts no cookie (`DefaultCookiePolicy.is_not_allowed`); a test pins it.
+- Cookies: pass the **raw** `http.cookiejar.CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))`
+  as `cookies=`. An empty allow list accepts no cookie. Wrapping it in `httpx.Cookies` copies it
+  into a fresh jar without the policy (review I3, reproduced). A test pins this on both
+  clients.
+- **Closing network backend** (owner decision D22 (9), review C1). httpcore's anyio `start_tls`
+  closes the stream only on `Exception`, so a cancel during the TLS handshake leaves an open
+  socket that nothing closes. `alpaca_http.py` wraps `httpcore.AnyIOBackend`: its stream's
+  `start_tls` closes the inner stream on `BaseException` and re-raises. httpx 0.28 has no public
+  hook for a backend, so the transport sets `transport._pool._network_backend` (private;
+  pinned by the loopback test and re-checked on upgrade). This is not the DNS-isolating backend
+  spec section 1 rejected: it resolves nothing and only adds the missing close.
 - `asset_rules` cache TTL 300 s, on an injected monotonic clock.
 - The startup broker check gets one overall `asyncio.timeout(BROKER_CHECK_S)` with
   `BROKER_CHECK_S = 10.0` in `core/runtime.py`, the engine's `io_timeout_s` default. The runtime
   does not configure `io_timeout_s`, so there is no config value to reuse.
 - `aclose()` joins the `Broker` protocol. SimBroker and the runtime's test fakes get it.
-- Log level of `alpaca.http`: `debug` for a 2xx GET, `info` for a 2xx POST/DELETE, `warning` for
-  any non-2xx status or transport error. The spec fixes the line, not its level. At `debug`, a
-  sync loop polling every 2 s does not flood the info log.
+- Log level of `alpaca.http` (owner, 2026-11-22): `info` for every 2xx, `warning` for any non-2xx
+  status or transport error. The default `info` level would drop `debug`, and successful reads
+  would then log no request id (review M5). Cost: about 2-4 lines per minute steady state, plus
+  about 30 per minute per unsettled order.
+- Order ids are checked against `[A-Za-z0-9-]+` before they go into a path (in `get_order`,
+  `cancel_order` and the ack check). Anything else raises `BrokerError` before any I/O: httpx
+  normalises `/orders/../account`, and `DELETE /v2/orders` is Alpaca's cancel-all (review M6).
+- Every `BrokerError` raised from a response carries the request id, `UnknownOrderStatus` and
+  parse errors included (spec 3.1, review M4).
 - `cancel_order`: any 2xx returns (the probes saw 204). Spec 3.3 lists only 204 and "other
   non-2xx".
 - `get_order` also checks that the response's `id` equals the requested id; a different id is
@@ -100,25 +137,39 @@ Alpaca allows 200 trading-API requests per minute per account. With the `asset_r
 
 ### Pre-implementation verification (spec 3.2, owner condition; done in the dry run)
 
-Before Task 4 is written to disk, check these against the **installed** `httpcore` source and
-record the result, with the versions, in `docs/alpaca-notes.md` (Task 8):
+The Fable plan review already verified these against httpcore 1.0.9, httpx 0.28.1 and
+anyio 4.16.0. The dry run confirms them against the versions `uv add` actually resolves, then
+records them (file, function, versions) in `docs/alpaca-notes.md` (Task 8):
 
 1. `httpcore/_async/connection.py` `AsyncHTTPConnection.handle_async_request`: `_connect()`
-   (TCP, then `start_tls`) completes before the connection's `handle_async_request` writes the
-   first request byte. `ConnectError` and `ConnectTimeout` are raised only inside `_connect()`
-   (the `map_exceptions` around `connect_tcp` / `start_tls`).
-2. `httpcore/_async/http11.py` `handle_async_request`: an exception during
-   `_send_request_headers` / `_send_request_body`, `CancelledError` included, goes through the
-   `except BaseException` path, which closes the connection
-   (`_response_closed` under `AsyncShieldCancellation`). A cancelled write therefore leaves no
-   connection that could finish the request later.
-3. `httpcore/_async/connection_pool.py`: `PoolTimeout` is raised while waiting for a
-   connection, before any request is assigned to one.
+   (`connect_tcp`, then `start_tls`) returns before the request reaches the HTTP/1.1
+   connection. `ConnectError` / `ConnectTimeout` are produced only by the exception maps in
+   `httpcore/_backends/anyio.py` (`connect_tcp`, `connect_unix_socket`, `start_tls`); there is
+   no other raise site outside the proxy modules.
+2. `httpcore/_async/http11.py` `handle_async_request`: any exception except `WriteError`,
+   `CancelledError` included, closes the connection in the `except BaseException` path
+   (`_response_closed` under `AsyncShieldCancellation`). `WriteError` is suppressed and the
+   response is read. That outcome is a read error or a status, never a connect error.
+3. `httpcore/_async/connection_pool.py` and `_synchronization.py`: `PoolTimeout` is raised only
+   around the wait for a connection. The retry loop re-queues only on
+   `ConnectionNotAvailable`, which `http11.py` raises before any write.
 4. `httpx/_transports/default.py` maps `httpcore.ConnectError` / `ConnectTimeout` /
-   `PoolTimeout` to the `httpx` exceptions of the same name and nothing else to them.
+   `PoolTimeout` to the `httpx` exceptions of the same name. None of the three has a subclass,
+   and httpx raises them nowhere else.
+5. (C1, the reason for the closing backend) `httpcore/_backends/anyio.py` `start_tls` closes
+   the stream only on `Exception`, not on cancellation.
 
-**If any of the four does not hold, stop and report to the owner before Task 4.** The
-`RequestNotSent` mapping would be unsafe, and that changes the spec.
+The argument holds only under these conditions, which the transport must keep and the notes
+must state:
+- no proxy (the proxy modules call `start_tls` after written bytes; `trust_env=False` and no
+  `proxy=` keep them out);
+- HTTP/1.1 only (`http2` off, the default);
+- `retries=0`;
+- the anyio backend.
+
+**If facts 1-4 or a condition do not hold for the resolved versions, stop and report to the
+owner before Task 4.** The `RequestNotSent` mapping would be unsafe, and that changes the
+spec. Pin and record anyio too (review M10).
 
 ## Review Focus
 
@@ -160,7 +211,8 @@ Spec 3.7 (protocol part), 3.9, acceptance 13 and 14. No transport yet.
 - Produces: `Broker` without `close_position`, `close_all`, `stream_fills`; with
   `async def aclose(self) -> None`.
 - Produces: `SimBroker.fills() -> list[Fill]` (test hook: every emitted fill, in emission
-  order).
+  order) and `SimBroker.take_fills() -> list[Fill]` (the fills emitted since the previous
+  `take_fills()` call).
 - Produces: `tests/sim_helpers.py`:
   `async def sell_free(sim: SimBroker, symbol: str) -> OrderAck`. It submits a market sell of
   the position's `qty_available` (what `exit()` does since D20). With no position or a free qty
@@ -193,18 +245,15 @@ def test_removed_methods_are_gone() -> None:
         assert not hasattr(SimBroker, name)
     assert not {"close_position", "close_all", "stream_fills"} & set(dir(Broker))
 
-async def test_fills_hook_lists_every_fill_in_emission_order() -> None:
-    sim = make_sim(cash="10000")
-    sim.process_bar(bar(0, 100.0))
-    a = await sim.submit_order(market("buy", "1"))
-    b = await sim.submit_order(market("buy", "2"))
-    sim.process_bar(bar(1, 100.0))
-    assert [f.fill_id for f in sim.fills()] == [f"{a.order_id}:1", f"{b.order_id}:1"]
 ```
+
+`test_fills_carry_stable_unique_ids_and_fee_asset` (today line 360) becomes the `fills()` test.
+It reads `sim.fills()` instead of the stream, with the same assertions. No duplicate test is
+added (review M1).
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `uv run pytest tests/unit/broker/test_sim.py -k "alpaca_contract or removed_methods or fills_hook" -q`
+Run: `uv run pytest tests/unit/broker/test_sim.py -k "alpaca_contract or removed_methods or stable_unique_ids" -q`
 Expected: 3 failed.
 
 - [ ] **Step 3: Implement**
@@ -225,8 +274,11 @@ Expected: 3 failed.
     `test_close_position_without_position_raises`,
     `test_close_all_continues_past_a_rejected_symbol`,
     `test_redeliver_repeats_the_identical_fill`). Keep their full-close and dust cases by
-    rewriting them on `sell_free`. Stream-reading tests use `sim.fills()` (the hypothesis
-    invariant test and `drain()` included). Tests that expect `OrderRejected` from cancelling a
+    rewriting them on `sell_free`. Stream-reading tests use `sim.fills()`, the hypothesis
+    invariant test included. `drain()` keeps its consuming meaning (tests at 661, 674 and
+    830-835 assert `drain(sim) == []` after an earlier drain). It becomes
+    `return sim.take_fills()`, a second test hook that returns the fills emitted since its last
+    call (a cursor index into `_fill_log` kept by the sim) (review M1). Tests that expect `OrderRejected` from cancelling a
     final order expect `BrokerError`. In `test_alpaca.py`, drop the removed names from the two
     "not implemented" tests. Add `async def aclose(self) -> None` to `test_runtime.FakeBroker`.
 - [ ] **Step 4: Full check** (Global Constraints order). Expected: all green, `risk/` 100 %.
@@ -331,8 +383,10 @@ here so the engine is complete before the adapter raises them.
   - `class RequestNotSent(BrokerError)`, docstring: "The request failed before any byte of it
     was written (connect, DNS, TLS, pool wait); no order can exist. Submit records
     `not_submitted` (D22.5)."
-  - `class UnknownOrderStatus(BrokerError)` with `__init__(self, status: str)`; stores
-    `self.status`; message `f"unmapped alpaca order status {status!r}"`.
+  - `class UnknownOrderStatus(BrokerError)` with
+    `__init__(self, status: str, request_id: str | None = None)`. It stores `self.status` and
+    has the message `f"unmapped alpaca order status {status!r} (request {request_id})"`
+    (review M4).
 - Produces: `IncidentReason` gains `"unknown_status"`.
 - Produces: `LINKABLE_INCIDENTS` gains `"unknown_status"`. For a row whose incident is
   `unknown_status`, `prepare_link` refuses unless `view.status in ("filled", "canceled",
@@ -371,20 +425,28 @@ async def test_a_failure_after_the_write_stays_unknown(...) -> None:
     # submit raises BrokerError("... WriteError"): row "unknown"; a TimeoutError from _within too
 ```
 
-`test_resolver.py`:
+`test_resolver.py` (sketch; use the file's `Rig` and its `sync_at`, which applies each result
+through the ledger, so `start_clock` is persisted (review M9)):
 
 ```python
+class HeldStatus(SimBroker):  # every read of any order meets Alpaca status "held"
+    async def get_order(self, order_id: str) -> OrderStatus:
+        raise UnknownOrderStatus("held", "rid-1")
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        raise UnknownOrderStatus("held", "rid-2")
+
 async def test_an_unknown_status_read_makes_a_type_b_candidate_then_an_incident(...) -> None:
-    # SimBroker subclass: get_order raises UnknownOrderStatus("held") for the row's broker id,
-    # get_order_by_client_id raises UnknownOrderStatus("held") as well.
-    first = await engine.sync_orders()
+    # a submitted entry on HeldStatus (r.entry()), so the row has a broker id
+    first = await r.sync_at(0)
     assert row_id in first.failed
-    assert [r.action for r in first.resolutions] == ["start_clock"]
-    clock.advance(80)  # order_resolution_timeout_s
-    later = await engine.sync_orders()
-    (inc,) = [r for r in later.resolutions if r.action == "incident"]
-    assert inc.reason == "unknown_status"
+    assert actions(first) == [(row_id, "start_clock", None)]
+    later = await r.sync_at(80)  # order_resolution_timeout_s after the clock started
+    assert (row_id, "incident", "unknown_status") in actions(later)
+    assert (await order(r.sessions, row_id)).incident == "unknown_status"
 ```
+
+`actions()` returns `(row, action, reason)` triples. Check its exact tuple shape in the file and
+adapt only that.
 
 `test_position_manager.py` (Harness, as in `test_failed_exits_back_off_and_alert_after_three`):
 
@@ -410,16 +472,21 @@ async def test_an_unsent_exit_is_retried_after_its_backoff(sessions, bus) -> Non
     assert [s.status for s in await h.sells()] == ["not_submitted", "new"]
 ```
 
-`test_repair.py`:
+`test_repair.py` (sketch; the row comes from the file's `own_cid` + `submit` helpers, then is set
+to incident `unknown_status` the way `test_type_b_lookup_failed_incident_is_repairable` sets
+its incident; the lookups are inline async functions):
 
 ```python
-async def test_link_of_an_unknown_status_incident_needs_a_final_broker_order(...) -> None:
-    # row: broker id "b-1", incident "unknown_status"
+async def test_link_of_an_unknown_status_incident_needs_a_final_broker_order(r: Rig) -> None:
+    async def held(cid: str) -> BrokerOrderView | None:
+        raise UnknownOrderStatus("held", "rid-1")
     with pytest.raises(RepairRefused, match="broker lookup failed: UnknownOrderStatus"):
-        await prepare_link(sessions, row, "b-1", raising(UnknownOrderStatus("held")))
+        await prepare_link(r.sessions, row, broker_id, held)
+    # the sim's order is open ("new"): refused
     with pytest.raises(RepairRefused, match="broker order is not final: new"):
-        await prepare_link(sessions, row, "b-1", returning(view(status="new")))
-    plan = await prepare_link(sessions, row, "b-1", returning(view(status="canceled")))
+        await prepare_link(r.sessions, row, broker_id, lookup_of(sim))
+    await sim.cancel_order(broker_id)
+    plan = await prepare_link(r.sessions, row, broker_id, lookup_of(sim))
     assert plan.after["incident"] is None
 ```
 
@@ -486,37 +553,73 @@ class AlpacaHttp:
     def closed(self) -> bool: ...                 # both clients closed
 
 def wire_decimal(value: Decimal) -> str: ...      # format(value, "f")
+
+def make_transport(limits: httpx.Limits) -> httpx.AsyncHTTPTransport: ...
+    # AsyncHTTPTransport(limits=limits, retries=0, verify=True, trust_env=False, http2=False),
+    # then `transport._pool._network_backend = ClosingBackend()` (review C1, I2)
+
+class ClosingBackend(httpcore.AsyncNetworkBackend): ...   # wraps httpcore.AnyIOBackend
+class _ClosingStream(httpcore.AsyncNetworkStream): ...    # delegates read/write/aclose/get_extra_info
 ```
 
-- `transport=None` builds `httpx.AsyncHTTPTransport(limits=READ_LIMITS, retries=0)` for reads
-  and `httpx.AsyncHTTPTransport(limits=WRITE_LIMITS, retries=0)` for writes. Both keep
-  `verify=True`, and both clients get `trust_env=False`. A given `transport` (tests) serves
-  both clients.
+- `ClosingBackend.connect_tcp(...)` wraps the inner stream in `_ClosingStream`;
+  `connect_unix_socket` raises `NotImplementedError`; `sleep` delegates. This is the one
+  algorithm the signatures do not fix:
+
+```python
+async def start_tls(self, ssl_context, server_hostname=None, timeout=None):  # _ClosingStream
+    try:
+        return await self._inner.start_tls(ssl_context, server_hostname, timeout)
+    except BaseException:  # httpcore closes only on Exception; a cancel leaked the socket
+        await self._inner.aclose()
+        raise
+```
+
+  Fully typed in the real file. The review validated this in a scratch venv: 3 runs green under
+  `filterwarnings=error`, for both the `task.cancel()` and the `wait_for` case.
+- `transport=None` builds both clients' transports with `make_transport` (`READ_LIMITS` /
+  `WRITE_LIMITS`). A given `transport` (tests) serves both clients. Both clients:
+  `trust_env=False`, `follow_redirects=False`, `timeout=timeout`, the raw cookie jar.
 - `get` uses the read client; `post` and `delete` use the write client.
-- Exception mapping (spec 3.2 table): `httpx.ConnectError`, `httpx.ConnectTimeout` and
-  `httpx.PoolTimeout` raise `RequestNotSent(f"alpaca {method} {template} not sent:
-  {type(e).__name__}")` from `e`. Any other `httpx.HTTPError` (or `httpx.InvalidURL`) raises
-  `BrokerError(f"alpaca {method} {template} failed: {type(e).__name__}")` from `e`.
-  `CancelledError` passes through. The message never includes `str(e)`.
+- Exception mapping (spec 3.2 table, widened by review I7). The message never includes
+  `str(e)`. `CancelledError` (a `BaseException`) passes through.
+  - A call on a closed client (`client.is_closed`, checked first, before any I/O) raises
+    `RequestNotSent(f"alpaca {method} {template} not sent: client closed")`. A task that
+    teardown left behind and that submits after the broker step is provably unsent, not
+    `unknown`.
+  - `httpx.ConnectError`, `httpx.ConnectTimeout` and `httpx.PoolTimeout` raise
+    `RequestNotSent(f"alpaca {method} {template} not sent: {type(e).__name__}")` from `e`.
+  - **Any other `Exception`** raises
+    `BrokerError(f"alpaca {method} {template} failed: {type(e).__name__}")` from `e`. That
+    includes other httpx errors, a bare `OSError` (anyio maps only some), and a `RuntimeError`.
 - `alpaca.http` log line per call: `method`, `path` (the template), `order_id` (when given),
   `status` or `error` (exception type name), `elapsed_ms` (int, monotonic), `request_id`, and
-  for non-2xx `message` (`body.get("message")` when the body is a dict). Levels as decided
-  above.
+  for non-2xx `message` (`body.get("message")` when the body is a dict). Levels: `info` for
+  every 2xx, `warning` otherwise.
 - HTTP status codes are returned, never raised: the status contract lives in `alpaca.py`.
 
 - [ ] **Step 1: Pre-implementation verification** (section above). Run
-  `uv add "httpx>=0.28.1,<0.29" "httpcore>=1.0.9,<1.1"`, then read the four places in
-  `.venv/lib/python3.12/site-packages/httpcore` and `httpx`. Record findings (file, function,
-  version) for Task 8. Stop if any fails.
+  `uv add "httpx>=0.28.1,<0.29" "httpcore>=1.0.9,<1.1"`, then confirm facts 1-5 and the
+  conditions in `.venv/lib/python3.12/site-packages/{httpcore,httpx}` for the resolved
+  versions. Record the anyio version from `uv.lock`. Keep the findings (file, function,
+  versions) for Task 8. Stop if facts 1-4 or a condition fail.
 
 - [ ] **Step 2: Write the failing tests** in `tests/unit/broker/test_alpaca_http.py`
 
 ```python
-def http(handler: Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]], **kw: Any) -> AlpacaHttp:
-    return AlpacaHttp(base_url=PAPER_URL, key_id=KEY, secret_key=SECRET,
-                      transport=httpx.MockTransport(handler), **kw)
-
 KEY, SECRET = "KEYID-not-a-real-key-7", "SECRET-not-a-real-secret-9"
+Handler = (
+    Callable[[httpx.Request], httpx.Response]
+    | Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
+)
+
+
+def http(handler: Handler, **kw: Any) -> AlpacaHttp:
+    return AlpacaHttp(
+        base_url=PAPER_URL, key_id=KEY, secret_key=SECRET,
+        transport=httpx.MockTransport(handler), **kw,
+    )
+
 
 async def test_clients_carry_the_specified_settings() -> None:
     h = http(lambda r: httpx.Response(200, json={}))
@@ -524,54 +627,135 @@ async def test_clients_carry_the_specified_settings() -> None:
         assert c.timeout == httpx.Timeout(connect=3.0, write=5.0, read=5.0, pool=2.0)
         assert c.follow_redirects is False and c.trust_env is False
         assert c.headers["APCA-API-KEY-ID"] == KEY
+    await h.aclose()
+
+
+async def test_production_transports_ignore_env_and_never_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # review I2, M7: the settings MockTransport hides
+    monkeypatch.setenv("SSL_CERT_FILE", "/nonexistent/ca.pem")  # trust_env would load it
+    h = AlpacaHttp(base_url=PAPER_URL, key_id=KEY, secret_key=SECRET)
+    for client, keepalive in ((h._read, 4), (h._write, 0)):
+        pool = client._transport._pool  # type: ignore[attr-defined]
+        assert pool._retries == 0 and pool._http2 is False
+        assert pool._max_keepalive_connections == keepalive
+        assert pool._ssl_context.verify_mode is ssl.CERT_REQUIRED
+        assert pool._ssl_context.check_hostname is True
+        assert isinstance(pool._network_backend, ClosingBackend)
+    await h.aclose()
+
 
 async def test_a_set_cookie_is_not_kept() -> None:
     h = http(lambda r: httpx.Response(200, json={}, headers={"set-cookie": "a=b; Path=/"}))
     await h.get("/account", "/account")
-    assert not h._read.cookies.jar and not h._write.cookies.jar  # nothing stored
+    await h.post("/orders", "/orders", {})  # the write client sees a Set-Cookie too
+    assert len(h._read.cookies.jar) == 0 and len(h._write.cookies.jar) == 0
+    await h.aclose()
+
 
 @pytest.mark.parametrize("status", [429, 503])
 async def test_no_retry_on_status(status: int) -> None:
     seen: list[httpx.Request] = []
+
     def handler(r: httpx.Request) -> httpx.Response:
-        seen.append(r); return httpx.Response(status, json={"message": "x"})
+        seen.append(r)
+        return httpx.Response(status, json={"message": "x"})
+
     result = await http(handler).post("/orders", "/orders", {"symbol": "BTC/USD"})
     assert (result.status, len(seen)) == (status, 1)
 
-@pytest.mark.parametrize(("exc", "raised"), [
-    (httpx.ConnectError, RequestNotSent), (httpx.ConnectTimeout, RequestNotSent),
-    (httpx.PoolTimeout, RequestNotSent), (httpx.WriteError, BrokerError),
-    (httpx.WriteTimeout, BrokerError), (httpx.ReadError, BrokerError),
-    (httpx.ReadTimeout, BrokerError), (httpx.RemoteProtocolError, BrokerError)])
-async def test_transport_errors_map_by_whether_bytes_may_have_left(exc: type[Exception], raised: type[Exception]) -> None:
+
+@pytest.mark.parametrize(
+    ("exc", "raised"),
+    [
+        (httpx.ConnectError, RequestNotSent),
+        (httpx.ConnectTimeout, RequestNotSent),
+        (httpx.PoolTimeout, RequestNotSent),
+        (httpx.WriteError, BrokerError),
+        (httpx.WriteTimeout, BrokerError),
+        (httpx.ReadError, BrokerError),
+        (httpx.ReadTimeout, BrokerError),
+        (httpx.RemoteProtocolError, BrokerError),
+    ],
+)
+async def test_transport_errors_map_by_whether_bytes_may_have_left(
+    exc: type[httpx.TransportError], raised: type[BrokerError]
+) -> None:
     seen: list[httpx.Request] = []
+
     def handler(r: httpx.Request) -> httpx.Response:
-        seen.append(r); raise exc("boom", request=r)
+        seen.append(r)
+        raise exc("boom", request=r)
+
     with pytest.raises(raised) as e:
         await http(handler).post("/orders", "/orders", {})
     assert type(e.value) is raised and len(seen) == 1  # exact class, no retry
     assert KEY not in str(e.value) and SECRET not in str(e.value)
 
+
+@pytest.mark.parametrize("error", [OSError("reset"), RuntimeError("odd")])
+async def test_any_other_exception_is_a_broker_error(error: Exception) -> None:  # review I7
+    def handler(r: httpx.Request) -> httpx.Response:
+        raise error
+
+    with pytest.raises(BrokerError) as e:
+        await http(handler).get("/account", "/account")
+    assert type(e.value) is BrokerError
+
+
+async def test_a_closed_client_is_request_not_sent() -> None:  # review I7
+    seen: list[httpx.Request] = []
+
+    def handler(r: httpx.Request) -> httpx.Response:
+        seen.append(r)
+        return httpx.Response(200, json={})
+
+    h = http(handler)
+    await h.aclose()
+    assert h.closed
+    with pytest.raises(RequestNotSent, match="client closed"):
+        await h.post("/orders", "/orders", {})
+    assert seen == []
+
+
 def test_decimals_go_out_without_exponent() -> None:
     assert wire_decimal(Decimal("1E-7")) == "0.0000001"
     assert wire_decimal(Decimal("73667.30052")) == "73667.30052"
 
+
 async def test_one_log_line_per_call_without_secrets() -> None:
-    h = http(lambda r: httpx.Response(403, json={"message": "cost basis"}, headers={"X-Request-ID": "rid-1"}))
+    responses = iter([
+        httpx.Response(403, json={"message": "cost basis"}, headers={"X-Request-ID": "rid-1"}),
+        httpx.Response(200, json={}, headers={"X-Request-ID": "rid-2"}),
+    ])
+    h = http(lambda r: next(responses))
     with capture_logs() as logs:
         await h.post("/orders", "/orders", {})
         await h.get("/orders/{id}", "/orders/o-1", order_id="o-1")
-    lines = [l for l in logs if l["event"] == "alpaca.http"]
-    assert [(l["method"], l["path"], l.get("order_id"), l["status"]) for l in lines] == [
-        ("POST", "/orders", None, 403), ("GET", "/orders/{id}", "o-1", 403)]
-    assert lines[0]["request_id"] == "rid-1" and lines[0]["message"] == "cost basis"
+    lines = [line for line in logs if line["event"] == "alpaca.http"]
+    assert [
+        (x["method"], x["path"], x.get("order_id"), x["status"], x["log_level"], x["request_id"])
+        for x in lines
+    ] == [
+        ("POST", "/orders", None, 403, "warning", "rid-1"),
+        ("GET", "/orders/{id}", "o-1", 200, "info", "rid-2"),  # 2xx reads log at info (M5)
+    ]
+    assert lines[0]["message"] == "cost basis"
     assert KEY not in repr(logs) and SECRET not in repr(logs)
 
+
 async def test_a_handler_blocked_past_cancellation_records_nothing() -> None:
+    # Proves only that AlpacaHttp neither shields nor detaches the request (spec wording);
+    # the loopback test below carries the real claim (review M8).
     started, release = asyncio.Event(), asyncio.Event()
     completed: list[httpx.Request] = []
+
     async def handler(r: httpx.Request) -> httpx.Response:
-        started.set(); await release.wait(); completed.append(r); return httpx.Response(200, json={})
+        started.set()
+        await release.wait()
+        completed.append(r)
+        return httpx.Response(200, json={})
+
     h = http(handler)
     task = asyncio.create_task(h.post("/orders", "/orders", {}))
     await started.wait()
@@ -581,61 +765,92 @@ async def test_a_handler_blocked_past_cancellation_records_nothing() -> None:
     release.set()
     await asyncio.sleep(0)
     assert completed == []
-    # same with asyncio.timeout rescheduled to "now" once started is set (the wait_for path)
 ```
 
-Loopback tests (`tests/unit/broker/loopback.py` gives `SilentTls`, a server that records bytes,
-never answers and sets `hello` on the first bytes and `closed` on EOF, and `KeepAliveHttp`, a
-minimal HTTP/1.1 responder that counts accepted connections and answers each request with
-`200 {}`):
+Loopback tests. `tests/unit/broker/loopback.py` provides two servers:
+- `SilentTls` records every byte, never answers, sets `hello` on the first bytes and `closed`
+  on EOF. It also has `record_types() -> set[int]`, which walks the TLS records.
+- `KeepAliveHttp` is a minimal HTTP/1.1 responder. It counts accepted connections and answers
+  each request with `200 {}`.
+
+`free_port()` binds port 0 and closes the socket again. Each server closes its client
+transports on `__aexit__`. Every `await` on a server event sits inside `asyncio.timeout(10)`.
+That is a hang guard, not a timing assertion: with the closing backend, EOF arrives at once.
 
 ```python
-async def test_a_request_cancelled_in_tls_setup_writes_no_request_bytes() -> None:
+@pytest.mark.parametrize("how", ["cancel", "wait_for"])
+async def test_a_request_cancelled_in_tls_setup_writes_nothing_and_closes(how: str) -> None:
     async with SilentTls() as srv:
         h = AlpacaHttp(base_url=f"https://127.0.0.1:{srv.port}/v2", key_id=KEY, secret_key=SECRET)
-        task = asyncio.create_task(h.post("/orders", "/orders", {"symbol": "BTC/USD"}))
-        await srv.hello.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        call = h.post("/orders", "/orders", {"symbol": "BTC/USD"})
+        if how == "cancel":
+            task = asyncio.create_task(call)
+            async with asyncio.timeout(10):
+                await srv.hello.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:  # the engine's path: wait_for times the caller out during the handshake
+            task = asyncio.create_task(asyncio.wait_for(call, 3600))
+            async with asyncio.timeout(10):
+                await srv.hello.wait()
+            task.cancel()  # stands in for the deadline firing; same cancellation inside wait_for
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        async with asyncio.timeout(10):
+            await srv.closed.wait()  # EOF before aclose: the backend closed the socket (C1)
         await h.aclose()
-        await srv.closed.wait()
     assert srv.record_types() == {0x16}  # TLS handshake records only, no application data
     assert b"POST" not in srv.received and SECRET.encode() not in srv.received
 
+
 async def test_a_connect_timeout_and_a_refused_port_are_request_not_sent() -> None:
     async with SilentTls() as srv:
-        h = AlpacaHttp(base_url=f"https://127.0.0.1:{srv.port}/v2", key_id=KEY, secret_key=SECRET,
-                       timeout=httpx.Timeout(5.0, connect=0.05))
+        h = AlpacaHttp(
+            base_url=f"https://127.0.0.1:{srv.port}/v2", key_id=KEY, secret_key=SECRET,
+            timeout=httpx.Timeout(5.0, connect=0.05),
+        )
         with pytest.raises(RequestNotSent, match="ConnectTimeout"):
             await h.post("/orders", "/orders", {})
         await h.aclose()
-    port = free_port()  # bound and closed again by the helper
+    port = free_port()
     h = AlpacaHttp(base_url=f"http://127.0.0.1:{port}/v2", key_id=KEY, secret_key=SECRET)
     with pytest.raises(RequestNotSent, match="ConnectError"):
         await h.post("/orders", "/orders", {})
     await h.aclose()
 
+
 async def test_writes_open_a_fresh_connection_reads_reuse_one() -> None:
     async with KeepAliveHttp() as srv:
         h = AlpacaHttp(base_url=f"http://127.0.0.1:{srv.port}/v2", key_id=KEY, secret_key=SECRET)
-        await h.post("/orders", "/orders", {}); await h.post("/orders", "/orders", {})
+        await h.post("/orders", "/orders", {})
+        await h.post("/orders", "/orders", {})
         assert srv.connections == 2
-        await h.get("/account", "/account"); await h.get("/account", "/account")
+        await h.get("/account", "/account")
+        await h.get("/account", "/account")
         assert srv.connections == 3
         await h.aclose()
     assert h.closed
 ```
+
+The review verified the reuse counts (2, then 3) and the TLS-only bytes with httpx 0.28.1 /
+httpcore 1.0.9. The `wait_for` case cancels the outer task rather than waiting for a real
+deadline: `wait_for` turns its own deadline into exactly this cancellation of the inner call,
+and the test then needs no clock.
 
 - [ ] **Step 3: Run them to see them fail**
 
 Run: `uv run pytest tests/unit/broker/test_alpaca_http.py -q`
 Expected: FAIL (module missing).
 
-- [ ] **Step 4: Implement `AlpacaHttp`** per Interfaces. One private `_send(client, method,
-  template, path, **kw) -> HttpResult` does the timing, the mapping and the log line. Body:
-  `parsed` is True only for a non-empty body that `response.json()` decodes; a decode error
-  gives `body=None, parsed=False`, never an exception.
+- [ ] **Step 4: Implement `AlpacaHttp`, `make_transport` and `ClosingBackend`** per
+  Interfaces. One private `_send(client, method, template, path, **kw) -> HttpResult` does the
+  closed check, the timing, the mapping and the log line. Body: `parsed` is True only for a
+  non-empty body that `response.json()` decodes; a decode error gives `body=None,
+  parsed=False`, never an exception. The private attributes the production-transport test
+  reads (`_pool._retries`, `_http2`, `_max_keepalive_connections`, `_ssl_context`,
+  `_network_backend`) were checked by the review for httpcore 1.0.9. If one is named
+  differently in the resolved version, adapt the test, not the transport.
 - [ ] **Step 5: Run the tests**, then the full check. Expected: green. Run the loopback file 5
   times (`for i in 1 2 3 4 5; do uv run pytest tests/unit/broker/test_alpaca_http.py -q || break; done`):
   5 passes.
@@ -680,8 +895,14 @@ class AlpacaBroker:
                       transport: httpx.AsyncBaseTransport | None = None) -> "AlpacaBroker": ...
     async def aclose(self) -> None: ...
 
-def order_state(raw: str, filled_qty: Decimal) -> OrderState: ...   # 3.4 table; raises UnknownOrderStatus
+def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) -> OrderState: ...
+    # 3.4 table; raises UnknownOrderStatus(raw, request_id)
 ```
+
+- `_parsing(what: str, request_id: str | None)` puts `(request {request_id})` into its
+  `BrokerError` message (review M4).
+- `aclose()` delegates to `AlpacaHttp.aclose()`. A test asserts that both clients are closed
+  afterwards (review M11).
 
 - `connect`: the `ALLOW_LIVE` gate and the missing-keys check run before any client exists.
   Then `AlpacaHttp(...)` is built, and `GET /account` validates `crypto_status` and
@@ -735,98 +956,186 @@ def order_state(raw: str, filled_qty: Decimal) -> OrderState: ...   # 3.4 table;
 - `asset_rules` cache: a dict of `symbol -> (expires_at, AssetRules)` on the injected
   monotonic clock. A failed fetch caches nothing.
 
-- [ ] **Step 1: Write `tests/unit/broker/alpaca_mock.py`**: `probe(step: str, *, run: str =
-  "round1", n: int = 0) -> dict[str, Any]` returns the n-th logged entry for `step` from
-  `tests/fixtures/alpaca/order_probes_20261112.json`. `class Router` maps `(method,
-  template-free path)` to a queued `httpx.Response`, records every request, and exposes
-  `.transport`. `ACCOUNT` is the existing recorded account dict.
-  `order_from(body: dict[str, str]) -> BrokerOrder` builds the order a probe sent (Decimals from
-  the strings). In `test_alpaca.py`, `CHANGED: dict[str, str | None]` holds one wrong value per
-  ack field (another client id, `"ETH/USD"`, `"sell"`, `"market"`, `"gtc"`, qty plus one
-  increment, limit plus one cent).
+- [ ] **Step 1: Write `tests/unit/broker/alpaca_mock.py`:**
+  - `probe(step: str, *, run: str = "round1", n: int = 0) -> dict[str, Any]` returns the n-th
+    logged entry for `step` from `tests/fixtures/alpaca/order_probes_20261112.json`.
+  - `ACCOUNT` is the existing recorded account dict.
+  - `order_from(body: dict[str, str]) -> BrokerOrder` builds the order a probe sent (Decimals
+    from the strings).
+  - `KEY`, `SECRET` (test constants).
+  - `class Router`:
+    - `add(method: str, path: str, status: int, json: Any = None, *, content: bytes | None = None,
+      repeat: bool = False)`. `path` is the URL path including `/v2`, without the query. Each
+      add queues one response; `repeat=True` serves it forever.
+    - `.requests: list[httpx.Request]` records every request.
+    - `.unrouted: list[str]`: a request with no queued response is recorded here as
+      `"METHOD path"`, then raises `RuntimeError("unrouted ...")`. Every test that uses a Router
+      ends with `assert router.unrouted == []`, so a mis-keyed route cannot pass as an
+      `unknown` (review I6).
+    - `.transport` is the `httpx.MockTransport` over it.
+
+  In `test_alpaca.py`, three module constants: `CHANGED: dict[str, str]` holds one wrong value
+  per ack field (another client id, `"ETH/USD"`, `"sell"`, `"market"`, `"gtc"`, qty plus one
+  increment, limit plus one cent). `CONTRACT` and `STATUS_TABLE` are lists with one row per row
+  of the spec 3.3 and 3.4 tables (sketched below).
 
 - [ ] **Step 2: Write the failing tests** (`test_alpaca.py`; named per acceptance item)
 
 ```python
 async def broker(router: Router, *, orders_enabled: bool = True, **kw: Any) -> AlpacaBroker:
-    http = AlpacaHttp(base_url=PAPER_URL, key_id="k", secret_key="s", transport=router.transport)
+    http = AlpacaHttp(base_url=PAPER_URL, key_id=KEY, secret_key=SECRET, transport=router.transport)
     return AlpacaBroker(http, paper=True, fees=FEE_TIERS[1], orders_enabled=orders_enabled, **kw)
 
+
 async def test_recorded_entry_and_exit_acks_pass_unchanged() -> None:
-    for run, step in (("round1", "E-entry"), ("round1", "H-exit"), ("round2", "I-sell-half"),
-                      ("round2", "C2-ioc-nofill"), ("round2", "D2-gtc-rest")):
+    for run, step in (
+        ("round1", "E-entry"), ("round1", "H-exit"), ("round2", "I-sell-half"),
+        ("round2", "C2-ioc-nofill"), ("round2", "D2-gtc-rest"),
+    ):
         entry = probe(step, run=run)
-        r = Router(); r.add("POST", "/v2/orders", 200, entry["json"])
+        r = Router()
+        r.add("POST", "/v2/orders", 200, entry["json"])
         ack = await (await broker(r)).submit_order(order_from(entry["body"]))
         assert (ack.order_id, ack.status) == (entry["json"]["id"], "new")
-        sent = json.loads(r.requests[0].content)
-        assert sent == entry["body"]  # exact wire shape, decimals as plain strings
+        assert json.loads(r.requests[0].content) == entry["body"]  # exact wire shape
+        assert r.unrouted == []
 
-@pytest.mark.parametrize("field", ["client_order_id", "symbol", "side", "type", "time_in_force", "qty", "limit_price"])
+
+@pytest.mark.parametrize(
+    "field", ["client_order_id", "symbol", "side", "type", "time_in_force", "qty", "limit_price"]
+)
 async def test_each_ack_field_mismatch_raises_and_logs_the_broker_id(field: str) -> None:
     entry = probe("E-entry")
-    bad = {**entry["json"], field: CHANGED[field]}  # CHANGED: one wrong value per field
-    r = Router(); r.add("POST", "/v2/orders", 200, bad)
+    r = Router()
+    r.add("POST", "/v2/orders", 200, {**entry["json"], field: CHANGED[field]})
     with capture_logs() as logs, pytest.raises(BrokerError) as e:
         await (await broker(r)).submit_order(order_from(entry["body"]))
     assert type(e.value) is BrokerError
-    (line,) = [l for l in logs if l["event"] == "alpaca.ack_mismatch"]
+    (line,) = [x for x in logs if x["event"] == "alpaca.ack_mismatch"]
     assert line["order_id"] == entry["json"]["id"] and line["fields"][0].startswith(field)
 
+
+async def test_get_order_with_another_id_is_a_broker_error() -> None:  # builder call, review I4
+    resting = probe("D2-resting", run="round2")["json"]
+    r = Router()
+    r.add("GET", "/v2/orders/other-id", 200, resting)
+    with pytest.raises(BrokerError, match="request"):
+        await (await broker(r)).get_order("other-id")
+
+
+@pytest.mark.parametrize("bad", ["../account", "", "a/b", "id?x=1", "id with space"])
+async def test_unsafe_order_ids_are_refused_before_io(bad: str) -> None:  # review M6
+    r = Router()
+    b = await broker(r)
+    for call in (b.get_order(bad), b.cancel_order(bad)):
+        with pytest.raises(BrokerError):
+            await call
+    assert r.requests == []
+
+
+async def test_writes_are_refused_before_io_while_disabled() -> None:
+    resting = probe("D2-resting", run="round2")["json"]
+    oid = resting["id"]
+    r = Router()
+    r.add("GET", f"/v2/orders/{oid}", 200, resting)
+    b = await broker(r, orders_enabled=False)
+    with pytest.raises(OrderMethodsUnavailable):
+        await b.submit_order(order_from(probe("E-entry")["body"]))
+    with pytest.raises(OrderMethodsUnavailable):
+        await b.cancel_order(oid)
+    assert b.can_place_orders() is False and r.requests == []
+    assert (await b.get_order(oid)).status == "new"  # reads still work
+
+
+def test_orders_enabled_with_a_live_account_is_refused() -> None:
+    http = AlpacaHttp(base_url=LIVE_URL, key_id=KEY, secret_key=SECRET)
+    with pytest.raises(BrokerError, match="paper accounts only"):
+        AlpacaBroker(http, paper=False, fees=FEE_TIERS[1], orders_enabled=True)
+
+
+async def test_asset_rules_are_cached_for_five_minutes() -> None:
+    now = [0.0]
+    r = Router()
+    r.add("GET", "/v2/assets/BTC/USD", 200, probe("0-asset")["json"], repeat=True)
+    b = await broker(r, monotonic=lambda: now[0])
+    await b.asset_rules("BTC/USD")
+    now[0] = 299.0
+    await b.asset_rules("BTC/USD")
+    assert len(r.requests) == 1
+    now[0] = 300.0
+    await b.asset_rules("BTC/USD")
+    assert len(r.requests) == 2
+
+
+async def test_aclose_closes_both_clients() -> None:  # review M11
+    b = await broker(Router())
+    await b.aclose()
+    assert b._http.closed
+```
+
+Sketches (names and assertions binding):
+
+```python
 @pytest.mark.parametrize(("method", "status", "body", "raised"), CONTRACT)  # every 3.3 row
-async def test_status_contract(method: str, status: int, body: Any, raised: type[BaseException] | None) -> None: ...
-    # CONTRACT rows: submit 403 json -> OrderRejected; submit 403 text -> BrokerError;
-    # submit 400/401/404/422/429/500/503 -> BrokerError (exact class); get_order 404 -> OrderNotFound;
-    # get_order 500 -> BrokerError; by_client_id 404 -> None (raised=None, result None);
-    # cancel 204 -> None; cancel 422 (probe G-cancel-final) -> BrokerError (exact);
-    # cancel 404 (probe A-cancel-unknown-id) -> OrderNotFound; account 500 -> BrokerError
+async def test_status_contract(...) -> None: ...
+    # submit 403 json -> OrderRejected; submit 403 text -> BrokerError;
+    # submit 400/401/404/422/429/500/503 -> BrokerError (exact class);
+    # get_order 404 -> OrderNotFound; get_order 500 -> BrokerError;
+    # by_client_id 404 -> None (raised=None, result None); cancel 204 -> None;
+    # cancel 422 (probe G-cancel-final) -> BrokerError (exact);
+    # cancel 404 (probe A-cancel-unknown-id) -> OrderNotFound; account 500 -> BrokerError.
+    # Every BrokerError message from a response contains "request" and the X-Request-ID.
 
 @pytest.mark.parametrize(("raw", "filled", "ours"), STATUS_TABLE)  # every 3.4 row
 def test_status_mapping(raw: str, filled: str, ours: str) -> None:
     assert order_state(raw, Decimal(filled)) == ours
 
-@pytest.mark.parametrize("raw", ["done_for_day", "replaced", "pending_replace", "stopped", "suspended",
-                                 "calculated", "held", "accepted_for_bidding", "brand_new"])
+@pytest.mark.parametrize("raw", ["done_for_day", "replaced", "pending_replace", "stopped",
+                                 "suspended", "calculated", "held", "accepted_for_bidding",
+                                 "brand_new"])
 def test_unlisted_statuses_raise(raw: str) -> None:
     with pytest.raises(UnknownOrderStatus) as e:
-        order_state(raw, Decimal(0))
-    assert e.value.status == raw
+        order_state(raw, Decimal(0), "rid-9")
+    assert e.value.status == raw and "rid-9" in str(e.value)
 
-async def test_writes_are_refused_before_io_while_disabled() -> None:
-    r = Router(); r.add("GET", "/v2/orders/o-1", 200, probe("D2-resting", run="round2")["json"])
-    b = await broker(r, orders_enabled=False)
-    with pytest.raises(OrderMethodsUnavailable):
-        await b.submit_order(order_from(probe("E-entry")["body"]))
-    with pytest.raises(OrderMethodsUnavailable):
-        await b.cancel_order("o-1")
-    assert b.can_place_orders() is False and len(r.requests) == 0
-    await b.get_order("o-1")  # reads still work
-
-def test_orders_enabled_with_a_live_account_is_refused() -> None:
-    with pytest.raises(BrokerError, match="paper accounts only"):
-        AlpacaBroker(AlpacaHttp(base_url=LIVE_URL, key_id="k", secret_key="s"),
-                     paper=False, fees=FEE_TIERS[1], orders_enabled=True)
-
-async def test_asset_rules_are_cached_for_five_minutes() -> None:
-    now = [0.0]
-    r = Router(); r.add("GET", "/v2/assets/BTC/USD", 200, probe("0-asset")["json"], repeat=True)
-    b = await broker(r, monotonic=lambda: now[0])
-    await b.asset_rules("BTC/USD"); now[0] = 299.0; await b.asset_rules("BTC/USD")
-    assert len(r.requests) == 1
-    now[0] = 300.0; await b.asset_rules("BTC/USD")
-    assert len(r.requests) == 2
-
-async def test_connect_closes_the_clients_when_validation_fails_or_is_cancelled() -> None:
-    # (a) crypto_status "INACTIVE" -> BrokerError; (b) a handler that blocks on an event, the
-    # connect task cancelled after the request started. In both, the AlpacaHttp the connect
-    # built is closed: monkeypatch `autotrader.broker.alpaca.AlpacaHttp` with a subclass that
-    # records its instances, then assert `instance.closed`.
+async def test_connect_closes_the_clients_when_validation_fails_or_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None: ...
+    # monkeypatch `autotrader.broker.alpaca.AlpacaHttp` with a subclass that records its
+    # instances. (a) crypto_status "INACTIVE" -> BrokerError; (b) a handler that blocks on an
+    # event, the connect task cancelled after the request started. Each instance is closed.
 ```
 
 Plus the Review Focus tests named above (JSON number, HTML 2xx, nanosecond/naive timestamps,
-`BTCUSD` ack symbol, ack with `held`), and the read-side tests ported from the old file
-(account Decimals, crypto positions only, `BTCUSD` positions, asset rules, unknown
-`crypto_tier`, missing keys, `ALLOW_LIVE`).
+`BTCUSD` ack symbol, ack with `held`).
+
+**Existing `test_alpaca.py` tests (review I8)**. Every one is kept, ported to the Router, or
+dropped with its reason:
+
+| Existing test | Fate |
+|---|---|
+| `test_satisfies_broker_protocol` | port (mypy structural check, now including `aclose`) |
+| `test_account_values_are_exact_decimals` | port |
+| `test_fee_schedule_follows_account_crypto_tier` | port |
+| `test_unknown_crypto_tier_refuses_to_guess_fees` | port (and the clients end closed) |
+| `test_inactive_crypto_account_is_refused` | port (folded into the connect-cleanup test's case (a) plus its own message check) |
+| `test_live_mode_requires_allow_live` | port (no client is built) |
+| `test_asset_rules_from_raw_strings` | port, on the recorded `0-asset` probe |
+| `test_unknown_asset_is_a_broker_error` | port (404 from `/v2/assets/...`) |
+| `test_crypto_positions_use_slash_symbols` | port |
+| `test_order_methods_are_not_available_until_wp_1_6` | drop: replaced by `test_writes_are_refused_before_io_while_disabled` |
+| `test_fee_tiers_match_published_schedule` | keep unchanged |
+| `test_unmappable_position_symbol_is_a_broker_error` | port |
+| `test_connect_without_keys_is_a_broker_error` | port (no client is built) |
+| `test_connect_failures_are_broker_errors` | port: transport errors on `GET /account` during connect; `ConnectError` gives `RequestNotSent` (still a `BrokerError`) |
+| `test_account_read_failures_are_broker_errors` | port, same parametrisation over the transport |
+| `test_position_read_failures_are_broker_errors` | port, same |
+| `test_error_messages_do_not_echo_sdk_messages` | port: a handler raising an httpx error whose message contains a marker string; the marker is not in `str(exc)` |
+| `test_malformed_account_payload_is_a_broker_error` | port |
+| `test_malformed_position_payload_is_a_broker_error` | port |
+| `test_cancellation_is_not_swallowed` | port: a blocking handler, task cancelled, `CancelledError` propagates |
+| `test_order_fills_is_not_implemented_until_wp_1_6` | port: `order_fills` raises `OrderMethodsUnavailable` mentioning 1.6b |
+| `test_order_methods_raise_the_typed_unavailable_error` | drop: covered by the writes-disabled test |
 
 - [ ] **Step 3: Run them to see them fail**
 
@@ -838,9 +1147,16 @@ Expected: FAIL (`AlpacaBroker` has no `http` constructor).
   threads), the error contract by reference to the spec 3.3 table, writes refused until 1.6d,
   `order_fills` until 1.6b, and the `asset_rules` cache. `cli.py` still passes
   `AlpacaBroker.connect` (signature-compatible).
-- [ ] **Step 5: Full check.** Expected: green. Also `uv run pytest -m smoke --collect-only -q`:
+- [ ] **Step 5: Smoke tests (acceptance 16, review M11).** In
+  `tests/smoke/test_alpaca_paper.py` the `broker` fixture becomes an async generator:
+  `yield` the connected broker, then `await broker.aclose()`. Without that, a real run fails on
+  `ResourceWarning`. Add two read-only tests that place no orders:
+  - `test_unknown_order_id_is_not_found`: `get_order(str(uuid4()))` raises `OrderNotFound`;
+  - `test_unknown_client_id_lookup_is_none`: `get_order_by_client_id(f"smoke-{uuid4()}")`
+    returns `None`.
+- [ ] **Step 6: Full check.** Expected: green. Also `uv run pytest -m smoke --collect-only -q`:
   the smoke module still imports.
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/autotrader/broker/alpaca.py tests/unit/broker/ tests/smoke/test_alpaca_paper.py
@@ -862,28 +1178,47 @@ contract gaps between Tasks 3 and 5 that each task's own stubs cannot.
   `tests/unit/risk/test_engine.py`: sessions fixture, gate, baseline, `FakeView`), `Router`
   (Task 5), `AlpacaBroker(..., orders_enabled=True)`.
 
-- [ ] **Step 1: Write the tests**
+- [ ] **Step 1: Write the tests** (sketch: names and assertions binding). Setup reuses the
+  construction from `test_exit_submits_a_namespaced_market_sell_of_the_free_qty`: its
+  `ExitRequest` and the file's `orders(sessions)` helper (filter `side == "sell"`). The broker
+  is a spy subclass that records what its `submit_order` raised, because the engine turns any
+  `Exception` into `unknown`. Without the spy, a mis-keyed route or a parse bug would pass the
+  `unknown` rows (review I6):
 
 ```python
-@pytest.mark.parametrize(("outcome", "row_status"), [
-    (("status", 422, probe("F-duplicate-cid")["json"]), "unknown"),
-    (("status", 403, probe("B-below-min")["json"]), "rejected"),
-    (("raise", httpx.ConnectError), "not_submitted"),
-    (("raise", httpx.ConnectTimeout), "not_submitted"),
-    (("raise", httpx.PoolTimeout), "not_submitted"),
-    (("raise", httpx.WriteError), "unknown"),
-    (("raise", httpx.ReadTimeout), "unknown"),
-    (("raise", httpx.RemoteProtocolError), "unknown"),
+class Spy(AlpacaBroker):
+    raised: list[BaseException]
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        try:
+            return await super().submit_order(order)
+        except BaseException as e:
+            self.raised.append(e)
+            raise
+
+@pytest.mark.parametrize(("outcome", "row_status", "cause"), [
+    (("status", 422, probe("F-duplicate-cid")["json"]), "unknown", BrokerError),
+    (("status", 403, probe("B-below-min")["json"]), "rejected", OrderRejected),
+    (("raise", httpx.ConnectError), "not_submitted", RequestNotSent),
+    (("raise", httpx.ConnectTimeout), "not_submitted", RequestNotSent),
+    (("raise", httpx.PoolTimeout), "not_submitted", RequestNotSent),
+    (("raise", httpx.WriteError), "unknown", BrokerError),
+    (("raise", httpx.ReadTimeout), "unknown", BrokerError),
+    (("raise", httpx.RemoteProtocolError), "unknown", BrokerError),
 ])
-async def test_submit_outcomes_through_the_engine(outcome, row_status, ...) -> None:
+async def test_submit_outcomes_through_the_engine(outcome, row_status, cause, ...) -> None:
     # account/positions/asset routes answer from the probes; POST /v2/orders answers `outcome`
-    result = await engine.exit(exit_request(BTC))   # exits need no feed; one held position
-    (row,) = await sell_rows(sessions)
+    result = await engine.exit(request)  # exits need no feed; one held position
+    (row,) = [o for o in await orders(sessions) if o.side == "sell"]
     assert (result.status, row.status) == (row_status, row_status)
+    assert [type(e) for e in spy.raised] == [cause]  # exact class, not a subclass
+    assert [r.method for r in router.requests if r.url.path == "/v2/orders"] == ["POST"]
+    assert router.unrouted == []
 
 async def test_an_unknown_status_row_becomes_an_unknown_status_incident(...) -> None:
-    # row with broker id; GET /v2/orders/{id} and the client-id lookup answer status "held";
-    # sync_orders twice around order_resolution_timeout_s -> incident reason "unknown_status"
+    # row with broker id; GET /v2/orders/{id} and the client-id lookup answer status "held"
+    # (repeat=True). Pass 1 and a pass after order_resolution_timeout_s, each followed by
+    # `ledger.apply_all(result)` so start_clock is persisted (review M9): the row's incident
+    # is "unknown_status"; router.unrouted == [].
 ```
 
 - [ ] **Step 2: Run them.** Expected: PASS without code changes. A failure means a contract
@@ -924,9 +1259,13 @@ part).
 - Produces: `cli_repair._prepare`: after a successful `connect_broker`, `prepare_link` runs in
   `try/finally` with `await broker.aclose()`.
 
-- [ ] **Step 1: Write the failing tests** (`test_runtime.py`; `FakeBroker` gets `closed: bool`
-  set by `aclose`, and `GatedAccount(FakeBroker)` whose first `get_account` call (the startup
-  check) waits on an event)
+- [ ] **Step 1: Write the failing tests** (sketch: names and assertions binding).
+  `test_runtime.py` helpers:
+  - `FakeBroker` gets `closed: bool`, set by `aclose`.
+  - Existing: `sim_connect(broker)` (the connect callable), `LiveBroker` (mode `"live"`),
+    `make_control(timeout_s=...)`, `start_core`, `StopRaceSource`.
+  - New: `GatedAccount(FakeBroker)`. Its first `get_account` call (the startup check) waits on
+    an event; later calls answer at once.
 
 ```python
 async def test_a_clean_shutdown_closes_the_broker(...) -> None:
@@ -935,9 +1274,9 @@ async def test_a_clean_shutdown_closes_the_broker(...) -> None:
     assert await task == 0 and broker.closed
 
 async def test_a_mode_mismatch_closes_the_broker(...) -> None:
-    broker = LiveFakeBroker()  # mode() == "live" against a paper config
+    broker = LiveBroker()  # mode() == "live" against a paper config
     with pytest.raises(RuntimeError, match="does not match"):
-        await start_core(cfg, lock, control, connect_broker=returning(broker))
+        await start_core(cfg, lock, control, connect_broker=sim_connect(broker))
     assert broker.closed
 
 async def test_a_stop_during_the_backfill_closes_the_broker(...) -> None:  # StopRaceSource-style
@@ -948,16 +1287,19 @@ async def test_a_failing_or_timed_out_startup_check_closes_the_broker(...) -> No
     # get_account raises -> closed; timeout_s=0.01 with a get_account that waits on an
     # event never set -> TimeoutError and closed (outcome only, no timing assert)
 async def test_a_forced_broker_close_makes_the_exit_unclean(...) -> None:
-    # aclose waits on an event never set; teardown deadline passes -> "broker" in the
-    # forced steps, exit code EXIT_FAILED
+    # aclose waits on an event never set; make_control(timeout_s=0.5) so the deadline passes
+    # quickly in real time (plus the 1 s engine.dispose floor, as in the existing forced-step
+    # tests) -> "broker" in the forced steps, exit code EXIT_FAILED (review M12)
 ```
 
-`test_cli_repair.py`:
+`test_cli_repair.py` (synchronous tests on the file's `Rig` / `rig` fixture, like
+`test_link_mismatch_lists_the_difference` and `test_link_applies_and_records_the_operator`;
+`connect_to(broker)` is the existing connect helper):
 
 ```python
-async def test_link_closes_the_broker_on_refusal_and_success(...) -> None:
-    # a SimBroker subclass recording aclose; a refused link (no match) and an applied link
-    # each leave it closed
+def test_link_closes_the_broker_on_refusal_and_success(rig: Rig) -> None:
+    # a SimBroker subclass whose aclose sets `closed`; a refused link (qty mismatch) and an
+    # applied link each leave it closed. A failing connect has nothing to close (unchanged).
 ```
 
 - [ ] **Step 2: Run them to see them fail**
@@ -967,7 +1309,10 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement** per Interfaces. Runtime module docstring: one sentence on broker
   ownership (connect, check, holder, teardown step `broker`) and the startup check timeout.
-  `_teardown` docstring: the step order now includes `broker`.
+  `_teardown` docstring: the step order now includes `broker`. `cli_repair.py` module
+  docstring: replace "The broker is not closed: the `Broker` protocol has no close ..." with
+  "`link` closes the broker in a `finally` after the lookup (D22 (8))" (review M3; the Task 8
+  patterns do not match this sentence).
 - [ ] **Step 4: Full check.** Expected: green.
 - [ ] **Step 5: Commit**
 
@@ -992,7 +1337,11 @@ Spec section 4, plus the user rule: correct every claim the change falsified, fi
   where the request id appears.)
 - Modify: `docs/alpaca-notes.md` (transport facts: alpaca-py has no timeout and retries POST,
   and trading calls no longer use it; rate limit 200/min; the request-budget numbers above; the
-  httpcore verification results with versions and "re-check on httpx/httpcore upgrade")
+  httpcore facts 1-5 and the conditions (no proxy, HTTP/1.1, `retries=0`, anyio) with the
+  httpx, httpcore and anyio versions; the connect timeout applying to TCP and TLS separately
+  (`RequestNotSent` after up to 6 s); the closing network backend, why it exists (C1) and the
+  private `_pool._network_backend` hook; "re-check all of this on any httpx, httpcore or
+  anyio upgrade")
 - Modify: `CLAUDE.md` (`run core` line: "no orders until WP 1.6" becomes 1.6d; "disabled with
   Alpaca until 1.6" becomes 1.6d)
 - Modify: `PLAN.md` (dated 2026-11-22 note on the 1.6 row: 1.6a implemented, plan path; the

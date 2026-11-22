@@ -56,6 +56,12 @@ What it does **not** do (later sub-WPs):
   within budget. Both are preconditions of 1.6d enabling paper writes. Isolating DNS inside the
   trading transport (a custom httpcore network backend that resolves in a dedicated pool) was
   considered and not chosen: more code on the order path for what one dedicated pool also solves.
+  **2026-11-22 (owner, D22 (9), after a Fable review of the plan):** a narrower backend *is*
+  added, for a different reason. httpcore's `start_tls` closes the socket only on `Exception`,
+  so a request cancelled during the TLS handshake left an open socket that `aclose()` cannot
+  reach. The backend wraps httpcore's anyio backend, resolves nothing itself, and only closes
+  the stream on cancellation. This makes the "both clients closed" claims of 3.7 and acceptance 15
+  hold for that case too.
 
 **Why own the transport.** alpaca-py 0.44's `TradingClient` is synchronous `requests` code
 (the package's only async code is the websocket streams). It sends every request without a
