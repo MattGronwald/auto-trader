@@ -1,11 +1,15 @@
 # Alpaca order methods design (WP 1.6a)
 
-Date: 2026-11-12. Status: owner decisions in chat 2026-11-12, recorded as PLAN D22; this written
-spec is in review. Choices made here that D22 does not fix are marked **(builder call)**.
-Revised 2026-11-12 after the cold builder check (before review): the send bound in 3.1 was wrong
-(shared engine budget, unbounded DNS, the request is written under the connect timeout); owner
-chose a no-send-after-deadline guard (D22.5, 3.2). SimBroker's cancel follows the Alpaca contract
-and the Session is shared (both builder calls, 3.1, 3.8).
+Date: 2026-11-12. Status: owner decisions in chat 2026-11-12 and 2026-11-22, recorded as PLAN
+D22; this written spec is in review. Choices made here that D22 does not fix are marked
+**(builder call)**.
+Revised before review, twice: (1) a cold builder check showed that timeouts alone bound neither
+DNS nor a call that starts late in a shared engine budget; (2) a Fable architecture review
+(2026-11-22, verdict "needs changes") found that a provably unsent exit was recorded `unknown` and
+never retried, and that a thread-based transport cannot stop a cancelled caller from sending or
+keep hung threads from starving exits. Owner decisions on that review: async `httpx` instead of
+`requests` (D22.1, revised) and provably unsent requests become `not_submitted` (D22.5, revised).
+The review's other findings are folded in and marked "Fable".
 
 ## 1. Scope and intent
 
@@ -16,32 +20,53 @@ possible. It is split into four sub-WPs (PLAN 1.6 row, owner 2026-11-12); this i
 
 1.6a delivers the adapter's order side and a trading-API transport we control:
 
-1. **Our own HTTP layer** for every trading-API call (D22.1), replacing `TradingClient`, that
-   never starts a send after the engine has given up on the call (D22.5).
+1. **An async HTTP transport on `httpx`** for every trading-API call (D22.1), replacing
+   `TradingClient`. No worker threads; cancelling or timing out the caller stops the request.
 2. **`submit_order`, `cancel_order`, `get_order`, `get_order_by_client_id`** for Alpaca, with
    ack validation and one error contract mapped from the probed status codes (D22.2).
-3. **`BrokerOrderView` gains order type, limit price and time in force**, and the resolver's
+3. **Provably unsent requests are `not_submitted`** (D22.5): a failure before any byte of the
+   request was written is retried by the existing paths instead of becoming an operator incident.
+4. **`BrokerOrderView` gains order type, limit price and time in force**, and the resolver's
    match check compares them (PR #35 finding m2).
-4. **`close_position`, `close_all` and `stream_fills` leave the `Broker` protocol** (D22.3).
+5. **`close_position`, `close_all` and `stream_fills` leave the `Broker` protocol** (D22.3).
 
 What it does **not** do (later sub-WPs):
 
 - No order reaches Alpaca from the runtime. `can_place_orders()` stays false, and the adapter
-  refuses order writes on its own as well (3.7). Enabling is 1.6d.
+  refuses order writes on its own as well (3.8). Enabling is 1.6d.
 - `order_fills` (activities API), `broker_fill_id`, fee/rounding and the 1.5b ledger hardening
   are 1.6b. `order_fills` keeps raising `OrderMethodsUnavailable`.
 - Buying power, broker max notional, quote/snapshot age, the $10 buy minimum in
   `AssetRules.min_notional` and full-close `min_notional` are 1.6c.
-- The market-data client (`broker/alpaca_data.py`) stays on alpaca-py. It has the same missing
-  HTTP timeout; that is noted, not fixed here.
+- The market-data client (`broker/alpaca_data.py`) stays on alpaca-py, which has no HTTP timeout
+  and runs in asyncio's default thread pool. Once trading calls no longer use that pool, a hung
+  market-data call can no longer delay an exit; it can still stall the feed's REST refresh. Fixing
+  it is added to 1.6c (PLAN 1.6 row), before 1.6d enables orders.
 
-**Why own the transport.** alpaca-py 0.44 sends every request without a timeout
-(`alpaca/common/rest.py`, `_request` builds `opts` with no `timeout`) and retries 429 and 504 up to
-three times with 3 s sleeps, POST included; `retry_attempts=0` is ignored (only values > 0 are
-taken). The engine bounds each call with `asyncio.wait_for` around `asyncio.to_thread`, which
-stops waiting but not the thread: the request can still be sent, or sent again, after the engine
-has recorded `unknown`. PLAN 3.2 item 4 requires a transport deadline that actually ends the work
-and makes "the original worker is quiescent (no later local send/retry)" true.
+**Why own the transport.** alpaca-py 0.44's `TradingClient` is synchronous `requests` code
+(the package's only async code is the websocket streams). It sends every request without a
+timeout (`alpaca/common/rest.py`, `_request` builds `opts` with no `timeout`), retries 429 and 504
+up to three times with 3 s sleeps, POST included, and `TradingClient.__init__` exposes neither
+setting (it passes only keys, `paper`, `raw_data`, `url_override` to its base class, whose
+`retry_attempts=0` is ignored anyway). Turning retries off and adding timeouts would mean writing
+to private attributes that an upgrade can silently undo.
+
+**Alternatives considered** (Fable I8):
+
+- *Keep alpaca-py, patch its private session.* Still threads (below), plus private-API coupling.
+- *Own `requests` transport in `asyncio.to_thread`* (the first version of this spec). A thread
+  cannot be stopped: a caller that times out or is cancelled (the Cycle Runner force-cancels a
+  `check()` still in its submit at shutdown, `core/cycle.py` `close`) leaves a worker that may still
+  connect and send; DNS has no timeout in that stack; and hung threads fill asyncio's default
+  executor (`min(32, cpus + 4)` workers, 5 on a 1-vCPU VPS), so an exit can wait for a thread until
+  its budget is spent. Fixing that needed a deadline token, an abandon flag, a urllib3 connection
+  subclass and dedicated executors.
+- *Separate process for broker I/O.* Strong isolation, far more machinery than the PoC needs.
+- **Chosen: `httpx.AsyncClient`.** The request runs as a coroutine on the event loop, so the
+  engine's `asyncio.wait_for` (and any cancellation) stops it where it is; a request whose
+  connection is not yet established is never written. The connect timeout covers DNS and TCP/TLS
+  setup. `httpx.MockTransport` is a built-in test seam. Cost: new dependencies (`httpx` with
+  `httpcore`, `anyio`, `h11`, `certifi`, `idna`).
 
 ## 2. Evidence (paper probes, 2026-11-12)
 
@@ -61,83 +86,116 @@ in `tests/fixtures/alpaca/order_probes_20261112.json`. What this design relies o
 | lookup by client id after submit | found on the first lookup, 0.22–0.30 s after sending |
 
 Bounded: one sample per symbol, paper only. The visibility bound stays the configured 60 s
-`order_visibility_allowance_s`.
+`order_visibility_allowance_s`. Rate limit (Alpaca support and docs, checked 2026-11-22): **200
+requests per minute per account** on the trading API, 429 above it.
 
 ## 3. Design
 
 ### 3.1 Transport (D22.1)
 
-A small module, `broker/alpaca_http.py` **(builder call: name)**, owns a `requests.Session`:
+A small module, `broker/alpaca_http.py` **(builder call: name)**, owns two `httpx.AsyncClient`s
+created by `AlpacaBroker.connect` and closed by `AlpacaBroker.aclose()` (3.7):
 
-- Base URL from the mode: `https://paper-api.alpaca.markets/v2` for paper, the live URL only when
-  `AlpacaBroker.connect` already allowed live (unchanged `ALLOW_LIVE` gate). Auth headers
-  `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY` set once on the session; never logged, never in an
-  exception message.
-- Every request: `timeout=(3, 5)` (connect, read), `allow_redirects=False`, **no retries** of any
-  kind (no urllib3 `Retry`, no loop). A 429 or 5xx is returned to the caller as a failure.
-- **What the timeouts alone do not bound** (urllib3 2.x, read, not run): the DNS lookup
-  (`getaddrinfo`) has no timeout; the connect timeout applies per resolved address (IPv4 + IPv6 can
-  take 2 x 3 s); the request is written under the connect timeout. And the engine budget is shared
-  per locked section (`check()` spends it on the gate and several reads before `submit_order`), so
-  a call may start with 1-2 s left. Without 3.2, a thread could send after the engine recorded
-  `unknown`, by an unbounded amount. Without retries the request is still sent **at most once**.
-- One `requests.Session` per `AlpacaBroker`, shared by the worker threads, with headers set once
-  and never mutated afterwards and an explicitly sized connection pool **(builder call)**:
-  concurrent calls (entries, exits, the sync, snapshots, the cash check) then share only urllib3's
-  thread-safe pool.
-- Calls run in `asyncio.to_thread`, as today. The engine's `_within` stays the outer budget.
-- **(builder call)** whether to also enforce a total read deadline; the read side cannot create an
-  order, so 3.2 does not need it.
+- **Read client** (GETs): keep-alive pool, small explicit `httpx.Limits` **(builder call: sizes)**.
+- **Write client** (`POST /orders`, `DELETE /orders/{id}`): **no connection reuse**
+  (`max_keepalive_connections=0`), so every write opens a fresh connection (Fable I3). A pooled
+  keep-alive connection that the server or a NAT dropped silently can accept the write locally and
+  then fail, turning a request Alpaca never processed into `unknown`. A fresh TLS connection costs
+  about 0.1 s against a 10 s budget.
+- Both: base URL from the mode (`https://paper-api.alpaca.markets/v2` for paper; live only where
+  `AlpacaBroker.connect` already allows it, unchanged `ALLOW_LIVE` gate), auth headers
+  `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY` set once, `httpx.Timeout(connect=3, write=5, read=5,
+  pool=2)` **(builder call:** `pool`), `follow_redirects=False`, `trust_env=False` (no env proxies,
+  no `.netrc`, no `SSL_CERT_FILE` override), TLS verification on and never overridden, cookies not
+  kept **(builder call:** mechanism, e.g. a cookie jar whose policy accepts none) (Fable M2).
+- **No retries of any kind:** the default transport (`retries=0`), no loop. A 429 or 5xx is
+  returned to the caller as a failure.
 - Decimals go out as plain strings (`format(d, "f")`, no exponent); responses are parsed with
-  `Decimal(str)` from the raw JSON strings, as the read side does today.
+  `Decimal(str)` from the JSON strings, as the read side does today.
+- **One log line per call** (Fable M1): `alpaca.http` with method, path template (the order id as
+  its own field), status or exception type, elapsed ms and Alpaca's `X-Request-ID`. Non-2xx
+  responses add Alpaca's `message`. Never headers, never keys. The request id also goes into every
+  `BrokerError` message raised from a response.
+- **Request budget** (Fable I5): `asset_rules` is cached per symbol for 5 minutes **(builder
+  call:** TTL). Today the 2 s sync loop calls it once per symbol per pass, and `exit()`/`check()`
+  once per held symbol; uncached, three unsettled orders on three symbols already use about 180 of
+  the 200 requests per minute. The probed `min_order_size` (about $1) moves with price, but the $10
+  buy minimum dominates it (alpaca-notes), so a 5-minute value is safe. The plan states the
+  expected steady-state and peak request rate.
 
-`requests` becomes a direct dependency (it is already installed through alpaca-py);
-`types-requests` a dev dependency for mypy. alpaca-py stays for market data.
+`httpx` becomes a direct dependency; `requests` is not added. alpaca-py stays for market data.
 
-### 3.2 No send after the deadline (D22.5)
+### 3.2 When a request is "not sent" (D22.5)
 
-Invariant: **no request starts being written after the caller's deadline.** A write that started in
-time finishes or fails within the connect timeout (3 s). Hence, once the engine's `_within` has
-raised `TimeoutError` and the row is `unknown`, the worker can no longer create an order later
-than about 3 s after that deadline, however long DNS, connect or TLS took. This is the "original
-worker is quiescent" condition of PLAN 3.2 item 4, and the "one total transport deadline per call
-within the engine I/O budget" of the PLAN 1.6 row.
+**Invariant 1, no late send.** A request is written only while its caller is still waiting for
+it. When the engine's `_within` times out (`asyncio.wait_for`) or the caller is cancelled, the
+coroutine is cancelled at its current await. If the connection is not yet established (DNS, TCP,
+TLS, or waiting for a pool slot), nothing is written, ever. If cancellation lands while the
+request is being written, the request is cut off mid-way and the connection closed; an HTTP server
+does not act on an incomplete request **(builder call:** verify against the installed httpcore
+that a cancelled write closes the connection rather than finishing it). If the request was fully
+written, the order may exist: `unknown`, as today. No thread outlives its caller, so this also
+holds for the forced cancel at shutdown (Fable I1).
 
-- **Deadline handoff, no protocol change.** `_within` (`risk/engine.py`) sets a context variable to
-  its absolute monotonic deadline for the duration of the call. `asyncio.to_thread` runs the
-  function in a copy of the current context, so the transport reads it in the worker thread. The
-  variable lives in a small shared module both sides import **(builder call:** module and name;
-  `broker/` must not import `risk/`).
-- **Fallback.** A call without a deadline in context (`AlpacaBroker.connect`, `cli_repair`'s
-  lookup, tests) uses its own start + 10 s **(builder call:** the value; same as the engine's
-  default `io_timeout_s`).
-- **Where the check sits.** After the connection is usable (DNS, TCP and TLS done, or a pooled
-  connection taken) and immediately before the request is written: a urllib3 connection subclass
-  (`request()` override) installed through a `requests` `HTTPAdapter` **(builder call:** exact hook;
-  it must sit after connect, not before the call starts). Past the deadline it raises a dedicated
-  error and writes nothing; the transport maps it to `BrokerError` (the engine already timed out,
-  so the row is `unknown` either way). Reads get the same check (no harm, one code path).
-- The same monotonic clock as the engine (`time.monotonic`) on both sides.
+**Invariant 2, provably not sent.** The transport raises **`RequestNotSent(BrokerError)`**
+(new, `broker/base.py`) when the request failed before any of it was written:
+
+| httpx outcome | Raised | Why |
+|---|---|---|
+| `ConnectError` (DNS failure, refused, TLS handshake failure) | `RequestNotSent` | the connection never existed |
+| `ConnectTimeout` | `RequestNotSent` | same |
+| `PoolTimeout` | `RequestNotSent` | no connection was handed out |
+| `WriteError`, `WriteTimeout`, `ReadError`, `ReadTimeout`, `RemoteProtocolError`, any other transport error | `BrokerError` | bytes may have reached the server |
+
+This leans on httpcore raising `ConnectError`/`ConnectTimeout` only from connection setup.
+**(builder call:** confirm in the installed httpcore that the HTTP/1.1 connection is fully
+established, TLS included, before the first request byte, and that no write-phase failure is
+reported as a connect error; pin `httpx`/`httpcore` to the verified minor versions and note
+"re-check on upgrade" in `docs/alpaca-notes.md`.) Because the write client never reuses
+connections, there is no stale-connection case in which a "connect" failure follows a write.
+
+The engine's own timeout (`TimeoutError` from `_within`) stays `unknown`: the engine cannot see
+whether the cancelled request had started writing. Only the transport's own errors carry proof.
+
+**Engine mapping.** `_submit` (`risk/engine.py`) catches `RequestNotSent` before the generic
+handler and records `not_submitted`, like `OrderMethodsUnavailable` today (log
+`risk.order_not_submitted`, reason "request not sent: <exception type>"). Effects through existing
+paths:
+
+- **Exit:** `not_submitted` reaches the Position Manager's backoff and is retried
+  (`position_manager.py`, the `backoff.fail` branch), which PLAN 3.2 item 5 requires for a
+  "proven-unsent exit". Before this change a short DNS or connect outage during a stop-out left the
+  row `unknown`, which is never retried, became an incident after 80 s, and needed a core-stopped
+  repair (Fable C1).
+- **Entry:** the cycle completes as the runner does for `not_submitted` today; no incident and no
+  all-symbol block after a restart.
+- `cancel_order` and reads: `RequestNotSent` is a `BrokerError`, so their callers treat it as a
+  failed call (a failed cancel is retried with backoff; a failed read fails the pass closed).
+
+**Resolver arithmetic** (Fable M5). An order can be created no later than the end of a write that
+started before the caller's deadline: at most `submitted_at + io_timeout_s + 5 s` (write timeout)
+= 15 s. The 80 s `order_resolution_timeout_s` still leaves the 60 s visibility allowance after it.
 
 ### 3.3 Error contract (D22.2)
 
 One mapping at the transport boundary. The engine's existing handling (`_submit`, `_sync`, the
-resolver) does the rest unchanged.
+resolver) does the rest.
 
 | Outcome | Raised | Engine result |
 |---|---|---|
-| connect error, timeout, connection reset, any 5xx, 429, malformed or unparsable body | `BrokerError` | submit: row `unknown` (resolver); reads: the pass fails closed |
-| submit **403** | `OrderRejected` (message: status and Alpaca's `message`) | row `rejected` |
-| submit **any other 4xx** (400, 401, 404, 422, …) | `BrokerError` | row `unknown`: the resolver looks the client id up. A 422 is also "client_order_id must be unique", which means an order with that id exists; it must be found, not recorded as rejected. A malformed order shape (a bug) becomes an operator incident after `order_resolution_timeout_s` instead of a silent rejection: deliberate |
+| failure before any byte was written (3.2) | `RequestNotSent` | submit: `not_submitted`; other calls: failed |
+| write/read error or timeout, any 5xx, 429, malformed or unparsable body | `BrokerError` | submit: row `unknown` (resolver); reads: the pass fails closed |
+| submit **403 with a parsable JSON body** | `OrderRejected` (status, Alpaca's `message`, request id) | row `rejected`. A 403 without a parsable body is `BrokerError` |
+| submit **any other 4xx** (400, 401, 404, 422, …) | `BrokerError` | row `unknown`: the resolver looks the client id up. A 422 is also "client_order_id must be unique", which means an order with that id exists; it must be found, not recorded as rejected. A malformed order shape (a bug) becomes an operator incident after `order_resolution_timeout_s` instead of a silent rejection: deliberate. 401 and 429 stay here in 1.6a; whether they may be `not_submitted` is a 1.6d decision with paper evidence (Fable I5) |
 | `get_order` **404** | `OrderNotFound` | resolver type (b), unchanged |
+| `get_order` with a status 3.4 does not list | `UnknownOrderStatus(BrokerError)` carrying the raw status | resolver type (b), like `OrderNotFound` (3.4) |
 | `get_order_by_client_id` **404** | returns `None` | resolver: zero match, unchanged |
 | `cancel_order` **204** | returns | |
-| `cancel_order` **422** | returns **(builder call)**: the order is already final; the next sync read books its real status. Logged at info | |
+| `cancel_order` **422** (order already final, e.g. filled) | `BrokerError` (Fable M4) | `cancel_open_entries` counts it `failed` and retries with backoff until the sync books the final status and it is no longer an open entry. Returning normally would put it into the Position Manager's `_cancel_requested`, which is never retried |
 | `cancel_order` **404** | `OrderNotFound` | |
 | any other non-2xx | `BrokerError` | |
 
-Never branch on Alpaca's body `code` (it was not stable across identical requests). Messages carry
-the HTTP status and Alpaca's `message`, never headers.
+Never branch on Alpaca's body `code` (it was not stable across identical requests).
 
 ### 3.4 Order mapping
 
@@ -149,8 +207,11 @@ Alpaca then assigns its own id, which the ack check below does not compare.
 
 **Ack validation.** A 200 is accepted only if the response's `client_order_id` (when we sent
 one), `symbol`, `side`, `type`, `time_in_force`, `qty` (Decimal equality) and `limit_price`
-(Decimal equality, both null for market) equal the request. Any difference raises `BrokerError`: the row becomes `unknown` and
-the resolver's match check decides with full information. `id` must be a non-empty string.
+(Decimal equality, both null for market) equal the request, and `id` is a non-empty string. Any
+difference raises `BrokerError`, so the row becomes `unknown` and the resolver's match check
+decides with full information. Before raising, the adapter logs `alpaca.ack_mismatch` at error
+level with the broker order id and each differing field (Fable M3): a live order exists, and the
+operator needs its id.
 
 **Status.** Alpaca → `OrderState`:
 
@@ -162,18 +223,28 @@ the resolver's match check decides with full information. `id` must be a non-emp
 | `filled` | `filled` |
 | `canceled`, `expired` | `canceled` (final; `expired` documented, not observed) |
 | `rejected` | `rejected` |
-| anything else (`done_for_day`, `replaced`, `pending_replace`, `stopped`, `suspended`, `calculated`, `held`, `accepted_for_bidding`, unknown values) | `BrokerError`: we never place orders that should reach them; fail closed rather than guess |
+| anything else (`done_for_day`, `replaced`, `pending_replace`, `stopped`, `suspended`, `calculated`, `held`, `accepted_for_bidding`, unknown values) | `UnknownOrderStatus`: we never place orders that should reach them; fail closed rather than guess |
+
+**An unknown status has a bounded path** (Fable I6). Today a `get_order` that raises anything but
+`OrderNotFound` fails the row on every 2 s pass, forever, and the row never becomes a resolver
+candidate (`engine.py` `_read`). `_read` catches `UnknownOrderStatus` like `OrderNotFound`: the
+row becomes a type (b) candidate (clock `resolve_since`), logged `risk.order_status_unknown` with
+the raw status. The resolver's client-id lookup meets the same status and reports `lookup_failed`,
+so after `order_resolution_timeout_s` the row is an incident with the existing reminder and
+`repair` path **(builder call:** a dedicated incident reason such as `unknown_status`, if it fits
+the existing reasons without a migration). The runbook gets a line on recognising it.
 
 `OrderAck.submitted_at` is the response's `submitted_at` (else `created_at`); `OrderStatus.reason`
-is null (Alpaca's order body has no rejection reason field we rely on). `avg_fill_price` from
-`filled_avg_price` (null until filled). Symbols map through the existing `_slash_symbol` (orders
-already use `BTC/USD`; positions use `BTCUSD`).
+is null. `avg_fill_price` from `filled_avg_price` (null until filled). Symbols map through the
+existing `_slash_symbol` (orders use `BTC/USD`, positions `BTCUSD`).
 
 ### 3.5 Reads on the new transport
 
 `get_account`, `get_positions`, `asset_rules` and the `connect` checks (`crypto_status`,
-`crypto_tier`) move to the transport with their current parsing unchanged; `RawTradingClient`
-and `_make_client` go. Their tests switch to the fake transport (3.9).
+`crypto_tier`) move to the read client with their current parsing unchanged; `RawTradingClient`,
+`_make_client` and `_call` (the `to_thread` wrapper) go. Startup's broker check
+(`core/runtime.py` `_check_broker`: `connect()` then `get_account()`) gets one overall timeout of
+`io_timeout_s` **(builder call)**, so a hung connect no longer blocks startup unbounded (Fable M7).
 
 ### 3.6 Match check: `BrokerOrderView` and `mismatches`
 
@@ -187,17 +258,29 @@ sends exactly two shapes, entry `limit`/`ioc` and exit `market`/`gtc`; one funct
 mismatch.) `repair link` gets the same comparison through `mismatches`. SimBroker's
 `get_order_by_client_id` fills the new fields from the order it stored.
 
-### 3.7 Writes stay off (defence in depth)
+### 3.7 Lifecycle
+
+`AlpacaBroker.aclose()` closes both clients. The runtime's teardown calls it after the runner,
+the Position Manager and the bus are closed; `cli_repair` calls it when done. SimBroker gets a
+no-op `aclose()` and the `Broker` protocol gains it **(builder call:** or the runtime calls it only
+when present).
+
+### 3.8 Writes stay off (defence in depth)
 
 Callers gate on `can_place_orders()` today (Position Manager, runtime admission), but `exit()`,
 `check()` and `cancel_open_entries()` themselves do not. So the adapter also refuses:
 `AlpacaBroker` takes `orders_enabled: bool = False`; while false, `submit_order` and
 `cancel_order` raise `OrderMethodsUnavailable` before any I/O (the engine records
-`not_submitted`, as today), and `can_place_orders()` returns `orders_enabled`. Nothing in 1.6a sets
-it true outside tests; 1.6d decides how it is enabled (paper only). `get_order` and
-`get_order_by_client_id` are always available, so `repair link` works against Alpaca from 1.6a on.
+`not_submitted`, as today), and `can_place_orders()` returns `orders_enabled`.
 
-### 3.8 Protocol cleanup (D22.3)
+- **Paper only from day one** (Fable I7): the constructor raises if `orders_enabled` is true and
+  the account is not paper. In 1.6a nothing outside tests sets it: `connect()` has no parameter or
+  setting that can. 1.6d decides how paper enabling works; live writes stay impossible before
+  Phase 5 (PLAN 1.6 row).
+- `get_order` and `get_order_by_client_id` are always available, so `repair link` works against
+  Alpaca from 1.6a on.
+
+### 3.9 Protocol cleanup (D22.3), SimBroker
 
 Remove `close_position`, `close_all` and `stream_fills` from `Broker`, from `AlpacaBroker`, and
 from SimBroker unless a remaining SimBroker test needs them. Test helpers that use
@@ -208,68 +291,79 @@ the behaviour for a full-holding sell). `redeliver` and its tests go with `strea
 ledger test depends on the redelivery mechanism, in which case it is re-expressed through
 `order_fills`.
 
-SimBroker's `cancel_order` follows the Alpaca contract **(builder call**, from the builder check):
-today it raises `OrderRejected` for an order that is already final, where Alpaca answers 204
-(already canceled) or 422 (filled), which 3.3 maps to a normal return. Cancelling a final order
-returns normally; an unknown id raises `OrderNotFound`. Engine tests that expect `failed` from
-`cancel_open_entries` for an already-final entry are adjusted, so they model Alpaca.
+SimBroker's `cancel_order` follows the Alpaca contract **(builder call**, from the builder
+check): an already-canceled order returns (Alpaca 204); a filled or rejected one raises
+`BrokerError` (Alpaca 422, 3.3); an unknown id raises `OrderNotFound`. Engine tests are adjusted
+so they model Alpaca.
 
-### 3.9 Tests
+Land the protocol cleanup and the SimBroker changes as their own commit(s), ahead of the
+transport, so the transport diff is reviewable alone (Fable M8).
 
-No test touches the network (CLAUDE.md). The transport takes an injectable "send" seam
-**(builder call:** a small fake object or a mocking library such as `responses`; a new dev
-dependency only if it saves real code). Fixtures come from
-`tests/fixtures/alpaca/order_probes_20261112.json`.
+### 3.10 Tests
 
-Acceptance (all against the fake transport unless noted):
+No test touches the network (CLAUDE.md). Adapter tests use `httpx.MockTransport` with fixtures
+from `tests/fixtures/alpaca/order_probes_20261112.json`.
 
-1. Each status code row of 3.3 raises or returns exactly as specified, for each method.
-2. A 422 "client_order_id must be unique" on submit is `BrokerError`, and through the engine the
-   row is `unknown`, not `rejected`; a 403 is `rejected`.
-3. Ack validation: each of the seven fields, changed alone, raises `BrokerError`; the recorded
-   probe acks pass unchanged.
-4. Every status in the 3.4 table maps as listed; an unlisted status raises.
-5. No retries: a 429, a 503 and a read timeout each cause exactly one send.
-6. Requests carry `timeout=(3, 5)` and no redirects; secrets appear in no log line and no
-   exception message (assert on captured logs and `str(exc)`).
-7. Decimals are sent without exponent (`Decimal("1E-7")` → `"0.0000001"`).
-8. `orders_enabled=False`: `submit_order` and `cancel_order` raise `OrderMethodsUnavailable` with
-   no send; `can_place_orders()` is false; `get_order` / `get_order_by_client_id` still work.
-9. `mismatches`: type, limit price and derived TIF differences are reported; the engine resolver
-   and `repair link` turn them into `client_id_mismatch` / a refusal.
-10. The three removed methods are gone from the protocol; mypy proves no caller remains.
-11. Deadline guard (3.2), with the guard's clock and the connection hook driven by the test:
-    a request whose connection becomes usable after the deadline (slow DNS/connect simulated) is
-    never written and raises `BrokerError`; one usable before the deadline is written once; the
-    context variable set by `_within` reaches the worker thread through `asyncio.to_thread`; a
-    call without a context deadline uses the fallback. Engine level: a `submit_order` that starts
-    with little budget left and whose connect outlasts it leaves the row `unknown` and nothing is
-    written afterwards.
-12. SimBroker `cancel_order` of a filled or canceled order returns; of an unknown id raises
+Acceptance (all against `MockTransport` unless noted):
+
+1. Each row of 3.3 raises or returns exactly as specified, for each method.
+2. Through the engine: a 422 "client_order_id must be unique" on submit leaves the row `unknown`;
+   a 403 `rejected`; `ConnectError`, `ConnectTimeout` and `PoolTimeout` `not_submitted`;
+   `WriteError`, `ReadTimeout` and `RemoteProtocolError` `unknown`.
+3. Position Manager: an exit whose submit raises `RequestNotSent` is retried on a later step after
+   its backoff, and the retry can succeed.
+4. Ack validation: each of the seven fields, changed alone, raises `BrokerError` and logs
+   `alpaca.ack_mismatch` with the broker id; the recorded probe acks pass unchanged.
+5. Every status in the 3.4 table maps as listed; an unlisted status raises `UnknownOrderStatus`,
+   and through `sync_orders` the row becomes a type (b) candidate and, after the resolution
+   timeout, an incident.
+6. No retries: a 429, a 503 and a `ReadTimeout` each reach the mock handler exactly once.
+7. Clients carry the specified timeouts, `trust_env=False`, no redirects, no keep-alive on the
+   write client; secrets appear in no log line and no exception message (captured logs and
+   `str(exc)`); each call logs `alpaca.http` with the request id.
+8. Decimals are sent without exponent (`Decimal("1E-7")` → `"0.0000001"`).
+9. **No late send** (Invariant 1), deterministic, events only, no sleeps: a handler that blocks on
+   an event, with the caller cancelled or timed out by `wait_for` before the event is set, records
+   no completed request. Plus one loopback test through the real `httpx` stack: an `asyncio` server
+   on 127.0.0.1 that records received bytes, the connection held in setup by the test, the caller
+   cancelled: zero bytes arrive **(builder call:** how to hold the connection in setup
+   deterministically).
+10. `orders_enabled=False`: `submit_order` and `cancel_order` raise `OrderMethodsUnavailable` with
+    no request; `can_place_orders()` is false; `get_order` / `get_order_by_client_id` still work.
+    `orders_enabled=True` with a live account raises in the constructor.
+11. `mismatches`: type, limit price and derived TIF differences are reported; the engine resolver
+    and `repair link` turn them into `client_id_mismatch` / a refusal.
+12. `asset_rules` is served from the cache within the TTL and refetched after it.
+13. The three removed methods are gone from the protocol; mypy proves no caller remains.
+14. SimBroker `cancel_order`: canceled returns, filled raises `BrokerError`, unknown raises
     `OrderNotFound`.
-13. Opt-in `smoke` (read-only, places no orders): account/positions/asset rules through the new
-    transport; `get_order` of a random UUID raises `OrderNotFound`; `get_order_by_client_id` of an
-    unknown id returns `None`.
+15. Opt-in `smoke` (read-only, places no orders): account, positions and asset rules through the
+    new transport; `get_order` of a random UUID raises `OrderNotFound`; `get_order_by_client_id` of
+    an unknown id returns `None`.
 
 ## 4. Docs (same PR as the change)
 
 Claims this falsifies or narrows, to correct when the code lands:
 
-- `broker/alpaca.py` module docstring (alpaca-py `raw_data`, "order submission lands in 1.6").
+- `broker/alpaca.py` module docstring (alpaca-py `raw_data`, `to_thread`, "order submission lands
+  in 1.6").
 - `broker/base.py`: `OrderMethodsUnavailable` docstring ("Alpaca until WP 1.6": writes until
-  1.6d, `order_fills` until 1.6b); the `Broker` protocol.
+  1.6d, `order_fills` until 1.6b); the `Broker` protocol; the new `RequestNotSent` and
+  `UnknownOrderStatus`.
+- `risk/engine.py` module docstring: the mention of `close_position`; `not_submitted` now also
+  covers a provably unsent request; `_read` for an unknown status.
 - SPEC §4.6 interface listing and "`AlpacaBroker` is currently read-only"; SPEC §5 step 6 "fill
   stream" (fills are pulled, D17.3).
 - `docs/runbook.md`: lines saying `repair link` / client-id lookup is unavailable until 1.6 (now
-  available); "cannot place orders until WP 1.6" → 1.6d.
-- `risk/engine.py` module docstring: the mention of `close_position`, and the budget paragraph
-  ("Each locked section has ONE budget ...") gains the deadline handoff (3.2); `_within`'s
-  docstring likewise. SimBroker docstrings.
-- `docs/alpaca-notes.md`: the transport facts (no SDK timeout/retry) and that trading calls no
-  longer use alpaca-py.
+  available); "cannot place orders until WP 1.6" → 1.6d; recognising an unknown-status incident;
+  the `alpaca.http` log line and where the request id is.
+- `docs/alpaca-notes.md`: the transport facts (alpaca-py has no timeout and retries POST; trading
+  calls no longer use it), the rate limit, and "re-check on httpx/httpcore upgrade".
+- SimBroker docstrings (cancel contract, removed methods).
 
 ## 5. Left to the builder
 
-Module and helper names; the fake-transport mechanism; how the total read deadline is enforced if
-at all (3.1); cancel-422 log level; how SimBroker test helpers are rewritten (3.8). Everything
-marked **(builder call)** above may be decided differently with a one-line reason in the plan.
+Module and helper names; pool sizes and the pool timeout; the cookie mechanism; the cache TTL; the
+startup timeout; whether `aclose` joins the protocol; the loopback test mechanics; how SimBroker
+test helpers are rewritten. Everything marked **(builder call)** may be decided differently with a
+one-line reason in the plan.
