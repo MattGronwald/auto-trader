@@ -53,6 +53,11 @@ Second Codex round (2026-11-23, two P2s, owner "go"; marked "Codex r2"):
   `AlpacaHttp.diag`, not only `message`.
 - The `unknown_status` evidence lasts the whole resolution window, kept in memory (owner).
 
+Third Codex round (2026-11-23, two P2s, owner "go"; marked "Codex r3"):
+- The evidence survives an ordinary direct-read failure (429, timeout): `_resolve` prunes it to
+  candidates plus `read.failed`, not to candidates alone.
+- `_slash_symbol` no longer puts the raw symbol into its error message.
+
 **Dry run 2026-11-22** (agent in an isolated worktree, branch `dryrun-1.6a`, every task as
 written). Result:
 - All 8 tasks green: 1409 passed, `risk/` 100 % branch coverage after every task that touched
@@ -173,6 +178,11 @@ file already has, which each task names.
 - `get_order` also checks that the response's `id` equals the requested id; a different id is
   malformed data and raises `BrokerError` (PLAN 1.6a: malformed broker data raises).
 - Response symbols go through `_slash_symbol` before any comparison or view (spec 3.4).
+- `_slash_symbol` raises `BrokerError(f"cannot map position symbol to BASE/QUOTE: <withheld:
+  {len(raw)} chars>")`: the raw symbol stays out of the message (Codex r3). Not `diag`: the
+  helper has no keys to redact, and a slashless key id would pass `FIELD_RE`.
+- Out of scope (noted, Codex r3): a symbol that already contains `/` is returned unchanged into
+  the position view, as today.
 - SimBroker: a full-holding sell (qty == `qty_available`) keeps skipping the increment check
   (spec 3.9). `stream_fills`, `redeliver` and the fill queue go (no ledger test uses
   `redeliver`). Tests that read the stream use `order_fills(order_id)` or the new test hook
@@ -492,8 +502,13 @@ here so the engine is complete before the adapter raises them.
   - **The direct read's evidence is kept (Codex P2-3, widened by Codex r2).**
     - The engine keeps `self._status_unknown: set[int]`, an in-memory set like `_last_outcome`.
       `_read` adds a row when its `get_order` raises `UnknownOrderStatus`. The row is removed
-      only when a successful direct read clears it (the `clear_clock` path), or when the row
-      leaves resolution (`_resolve` prunes it to `live` rows, as it does `_last_outcome`).
+      only when a direct read succeeds (the `else` branch of `_read`, whether or not the row has
+      a `resolve_since` clock), or when the row leaves resolution.
+    - Pruning (Codex r3): `_resolve` keeps only ids in `{candidates} | set(read.failed)`. A
+      generic read failure (429, timeout) puts the row in `read.failed` but not in
+      `candidates`, so pruning to candidates alone, as `_last_outcome` is pruned, would drop the
+      evidence while the window is still open. `_last_outcome` keeps its current pruning
+      (pre-existing; it only falls back to `lookup_failed`).
     - A direct read that later raises `OrderNotFound` or fails does not clear the evidence.
       `_resolve` hands `status_unknown=row.id in self._status_unknown` to `_decide`.
     - **Restart limitation (owner, accepted):** the set is in memory, so a restart inside the
@@ -579,6 +594,11 @@ async def test_unknown_status_evidence_lasts_the_resolution_window(...) -> None:
     await r.sync_at(0)
     later = await r.sync_at(80)
     assert (row_id, "incident", "unknown_status") in actions(later)
+
+async def test_unknown_status_evidence_survives_a_failed_direct_read(...) -> None:
+    # Codex r3. pass 1: direct read "held"; pass 2: direct read 429 (row in `failed`, not a
+    # candidate); pass 3 (at the bound): direct read 404, lookup 429
+    assert (row_id, "incident", "unknown_status") in actions(last)
 
 async def test_a_successful_read_clears_the_unknown_status_evidence(...) -> None:
     # pass 1 "held"; pass 2 the direct read succeeds (row readable again, clear_clock);
@@ -1103,7 +1123,7 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
 - `_parsing(what: str, request_id: str | None)` turns the `TypeError` / `ValueError` /
   `KeyError` / `ArithmeticError` from parsing into `BrokerError` with ` (request <id>)`, and
   appends the id to a nested `BrokerError` (`_slash_symbol`, ack mismatch) whose message lacks
-  one (review M4, dry run). `_decimal(raw: object) -> Decimal` and
+  one; neither nested message carries a raw response value (Codex r3) (review M4, dry run). `_decimal(raw: object) -> Decimal` and
   `_aware(raw: object) -> datetime` raise `TypeError` / `ValueError`, so they take no `what`
   argument.
 - `aclose()` delegates to `AlpacaHttp.aclose()`. A test asserts that both clients are closed
@@ -1328,12 +1348,13 @@ Plus the Review Focus tests named above (JSON number, HTML 2xx, nanosecond/naive
 
 Plus `test_a_malformed_status_or_ack_leaks_no_secret_into_the_rendered_log` (Codex r2, sketch
 with binding assertions). It uses `configure_logging(stream=buf)` as in the Task 4 rendered-log
-test, with two cases:
+test, with three cases:
 1. `get_order` answers `status: f"held{SECRET}"`. The engine-side line
    `log.warning("risk.order_status_unknown", status=e.status)` is rendered.
 2. A submit ack has `symbol: f"BTC/USD{SECRET}"`.
+3. A position has the slashless `symbol: f"XYZ{SECRET}"`, so `_slash_symbol` raises (Codex r3).
 
-In both, `SECRET` and `KEY` are absent from the rendered output and from `str(exc)`, and
+In all three, `SECRET` and `KEY` are absent from the rendered output and from `str(exc)`, and
 `<withheld` is present.
 
 **Existing `test_alpaca.py` tests (review I8)**. Every one is kept, ported to the Router, or
