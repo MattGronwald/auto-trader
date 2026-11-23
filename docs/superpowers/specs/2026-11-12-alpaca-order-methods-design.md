@@ -285,6 +285,12 @@ reminder.
   row whose last lookup fails ends as `unknown_status`, not `lookup_failed`. A lookup that links
   the row (mapped status) clears it, like a successful direct read. A restart inside the window
   still forgets the evidence for either kind of row.
+- *Note 2026-11-23 (Fable review of the implementation, I2):* `repair not-submitted` also
+  refuses a `client_id_mismatch` incident. On a row without a broker id it is the same positive
+  evidence (an order exists under our client id), and with the ack identity check of this WP a
+  normal submit can reach it (the ack does not echo the order, the row becomes `unknown`, the
+  first lookup finds the differing order). `repair link` still refuses the mismatch; the
+  runbook sends such a row to escalation.
 
 `OrderAck.submitted_at` is the response's `submitted_at` (else `created_at`); `OrderStatus.reason`
 is null. `avg_fill_price` from `filled_avg_price` (null until filled). Symbols map through the

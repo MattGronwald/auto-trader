@@ -17,8 +17,9 @@ broker id); otherwise nothing is written and it raises `RepairRefused`.
   books a foreign order.
 - `not_submitted` (5.3): marks an unsettled `pending`/`unknown` row without a broker id
   `not_submitted`; the next sync pass settles it with zero fill. Refused for an
-  `unknown_status` incident: that is positive evidence the order exists at the broker (a
-  type (a) row gets it when its client-id lookup meets an unmapped status).
+  `unknown_status` or `client_id_mismatch` incident: each is positive evidence the order
+  exists at the broker (a type (a) row gets one when its client-id lookup meets an unmapped
+  status, or finds an order under our client id that differs from the row).
 - `oversell` (5.4): flags a sell row whose latest `LedgerAnomaly` is `oversell` as
   `excess_external`; the ledger books the excess as an external holding on the next pass.
 
@@ -178,7 +179,13 @@ async def prepare_not_submitted(
         raise RepairRefused(
             f"order row {row_id} is an unknown_status incident: the order exists at the broker "
             "(a lookup met an unmapped status); find it by its client order id and use "
-            "`repair link` once it is final"
+            "`repair link` once it is final (runbook)"
+        )
+    if order.incident == "client_id_mismatch":  # Fable review I2
+        raise RepairRefused(
+            f"order row {row_id} is a client_id_mismatch incident: the order exists at the "
+            "broker (a lookup found an order under our client id that differs from the row); "
+            "follow the runbook's client_id_mismatch procedure"
         )
     return _plan(
         order, "not_submitted", {"status": "not_submitted", "incident": None, "incident_at": None}

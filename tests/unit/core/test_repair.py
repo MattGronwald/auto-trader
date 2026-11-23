@@ -536,20 +536,23 @@ async def test_not_submitted_refuses_wrong_state_rows(
         await prepare_not_submitted(r.sessions, row)
 
 
-async def test_not_submitted_refuses_an_unknown_status_incident(r: Rig) -> None:
-    """An `unknown_status` incident is positive evidence that the order exists at the broker
-    (final review I1): a type (a) row (no broker id) can carry it after a client-id lookup met
-    an unmapped status, and marking it `not_submitted` would drop a live order."""
+@pytest.mark.parametrize("reason", ["unknown_status", "client_id_mismatch"])
+async def test_not_submitted_refuses_an_incident_that_proves_the_order_exists(
+    r: Rig, reason: str
+) -> None:
+    """Both reasons are positive evidence that the order exists at the broker: a type (a) row
+    (no broker id) gets `unknown_status` when a client-id lookup met an unmapped status (final
+    review I1) and `client_id_mismatch` when the lookup found a differing order under our
+    client id (Fable review I2). Marking it `not_submitted` would drop a live order."""
     row = await tr.insert_row(r.sessions, cid=None, status="unknown", broker_order_id=None)
     async with r.sessions() as s:
         await s.execute(
-            update(m.Order)
-            .where(m.Order.id == row)
-            .values(incident="unknown_status", incident_at=NOW)
+            update(m.Order).where(m.Order.id == row).values(incident=reason, incident_at=NOW)
         )
         await s.commit()
-    with pytest.raises(RepairRefused, match="unknown_status incident: the order exists"):
+    with pytest.raises(RepairRefused, match=f"{reason} incident: the order exists") as refused:
         await prepare_not_submitted(r.sessions, row)
+    assert "runbook" in str(refused.value)
 
 
 # --- oversell (5.4) ---------------------------------------------------------------------

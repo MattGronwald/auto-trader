@@ -330,7 +330,7 @@ can never be accepted or become visible (PLAN.md section 3.2 item 4).
 | Incident reason | Meaning | Repair |
 |---|---|---|
 | `no_ownership_proof` | The row has no client id of this journal (NULL or legacy form), so no lookup was made. | Manual procedure below. |
-| `client_id_mismatch` | The broker has an order under our client id that differs from the row (symbol, side, qty, time, or broker id). A broker inconsistency. | Find out which is right; `repair link` only if it matches after all, else escalate. |
+| `client_id_mismatch` | The broker has an order under our client id that differs from the row (symbol, side, qty, order type, limit price, time in force, the `created_at` bound, or broker id). The order exists; a broker inconsistency. | Find out which is right; `repair link` only if it matches after all, else escalate ("Repair commands", step 4). Never `repair not-submitted` (it refuses this reason). |
 | `not_found` | Zero match until the bound. The order may still exist. | Investigate at the broker, then `repair link` (found) or `repair not-submitted` (authoritative evidence). |
 | `lookup_failed` | The lookups raised until the bound (or the budget ran out), so nothing was learned. | Same as `not_found`. |
 | `lookup_inconsistent` | (b) only: `get_order` says not found while the client-id lookup finds the order, until the bound. | `repair link` with the broker id the lookup reports. |
@@ -397,8 +397,13 @@ never migrates: it refuses a journal path that does not exist (`no journal at <p
    `broker_order_id` and clears the incident fields. On `AlpacaBroker` it works since WP 1.6a
    (reads only; no order is written).
 4. **Not found, with authoritative evidence:** `repair not-submitted <row>`, only for an unsettled
-   `pending`/`unknown` row without a broker id. It refuses an `unknown_status` incident: that
-   reason is positive evidence the order exists (see "Recovering an `unknown_status` incident"). Use it only with what PLAN.md section 3.2 item 4
+   `pending`/`unknown` row without a broker id. It refuses an `unknown_status` or a
+   `client_id_mismatch` incident: each reason is positive evidence the order exists (see
+   "Recovering an `unknown_status` incident"). A `client_id_mismatch` row whose broker order
+   still differs from the row after step 2 fits neither command: leave it an incident (its
+   symbol stays blocked, the fail-closed outcome), record the differences `repair link` prints,
+   and escalate (owner; Alpaca support with the request id from the `alpaca.http` line). Do
+   not mark it `not_submitted` by SQL either. Use `not-submitted` only with what PLAN.md section 3.2 item 4
    requires: the original worker is quiescent (the core is stopped) **and** authoritative broker
    evidence rules out that the order was or will ever be accepted or become visible, such as a
    broker-confirmed final rejection. A grace window plus a zero-match lookup does not qualify,

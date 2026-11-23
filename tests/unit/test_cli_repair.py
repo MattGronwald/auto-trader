@@ -403,22 +403,21 @@ def test_parsing_blank_evidence_exits_2(tmp_path: Path) -> None:
     assert result.exit_code == 2
 
 
-def test_not_submitted_of_an_unknown_status_incident_is_refused(
-    rig: Rig, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("reason", ["unknown_status", "client_id_mismatch"])
+def test_not_submitted_of_an_incident_that_proves_the_order_exists_is_refused(
+    rig: Rig, capsys: pytest.CaptureFixture[str], reason: str
 ) -> None:
     row = rig.insert(cid=None)
 
     async def mark(s: Any) -> None:
         async with s() as session:
             await session.execute(
-                update(m.Order)
-                .where(m.Order.id == row)
-                .values(incident="unknown_status", incident_at=tr.NOW)
+                update(m.Order).where(m.Order.id == row).values(incident=reason, incident_at=tr.NOW)
             )
             await session.commit()
 
     rig.db(mark)
 
     assert rig.run("not_submitted", row, yes=True) == 1
-    assert "unknown_status incident" in capsys.readouterr().err
+    assert f"{reason} incident" in capsys.readouterr().err
     assert rig.rows() == [] and rig.order(row).status != "not_submitted"
