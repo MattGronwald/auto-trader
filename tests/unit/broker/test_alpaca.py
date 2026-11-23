@@ -528,6 +528,53 @@ def test_an_unlisted_status_wins_over_a_contradictory_fill(filled: str) -> None:
     assert e.value.status == "held"
 
 
+_NO_QTY: list[Any] = ["missing", None, "", "not-a-number"]
+
+
+@pytest.mark.parametrize("filled", _NO_QTY)
+@pytest.mark.parametrize("call", ["get_order", "by_client_id", "submit"])
+async def test_an_unlisted_status_wins_over_an_unparsable_filled_qty(
+    call: str, filled: Any
+) -> None:
+    # Codex round 2 (PR #43): the status is classified before `filled_qty` is decoded, so an
+    # unlisted status keeps the bounded `unknown_status` path even when the quantity is
+    # missing or unparsable.
+    if call == "submit":
+        body = {**ENTRY["json"], "status": "held"}
+    else:
+        body = {**probe("D2-resting", run="round2")["json"], "status": "held"}
+        if call == "get_order":
+            body["id"] = OID
+    if filled == "missing":
+        body.pop("filled_qty", None)
+    else:
+        body["filled_qty"] = filled
+    r = Router()
+    method, path = _ROUTES[call]
+    r.add(method, path, 200, body)
+    with pytest.raises(UnknownOrderStatus) as e:
+        await _invoke(await broker(r), call)
+    assert e.value.status == "held" and "rid-1" in str(e.value)
+    assert e.value.__cause__ is None and e.value.__suppress_context__
+    assert r.unrouted == []
+
+
+@pytest.mark.parametrize("call", ["get_order", "by_client_id", "submit"])
+async def test_a_mapped_status_with_a_null_filled_qty_is_a_broker_error(call: str) -> None:
+    if call == "submit":
+        body = {**ENTRY["json"], "filled_qty": None}
+    else:
+        body = {**probe("D2-resting", run="round2")["json"], "filled_qty": None}
+        if call == "get_order":
+            body["id"] = OID
+    r = Router()
+    method, path = _ROUTES[call]
+    r.add(method, path, 200, body)
+    with pytest.raises(BrokerError) as e:
+        await _invoke(await broker(r), call)
+    assert type(e.value) is BrokerError
+
+
 @pytest.mark.parametrize("call", ["get_order", "by_client_id"])
 async def test_order_reads_with_an_unlisted_status_raise_unknown_order_status(call: str) -> None:
     r = Router()
@@ -1051,6 +1098,9 @@ _BTC_ROW = {"symbol": "BTC/USD", "qty": "1", "qty_available": "1", "avg_entry_pr
         [{**_BTC_ROW, "asset_class": None}],
         [{**_BTC_ROW, "asset_class": 7}],
         [{**_BTC_ROW, "asset_class": "crypto"}, {**_BTC_ROW, "asset_class": ["crypto"]}],
+        [{**_BTC_ROW, "asset_class": ""}],  # Codex round 2: unknown classes fail closed
+        [{**_BTC_ROW, "asset_class": "cryptoo"}],
+        [{**_BTC_ROW, "asset_class": "CRYPTO"}],
     ],
 )
 async def test_a_positions_body_that_is_not_a_list_of_classed_rows_is_a_broker_error(
@@ -1067,6 +1117,18 @@ async def test_a_positions_body_that_is_not_a_list_of_classed_rows_is_a_broker_e
     assert type(e.value) is BrokerError and "(request rid-1)" in text
     assert SECRET not in text and "BTC" not in text
     assert e.value.__cause__ is None and e.value.__suppress_context__
+    assert r.unrouted == []
+
+
+@pytest.mark.parametrize("asset_class", ["us_equity", "us_option", "crypto_perp"])
+async def test_known_non_spot_asset_classes_are_skipped(asset_class: str) -> None:
+    # Codex round 2 (PR #43): only the classes alpaca-py lists besides `crypto` are skipped;
+    # anything else fails the read (above) instead of hiding a holding.
+    other = {"symbol": "AAPL", "asset_class": asset_class, "qty": "1", "avg_entry_price": "2"}
+    r = Router()
+    r.add("GET", "/v2/positions", 200, [other, {**_BTC_ROW, "asset_class": "crypto"}])
+    (position,) = await (await broker(r)).get_positions()
+    assert position.symbol == "BTC/USD"
     assert r.unrouted == []
 
 

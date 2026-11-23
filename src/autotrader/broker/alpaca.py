@@ -16,9 +16,10 @@ docs/alpaca-notes.md for sources, raw values and open questions.
   be its binary expansion), timestamps must be timezone-aware, symbols go through
   `_slash_symbol`; a position's symbol must then match `BASE/QUOTE` (it goes into the
   `/assets/{symbol}` path, which `asset_rules` checks too). The positions body must be a JSON
-  array of objects that each carry a string `asset_class` (an empty array means flat, so a
-  `{}` or an unclassed row fails the read; Codex P2-1). A status outside the spec 3.4
-  table raises `UnknownOrderStatus` (from the submit ack it first logs
+  array of objects that each carry a known `asset_class` (an empty array means flat, so a
+  `{}` or an unclassed or unknown-class row fails the read; Codex P2-1 and round 2). A status
+  outside the spec 3.4 table raises `UnknownOrderStatus`, checked before `filled_qty` is
+  decoded (from the submit ack it first logs
   `alpaca.ack_status_unknown` with the broker order id); a mapped status contradicted by
   `filled_qty` (`filled` with none, any negative) raises `BrokerError` (Codex P2-2), so the
   read fails and the row stays unsettled. The submit ack must echo the
@@ -138,6 +139,14 @@ def _check_symbol(symbol: str, *, shown: int | None = None) -> None:
         raise BrokerError(f"refusing an unsafe symbol: <withheld: {n} chars>") from None
 
 
+# alpaca-py 0.44 `AssetClass`; only `crypto` rows are holdings here, the rest are skipped.
+_ASSET_CLASSES = frozenset({"crypto", "us_equity", "us_option", "crypto_perp"})
+
+
+def _known_class(raw: object) -> bool:
+    return isinstance(raw, str) and raw in _ASSET_CLASSES
+
+
 _MAPPED_STATUSES = frozenset(
     {
         "pending_new",
@@ -157,8 +166,8 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
     """Alpaca order status -> ours (spec 3.4). Anything unlisted raises `UnknownOrderStatus`:
     we never place orders that should reach it, so fail closed rather than guess.
 
-    Pure: the exception carries `raw` as given. Callers in this module re-raise it with the
-    status filtered through `AlpacaHttp.diag` (`AlpacaBroker._state`).
+    Pure: the exception carries `raw` as given. `AlpacaBroker._state` classifies the status
+    itself before decoding `filled_qty` and raises with it filtered through `AlpacaHttp.diag`.
 
     For a mapped status, a negative `filled_qty`, or `filled` / `partially_filled` without a
     positive one, contradicts itself and raises a plain `BrokerError`: the read failed, the row
@@ -265,14 +274,16 @@ class AlpacaBroker:
         result = await self._http.get("/positions", "/positions")
         raw = _body(result, "positions")
         # An empty list claims the account holds nothing, and the Position Manager's flatten
-        # check reads it so: only a JSON array of rows that each name a string `asset_class`
-        # is a holdings list (Codex P2-1, PR #43). Other asset classes are skipped.
+        # check reads it so: only a JSON array of rows that each name a known `asset_class`
+        # is a holdings list (Codex P2-1, PR #43). Only the known non-spot classes are
+        # skipped; a blank or unknown class fails the read rather than hide a holding (Codex
+        # round 2). A class Alpaca adds later fails every positions read until it is listed.
         if not isinstance(raw, list) or not all(
-            isinstance(p, dict) and isinstance(p.get("asset_class"), str) for p in raw
+            isinstance(p, dict) and _known_class(p.get("asset_class")) for p in raw
         ):
             raise BrokerError(
-                "unexpected alpaca positions response: not a list of positions with an "
-                f"asset_class (request {result.request_id})"
+                "unexpected alpaca positions response: not a list of positions with a "
+                f"known asset_class (request {result.request_id})"
             ) from None
         with _parsing("positions", result.request_id):
             return [
@@ -361,11 +372,11 @@ class AlpacaBroker:
         with _parsing("get_order", rid):
             if raw["id"] != order_id:
                 raise ValueError("the response is another order")
-            filled = _decimal(raw["filled_qty"])
+            state, filled = self._state(raw, rid)
             avg = raw.get("filled_avg_price")
             return OrderStatus(
                 order_id=order_id,
-                status=self._state(raw["status"], filled, rid),
+                status=state,
                 filled_qty=filled,
                 avg_fill_price=None if avg is None else _decimal(avg),
                 reason=None,
@@ -382,10 +393,10 @@ class AlpacaBroker:
         raw = _body(result, "get_order_by_client_id")
         rid = result.request_id
         with _parsing("get_order_by_client_id", rid):
-            filled = _decimal(raw["filled_qty"])
-            limit = raw.get("limit_price")
             order_id = _str(raw["id"])
             _check_order_id(order_id)  # it goes into a path (`get_order`) and log lines
+            state, filled = self._state(raw, rid)
+            limit = raw.get("limit_price")
             return BrokerOrderView(
                 order_id=order_id,
                 client_order_id=self._http.diag(_str(raw["client_order_id"]), _CLIENT_ID),
@@ -395,7 +406,7 @@ class AlpacaBroker:
                 type=raw["type"],
                 limit_price=None if limit is None else _decimal(limit),
                 time_in_force=raw["time_in_force"],
-                status=self._state(raw["status"], filled, rid),
+                status=state,
                 filled_qty=filled,
                 created_at=_aware(raw["created_at"]),
             )
@@ -407,14 +418,17 @@ class AlpacaBroker:
         if not self._orders_enabled:
             raise OrderMethodsUnavailable("AlpacaBroker order writes are disabled until WP 1.6d")
 
-    def _state(self, raw: object, filled_qty: Decimal, request_id: str | None) -> OrderState:
-        """`order_state` on the raw status; an unmapped one is re-raised with the status
-        filtered through `diag`, so the message and `.status` (which the engine logs) carry
-        no raw response text (Codex r2)."""
-        try:
-            return order_state(_str(raw), filled_qty, request_id)
-        except UnknownOrderStatus as e:
-            raise UnknownOrderStatus(self._http.diag(e.status, STATUS_RE), request_id) from None
+    def _state(self, raw: Any, request_id: str | None) -> tuple[OrderState, Decimal]:
+        """The order's state and `filled_qty` from a response body. The status is classified
+        before the quantity is decoded, so an unmapped status raises `UnknownOrderStatus`
+        (the bounded `unknown_status` path) even when `filled_qty` is missing or unparsable
+        (Codex round 2, PR #43). Its status is filtered through `diag`, so the message and
+        `.status` (which the engine logs) carry no raw response text (Codex r2)."""
+        status = _str(raw["status"])
+        if status not in _MAPPED_STATUSES:
+            raise UnknownOrderStatus(self._http.diag(status, STATUS_RE), request_id) from None
+        filled = _decimal(raw.get("filled_qty"))
+        return order_state(status, filled, request_id), filled
 
     def _ack(self, order: BrokerOrder, result: HttpResult) -> OrderAck:
         """Validate a 200 submit response against the order we sent (spec 3.4)."""
@@ -460,7 +474,7 @@ class AlpacaBroker:
                 )
                 raise BrokerError(f"alpaca ack does not match the order (request {rid})")
             try:
-                status = self._state(raw["status"], _decimal(raw["filled_qty"]), rid)
+                status, _ = self._state(raw, rid)
             except UnknownOrderStatus as e:  # the order is live; the operator needs its id
                 log.error(
                     "alpaca.ack_status_unknown",

@@ -323,6 +323,12 @@ unchanged. An empty holdings list means "flat" to the Position Manager, so the b
 JSON array whose rows are objects with a string `asset_class`; a `200 {}`, a `""` or an
 unclassed row raises `BrokerError` (request id, no response data) instead of reading as no
 holdings. Rows of another asset class are still skipped.
+*2026-11-23 follow-up (owner's Codex round 2 on PR #43):* only the known non-spot classes are
+skipped (`us_equity`, `us_option`, `crypto_perp`, as listed by alpaca-py 0.44); a blank or
+unknown `asset_class` fails the read, so a class Alpaca adds later blocks positions reads until
+it is listed. On every order read and the submit ack the status is classified before
+`filled_qty` is decoded, so an unlisted status raises `UnknownOrderStatus` even when the
+quantity is missing or unparsable.
 
 ### 3.6 Match check: `BrokerOrderView` and `mismatches`
 
