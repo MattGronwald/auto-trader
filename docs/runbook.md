@@ -11,7 +11,11 @@ The examples assume the default `config.yaml` (journal `data/autotrader.db`, SQL
 
 - `run core` connects `AlpacaBroker`, which cannot place orders until WP 1.6d: its order writes
   (submit, cancel) raise `OrderMethodsUnavailable` and `can_place_orders()` is false. Single-order
-  reads and the client-id lookup work since WP 1.6a; `order_fills` waits for 1.6b. The Position Manager still
+  reads and the client-id lookup work since WP 1.6a; `order_fills` waits for 1.6b. Until then
+  a linked or read order with a fill the row has not booked yet cannot settle: the sync pass
+  reads executions whenever the broker reports more filled than the row has booked, so such a
+  row fails every pass (`risk.order_sync_failed`, `OrderMethodsUnavailable`) and stays unsettled
+  (see "Resolving an order incident", step 3). The Position Manager still
   evaluates and latches triggers (`positions.exit_triggered`) and logs
   `positions.broker_cannot_trade` once, but sends no exits and no cancels. A flatten stays pending
   with `reason: "broker cannot place orders"`.
@@ -309,7 +313,8 @@ The ledger's 2 s sync pass (`RiskEngine.sync_orders`) resolves two kinds of unse
 A row without a client id of this journal becomes a `no_ownership_proof` incident at once (no
 lookup, no bound). Otherwise it looks the order up by client id. For (a), a match on symbol, side,
 qty and creation time (5 minutes of skew) links the row (`risk.order_resolved`, `OrderResolved`
-event; the next read books its fills and settles it). For (b), a match links nothing: the row
+event; the next read books its fills and settles it; on `AlpacaBroker` before WP 1.6b only
+when there is no unbooked fill, see "Current limits"). For (b), a match links nothing: the row
 keeps its clock and becomes `lookup_inconsistent` at the bound. A zero match or a failed lookup
 waits: the bound is 80 s from `submitted_at`
 for (a), or from the first `OrderNotFound` / `UnknownOrderStatus` (persisted as `resolve_since`, restart-safe) for (b).
@@ -395,7 +400,14 @@ never migrates: it refuses a journal path that does not exist (`no journal at <p
    `broker order is not final: <status>` otherwise (see "Recovering an `unknown_status` incident"). It refuses lookup misses, mismatches (the
    differences are printed) and rows without ownership proof; there is no `--force`. It writes
    `broker_order_id` and clears the incident fields. On `AlpacaBroker` it works since WP 1.6a
-   (reads only; no order is written).
+   (reads only; no order is written). **Until WP 1.6b, linking settles only orders with no fill
+   left to book:** the next sync pass reads the order's executions whenever the broker reports
+   more filled than the row has booked, and `AlpacaBroker.order_fills` raises until 1.6b. So a
+   linked order that filled, or a partially filled order that ended `canceled`, fails every sync
+   pass (`risk.order_sync_failed`) and stays unsettled, holding back its symbol and flat. In 1.6a
+   only a final order with nothing filled beyond the row's booked qty (e.g. `canceled` or
+   `rejected` with zero fill) settles after the link. Keep the manual pause in place until 1.6b
+   can reconcile the fills (the link still records the broker id and your evidence).
 4. **Not found, with authoritative evidence:** `repair not-submitted <row>`, only for an unsettled
    `pending`/`unknown` row without a broker id. It refuses an `unknown_status` or a
    `client_id_mismatch` incident: each reason is positive evidence the order exists (see
@@ -424,7 +436,8 @@ never migrates: it refuses a journal path that does not exist (`no journal at <p
    evidence (broker order id, what matched, who, when) in your ticket or operator notes.
    (`not_submitted` for such a row is `repair not-submitted`, same evidence rule as step 4.)
 6. Start the core again. Confirm the row settles (`settled_at` set) and the incident reminders
-   stop. A row left unrepaired keeps reminding every 60 s and holding back its symbol; that is
+   stop. On `AlpacaBroker` before WP 1.6b a linked row with an unbooked fill does not settle
+   (step 3): it fails every sync pass instead; keep the pause until 1.6b. A row left unrepaired keeps reminding every 60 s and holding back its symbol; that is
    expected. Resume the manual pause only after this (see "Resuming after a pause").
 
 Undoing `repair not-submitted` is manual and only safe with the core stopped, when the mark was
@@ -467,7 +480,11 @@ non-final order:
    row the id the broker shows for its client order id). It refuses while the order is not final
    (`broker order is not final: <status>`). Do not use it to get past that; the check keeps a row
    from being linked while the order can still move.
-5. Start the core: the ledger books the row's fills from the final state on the next pass.
+5. Start the core: the ledger books the row's fills from the final state on the next pass. On
+   `AlpacaBroker` before WP 1.6b that holds only for an order with no fill left to book (e.g.
+   `canceled` with zero fill); a filled or partially filled one fails every sync pass and stays
+   unsettled until 1.6b can read its fills ("Resolving an order incident", step 3). Keep the
+   manual pause in place until then.
 
 While Alpaca keeps the order in the unmapped state (`held`, `suspended`, ...), escalate to Alpaca
 support; the row stays an incident and keeps reminding every 60 s.
