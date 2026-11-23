@@ -21,6 +21,7 @@ from autotrader.broker.base import (
     OrderAck,
     OrderMethodsUnavailable,
     OrderRejected,
+    RequestNotSent,
 )
 from autotrader.broker.sim import FillPlan, SimBroker
 from autotrader.core.bus import EventBus
@@ -453,6 +454,31 @@ async def test_failed_exits_back_off_and_alert_after_three(
         "not_submitted",
     )
     assert failing["reasons"] == ["exit: stop"]
+
+
+class UnsentOnce(SimBroker):
+    sent = False
+
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        if order.side == "sell" and not self.sent:
+            self.sent = True
+            raise RequestNotSent("stub")
+        return await super().submit_order(order)
+
+
+async def test_an_unsent_exit_is_retried_after_its_backoff(
+    sessions: async_sessionmaker[AsyncSession], bus: EventBus
+) -> None:
+    h = Harness(sessions, bus, sim=make_sim(cls=UnsentOnce))
+    await h.open_position()
+    h.quote(BTC, 95.0)
+    await h.pm.step()
+    assert [s.status for s in await h.sells()] == ["not_submitted"]
+    await h.pm.step()  # within the 1 s backoff: nothing
+    assert len(await h.sells()) == 1
+    h.clock.advance(1)
+    await h.pm.step()
+    assert [s.status for s in await h.sells()] == ["not_submitted", "new"]
 
 
 async def test_an_unknown_exit_without_a_broker_id_is_never_retried(

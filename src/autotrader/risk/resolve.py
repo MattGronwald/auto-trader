@@ -13,7 +13,12 @@ from typing import Literal
 from autotrader.broker.base import BrokerOrderView, TimeInForce
 
 IncidentReason = Literal[
-    "no_ownership_proof", "client_id_mismatch", "not_found", "lookup_failed", "lookup_inconsistent"
+    "no_ownership_proof",
+    "client_id_mismatch",
+    "not_found",
+    "lookup_failed",
+    "lookup_inconsistent",
+    "unknown_status",
 ]
 
 # The broker's creation time may trail our submit stamp by clock skew; older than this

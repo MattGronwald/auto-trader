@@ -30,6 +30,7 @@ from autotrader.broker.base import (
     OrderRejected,
     OrderStatus,
     Position,
+    RequestNotSent,
 )
 from autotrader.broker.sim import FillPlan, SimBroker
 from autotrader.core.bus import EventBus
@@ -2022,6 +2023,59 @@ async def test_an_exit_on_a_broker_that_cannot_trade_is_not_submitted(
     assert (result.status, result.broker_order_id) == ("not_submitted", None)
     (row,) = await orders(sessions)
     assert row.status == "not_submitted"  # never "unknown": nothing left the process
+
+
+class UnsentSubmit(SimBroker):
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        raise RequestNotSent("alpaca POST /orders not sent: ConnectError")
+
+
+class WrittenThenFailed(SimBroker):
+    async def submit_order(self, order: BrokerOrder) -> OrderAck:
+        raise BrokerError("alpaca POST /orders failed: WriteError")
+
+
+async def test_an_unsent_entry_is_not_submitted(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
+) -> None:
+    engine = make_engine_(_sim(UnsentSubmit), sessions, gate)
+    with capture_logs() as logs:
+        result = await engine.check(intent(cycle_id))
+    assert result.status == "not_submitted"
+    (row,) = await orders(sessions)
+    assert (row.status, row.broker_order_id) == ("not_submitted", None)
+    (line,) = [x for x in logs if x["event"] == "risk.order_not_submitted"]
+    assert line["reason"] == "request not sent: RequestNotSent"
+
+
+async def test_an_unsent_exit_is_not_submitted(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    broker = _sim(UnsentSubmit)
+    # SimBroker.submit_order bypasses the raising override to seed the holding
+    await SimBroker.submit_order(
+        broker, BrokerOrder(symbol=BTC, side="buy", qty=D("1"), type="market")
+    )
+    broker.process_bar(five(30))
+    result = await make_engine_(broker, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
+    assert (result.status, result.broker_order_id) == ("not_submitted", None)
+    (row,) = await orders(sessions)
+    assert (row.status, row.broker_order_id) == ("not_submitted", None)
+
+
+@pytest.mark.parametrize("cls", [WrittenThenFailed, HangingSubmit])
+async def test_a_failure_after_the_write_stays_unknown(
+    cls: type[SimBroker],
+    sessions: async_sessionmaker[AsyncSession],
+    gate: ControlGate,
+    cycle_id: int,
+) -> None:
+    # a BrokerError after the write, or the engine's own TimeoutError from _within
+    engine = make_engine_(_sim(cls), sessions, gate, io_timeout_s=0.1, monotonic=Mono())
+    result = await asyncio.wait_for(engine.check(intent(cycle_id)), 10)
+    assert result.status == "unknown"
+    (row,) = await orders(sessions)
+    assert (row.status, row.broker_order_id) == ("unknown", None)
 
 
 async def test_an_external_exit_marks_its_order_row(

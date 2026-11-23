@@ -10,7 +10,8 @@ plan read (conditional `UPDATE`; `not_submitted` also re-checks that the row sti
 broker id); otherwise nothing is written and it raises `RepairRefused`.
 
 - `link` (5.2): records the broker id of an unsettled row that has none (`pending`/`unknown`)
-  or that is a type (b) incident, after the broker's order found by the row's own
+  or that is a type (b) incident (an `unknown_status` incident only once the broker order is
+  final: filled, canceled or rejected), after the broker's order found by the row's own
   journal-namespaced client id proved ownership and matched symbol, side, qty, type, limit
   price, time in force and the `created_at` bound. No override: a wrong link books a foreign order.
 - `not_submitted` (5.3): marks an unsettled `pending`/`unknown` row without a broker id
@@ -44,8 +45,9 @@ Lookup = Callable[[str], Awaitable[BrokerOrderView | None]]
 
 # Type (b) incidents (a row with a broker id) that `repair link` may re-link (spec 5.2, D20.11).
 LINKABLE_INCIDENTS = frozenset(
-    {"not_found", "lookup_failed", "lookup_inconsistent", "client_id_mismatch"}
+    {"not_found", "lookup_failed", "lookup_inconsistent", "client_id_mismatch", "unknown_status"}
 )
+_FINAL = ("filled", "canceled", "rejected")
 _UNRESOLVED = ("pending", "unknown")
 _DATETIME_COLUMNS = frozenset({"incident_at", "resolve_since"})
 
@@ -127,6 +129,8 @@ async def prepare_link(
         raise RepairRefused(f"broker lookup failed: {type(e).__name__}: {e}") from e
     if view is None:
         raise RepairRefused(f"the broker has no order with client id {cid}")
+    if order.incident == "unknown_status" and view.status not in _FINAL:
+        raise RepairRefused(f"broker order is not final: {view.status}")
     differences = list(
         mismatches(
             view,

@@ -18,7 +18,7 @@ from structlog.testing import capture_logs
 
 import tests.unit.risk.test_engine as te
 import tests.unit.risk.test_resolver as tr
-from autotrader.broker.base import BrokerOrder, BrokerOrderView
+from autotrader.broker.base import BrokerOrder, BrokerOrderView, UnknownOrderStatus
 from autotrader.broker.sim import SimBroker
 from autotrader.core.bus import CommitUncertain, EventBus
 from autotrader.core.kill import PAUSED_KEY, ControlGate
@@ -335,6 +335,31 @@ async def test_link_refuses_a_limit_price_mismatch(r: Rig) -> None:
     row = await tr.insert_row(r.sessions, cid=cid, type_="limit", limit_price=D("101"))
     with pytest.raises(RepairRefused, match="limit_price"):
         await prepare_link(r.sessions, row, ack.order_id, lookup_of(r.sim))
+
+
+async def test_link_of_an_unknown_status_incident_needs_a_final_broker_order(r: Rig) -> None:
+    cid = await own_cid(r.sessions, 1)
+    broker_id = await submit(r.sim, cid)
+    row = await tr.insert_row(r.sessions, cid=cid, status="new", broker_order_id=broker_id)
+    async with r.sessions() as s:
+        await s.execute(
+            update(m.Order)
+            .where(m.Order.id == row)
+            .values(incident="unknown_status", incident_at=NOW)
+        )
+        await s.commit()
+
+    async def held(cid: str) -> BrokerOrderView | None:
+        raise UnknownOrderStatus("held", "rid-1")
+
+    with pytest.raises(RepairRefused, match="broker lookup failed: UnknownOrderStatus"):
+        await prepare_link(r.sessions, row, broker_id, held)
+    # the sim's order is open ("new"): refused
+    with pytest.raises(RepairRefused, match="broker order is not final: new"):
+        await prepare_link(r.sessions, row, broker_id, lookup_of(r.sim))
+    await r.sim.cancel_order(broker_id)
+    plan = await prepare_link(r.sessions, row, broker_id, lookup_of(r.sim))
+    assert plan.after["incident"] is None
 
 
 @pytest.mark.parametrize(

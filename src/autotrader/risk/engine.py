@@ -24,15 +24,23 @@ Order resolver (WP 1.5d-2, spec 2026-11-10 3): only `sync_orders()` (the ledger'
 resolves, after the same read step and under the same budget; `check()` only reads. Candidates
 are (a) rows without a broker id that are not locally final (`rejected` / `not_submitted`) and
 not in flight, which in practice means `pending`/`unknown` (no other status is written without a
-broker id; the ledger's type (a) writes require it), and (b) rows whose
-`get_order` raised `OrderNotFound` (clock `resolve_since`, persisted at the first miss and kept
-until a successful read). A row is looked up by its own journal-namespaced client id: a match
+broker id; the ledger's type (a) writes require it), and (b) rows whose `get_order` raised
+`OrderNotFound` or `UnknownOrderStatus` (clock `resolve_since`, persisted at the first miss and
+kept until a successful read). A row is looked up by its own journal-namespaced client id: a match
 links a type (a) row; a row without ownership proof or with a mismatching hit becomes an
 incident at once; otherwise the row becomes an incident once `order_resolution_timeout_s` has
 passed since `submitted_at` (a) or `resolve_since` (b). A lookup the budget did not reach is
 "not looked up", never a zero match. Incident rows are skipped by the read and by the resolver
 until an operator repairs them; `risk.order_incident_open` reminds every 60 s. The resolver
 never marks a row `not_submitted` (D20.2): a zero match is no proof that an order cannot exist.
+
+Unknown status (spec 3.4): a status read or lookup that meets an unmapped broker status
+(`UnknownOrderStatus`) means the order exists in a state we cannot book. A row whose direct read
+raised it is remembered in memory (`_status_unknown`) until a direct read of it succeeds or it
+leaves resolution (neither a candidate nor a failed read); while remembered, every inconclusive
+outcome at the bound (`lookup_failed`, `not_found`, `lookup_inconsistent`, not looked up) becomes
+the incident `unknown_status`, which `repair link` accepts only once the broker order is final.
+Only `client_id_mismatch` still wins. A restart inside the window forgets the evidence.
 
 Daily-loss baseline (D19, spec 2026-11-09 3): the equity of the latest snapshot observed in
 the `2 x snapshot_interval_s` before the trading-day start; without one, entries are rejected
@@ -60,7 +68,8 @@ reads and writes (every `self._sessions()` block, `_write_snapshot`) run outside
 a timeout never cancels a DB session mid-statement or mid-commit; SQLite errors on a
 locked DB after `busy_timeout` (5 s) instead of hanging. A step whose budget is already
 spent is not called: its timeout outcome applies, and a submit that was never attempted
-is `not_submitted`. `asyncio.CancelledError` is never caught.
+is `not_submitted`, as is a request the transport proved unsent (`RequestNotSent`).
+`asyncio.CancelledError` is never caught.
 
 `cancel_open_entries()` cancels resting entry (buy) orders under the exit lock with its own
 budget, `sellable_positions()` reads the non-dust broker holdings lock-free with its own, and
@@ -93,6 +102,8 @@ from autotrader.broker.base import (
     OrderMethodsUnavailable,
     OrderNotFound,
     OrderRejected,
+    RequestNotSent,
+    UnknownOrderStatus,
 )
 from autotrader.core.config import StrategyProfile
 from autotrader.core.indicators import compute_features
@@ -133,7 +144,8 @@ _INCIDENT_REMINDER_S = 60.0
 @dataclass
 class _Read:
     """The read step of one sync pass: the ledger's `SyncResult` parts plus the resolver's
-    candidates, in row order (`b` = `get_order` raised `OrderNotFound`)."""
+    candidates, in row order (`b` = `get_order` raised `OrderNotFound` or
+    `UnknownOrderStatus`)."""
 
     updates: list[OrderUpdate] = field(default_factory=list)
     failed: list[int] = field(default_factory=list)
@@ -246,6 +258,9 @@ class RiskEngine:
         # Last lookup outcome per candidate row, for the incident reason when a later pass
         # cannot look it up (spent budget). Per process: after a restart the reason defaults.
         self._last_outcome: dict[int, IncidentReason] = {}
+        # Rows whose direct read raised `UnknownOrderStatus` (Codex P2-3, r2, r3): kept until a
+        # direct read succeeds or the row leaves resolution. Per process, like _last_outcome.
+        self._status_unknown: set[int] = set()
         self._incident_logged_at: float | None = None  # monotonic time of the last reminder
 
     async def _journal_id(self) -> str | None:
@@ -526,10 +541,16 @@ class RiskEngine:
                 log.exception("risk.order_sync_failed", order_row=row.id)
                 read.failed.append(row.id)
                 read.candidates.append((row, "b"))
+            except UnknownOrderStatus as e:  # known but unmapped: bounded path, type (b)
+                log.warning("risk.order_status_unknown", order_row=row.id, status=e.status)
+                self._status_unknown.add(row.id)
+                read.failed.append(row.id)
+                read.candidates.append((row, "b"))
             except Exception:  # the order is known, the read failed: not resolution
                 log.exception("risk.order_sync_failed", order_row=row.id)
                 read.failed.append(row.id)
             else:
+                self._status_unknown.discard(row.id)  # readable again: the evidence is gone
                 if row.resolve_since is not None:
                     read.resolutions.append(
                         OrderResolution(
@@ -548,6 +569,8 @@ class RiskEngine:
         jid = await self._journal_id()
         live = {row.id for row, _ in read.candidates}  # forget rows that left resolution
         self._last_outcome = {k: v for k, v in self._last_outcome.items() if k in live}
+        # a generic read failure is not a candidate but still inside its window (Codex r3)
+        self._status_unknown &= live | set(read.failed)
         resolutions = read.resolutions
         incidents = dict(read.incidents)
         failed = read.failed
@@ -566,7 +589,16 @@ class RiskEngine:
                 else:
                     since = row.resolve_since
             clock = since if kind == "b" else None
-            reason = await self._decide(row, kind, jid or "", since, deadline, now, resolutions)
+            reason = await self._decide(
+                row,
+                kind,
+                jid or "",
+                since,
+                deadline,
+                now,
+                resolutions,
+                status_unknown=row.id in self._status_unknown,
+            )
             if reason is None:
                 continue
             resolutions.append(
@@ -593,8 +625,12 @@ class RiskEngine:
         deadline: float,
         now: datetime,
         resolutions: list[OrderResolution],
+        *,
+        status_unknown: bool,
     ) -> IncidentReason | None:
-        """One candidate: appends a link, or returns the incident reason (None = wait)."""
+        """One candidate: appends a link, or returns the incident reason (None = wait).
+        `status_unknown`: a direct read of the row met an unmapped status, so any
+        inconclusive outcome at the bound is `unknown_status`."""
         cid = row.client_order_id
         if cid is None or not owns(cid, jid):
             return "no_ownership_proof"
@@ -604,6 +640,9 @@ class RiskEngine:
                 view = await self._within(
                     deadline, partial(self._broker.get_order_by_client_id, cid)
                 )
+            except UnknownOrderStatus as e:  # found, but in a state we do not map
+                log.warning("risk.order_status_unknown", order_row=row.id, status=e.status)
+                outcome = "unknown_status"
             except Exception:  # "don't know", never a zero match
                 log.warning("risk.order_lookup_failed", order_row=row.id, exc_info=True)
                 outcome = "lookup_failed"
@@ -639,6 +678,8 @@ class RiskEngine:
             self._last_outcome[row.id] = outcome
         start = row.submitted_at if kind == "a" else since
         if now >= start + self._resolution_timeout:
+            if status_unknown:  # only client_id_mismatch (returned above) outranks it
+                return "unknown_status"
             return outcome or self._last_outcome.get(row.id, "lookup_failed")
         expected = (
             row.submitted_at + timedelta(seconds=self._io_timeout) + self._visibility_allowance
@@ -750,6 +791,14 @@ class RiskEngine:
         except OrderMethodsUnavailable:  # nothing left the process
             log.warning(
                 "risk.order_not_submitted", order_row=row_id, reason="broker cannot place orders"
+            )
+            await self._set_status(row_id, "not_submitted")
+            return OrderResult(decision, row_id, "not_submitted")
+        except RequestNotSent as e:  # the transport proved no byte was written (D22.5)
+            log.warning(
+                "risk.order_not_submitted",
+                order_row=row_id,
+                reason=f"request not sent: {type(e.__cause__ or e).__name__}",
             )
             await self._set_status(row_id, "not_submitted")
             return OrderResult(decision, row_id, "not_submitted")

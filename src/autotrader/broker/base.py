@@ -145,9 +145,25 @@ class BrokerError(Exception):
 
 
 class OrderMethodsUnavailable(BrokerError):
-    """The adapter cannot place, cancel or read orders yet (Alpaca until WP 1.6).
+    """The adapter refuses order writes (Alpaca until WP 1.6d) or cannot serve the call
+    yet (`order_fills` until WP 1.6b).
 
     Nothing was sent, so callers record `not_submitted` (D18 decision 10)."""
+
+
+class RequestNotSent(BrokerError):
+    """The request failed before any byte of it was written (connect, DNS, TLS, pool
+    wait); no order can exist. Submit records `not_submitted` (D22.5)."""
+
+
+class UnknownOrderStatus(BrokerError):
+    """The broker reported an order status outside the mapped table (spec 3.4). The order
+    exists but its state is unknown: the resolver treats it as type (b) and, at the bound,
+    records the incident `unknown_status`."""
+
+    def __init__(self, status: str, request_id: str | None = None) -> None:
+        super().__init__(f"unmapped alpaca order status {status!r} (request {request_id})")
+        self.status = status
 
 
 class OrderRejected(BrokerError):

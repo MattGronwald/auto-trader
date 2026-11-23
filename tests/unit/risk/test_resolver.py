@@ -20,7 +20,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
 import tests.unit.risk.test_engine as te
-from autotrader.broker.base import BrokerOrder, BrokerOrderView, OrderAck, OrderStatus
+from autotrader.broker.base import (
+    BrokerError,
+    BrokerOrder,
+    BrokerOrderView,
+    OrderAck,
+    OrderNotFound,
+    OrderStatus,
+    UnknownOrderStatus,
+)
 from autotrader.broker.sim import SimBroker
 from autotrader.core.bus import EventBus
 from autotrader.core.kill import ControlGate
@@ -613,6 +621,136 @@ async def test_incident_holds_back_later_rows_on_its_symbol(r: Rig) -> None:
     assert len(await fills(r.sessions, entry.id)) == len(await fills(r.sessions, second.id)) == 1
     async with r.sessions() as s:
         assert await repo.open_position_symbols(s) == {ETH}
+
+
+class HeldStatus(SimBroker):  # every read of any order meets Alpaca status "held"
+    async def get_order(self, order_id: str) -> OrderStatus:
+        raise UnknownOrderStatus("held", "rid-1")
+
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        raise UnknownOrderStatus("held", "rid-2")
+
+
+async def test_an_unknown_status_read_makes_a_type_b_candidate_then_an_incident(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    r = rig(make_sim(HeldStatus), sessions, gate)
+    row_id, _ = await acked_entry(r)
+    with capture_logs() as logs:
+        first = await r.sync_at(0)
+    assert row_id in first.failed
+    assert actions(first) == [(row_id, "start_clock", None)]
+    assert any(x["event"] == "risk.order_status_unknown" and x["status"] == "held" for x in logs)
+    later = await r.sync_at(80)  # order_resolution_timeout_s after the clock started
+    assert (row_id, "incident", "unknown_status") in actions(later)
+    assert (await order(r.sessions, row_id)).incident == "unknown_status"
+
+
+class HeldButLookupFails(HeldStatus):  # Codex P2-3: the lookup is inconclusive at the bound
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        raise BrokerError("alpaca GET /orders:by_client_order_id returned 429 (request rid-3)")
+
+
+async def test_a_failed_lookup_cannot_downgrade_an_unknown_status(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    r = rig(make_sim(HeldButLookupFails), sessions, gate)
+    row_id, _ = await acked_entry(r)
+    await r.sync_at(0)
+    later = await r.sync_at(80)
+    assert (row_id, "incident", "unknown_status") in actions(later)  # not "lookup_failed"
+
+
+class HeldThenGone(HeldButLookupFails):  # Codex r2: the evidence outlives the pass
+    reads = 0
+
+    async def get_order(self, order_id: str) -> OrderStatus:
+        self.reads += 1
+        if self.reads == 1:
+            raise UnknownOrderStatus("held", "rid-1")
+        raise OrderNotFound(f"{order_id} (request rid-4)")
+
+
+async def test_unknown_status_evidence_lasts_the_resolution_window(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    r = rig(make_sim(HeldThenGone), sessions, gate)
+    row_id, _ = await acked_entry(r)
+    await r.sync_at(0)  # direct read "held"
+    later = await r.sync_at(80)  # direct read 404, lookup 429
+    assert (row_id, "incident", "unknown_status") in actions(later)
+
+
+class ScriptedRead(HeldButLookupFails):
+    """`get_order` of the `target` id plays `steps` in order (None = a real read), then
+    404s; every other id reads normally. The client-id lookup always 429s."""
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.target = ""
+        self.steps: list[Exception | None] = []
+
+    async def get_order(self, order_id: str) -> OrderStatus:
+        if order_id != self.target:
+            return await SimBroker.get_order(self, order_id)
+        step = self.steps.pop(0) if self.steps else OrderNotFound(order_id)
+        if step is None:
+            return await SimBroker.get_order(self, order_id)
+        raise step
+
+
+def scripted(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> tuple[Rig, ScriptedRead]:
+    r = rig(make_sim(ScriptedRead), sessions, gate)
+    assert isinstance(r.sim, ScriptedRead)
+    return r, r.sim
+
+
+async def test_unknown_status_evidence_survives_a_failed_direct_read(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    r, sim = scripted(sessions, gate)
+    row_id, sim.target = await acked_entry(r)
+    busy = BrokerError("alpaca GET /orders/{id} returned 429 (request rid-5)")
+    sim.steps = [UnknownOrderStatus("held", "rid-1"), busy]
+    await r.sync_at(0)  # direct read "held"
+    second = await r.sync_at(40)  # direct read 429: failed, not a candidate
+    assert row_id in second.failed and actions(second) == []
+    last = await r.sync_at(80)  # direct read 404, lookup 429, at the bound
+    assert (row_id, "incident", "unknown_status") in actions(last)
+
+
+async def test_a_successful_read_clears_the_unknown_status_evidence(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    r, sim = scripted(sessions, gate)
+    row_id, sim.target = await acked_entry(r)
+    sim.steps = [UnknownOrderStatus("held", "rid-1"), None]
+    await r.sync_at(0)  # "held"
+    assert actions(await r.sync_at(10)) == [(row_id, "clear_clock", None)]  # readable again
+    assert actions(await r.sync_at(20)) == [(row_id, "start_clock", None)]  # a fresh 404
+    last = await r.sync_at(100)  # that window's bound: 404, lookup 429
+    assert actions(last) == [(row_id, "incident", "lookup_failed")]  # not "unknown_status"
+
+
+async def test_a_successful_check_read_clears_the_unknown_status_evidence(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    # check() reads without resolving, so only its own read can clear the evidence before a
+    # failed sync read would keep it (pruning keeps `failed` rows)
+    r, sim = scripted(sessions, gate)
+    row_id, sim.target = await acked_entry(r)
+    busy = BrokerError("alpaca GET /orders/{id} returned 429 (request rid-5)")
+    sim.steps = [UnknownOrderStatus("held", "rid-1"), None, busy]
+    await r.sync_at(0)  # "held"
+    r.clock.now = NOW + 10 * SEC
+    await r.entry(ETH)  # check()'s read of the row succeeds
+    assert (await order(r.sessions, row_id)).resolve_since is None
+    assert row_id in (await r.sync_at(20)).failed  # 429
+    assert actions(await r.sync_at(30)) == [(row_id, "start_clock", None)]  # a fresh 404
+    last = await r.sync_at(110)
+    assert actions(last) == [(row_id, "incident", "lookup_failed")]
 
 
 class BrokenRead(LookupSpy):
