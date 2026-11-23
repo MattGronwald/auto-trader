@@ -370,7 +370,9 @@ class AlpacaBroker:
             raise OrderNotFound(f"{order_id} (request {rid})")
         raw = _body(result, "get_order")
         with _parsing("get_order", rid):
-            if raw["id"] != order_id:
+            # UUID hex is case-insensitive: `_ORDER_ID` accepts an upper-case id (set by SQL)
+            # and Alpaca answers in lower case (Fable review 2 nit).
+            if _str(raw["id"]).lower() != order_id.lower():
                 raise ValueError("the response is another order")
             state, filled = self._state(raw, rid)
             avg = raw.get("filled_avg_price")

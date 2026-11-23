@@ -168,6 +168,18 @@ async def test_get_order_with_another_id_is_a_broker_error() -> None:  # builder
         await (await broker(r)).get_order(other)
 
 
+async def test_get_order_compares_the_uuid_ignoring_hex_case() -> None:  # Fable review 2 nit
+    # `_ORDER_ID` accepts upper-case hex (an id set by SQL), Alpaca answers in lower case.
+    resting = probe("D2-resting", run="round2")["json"]
+    upper = resting["id"].upper()
+    assert upper != resting["id"]
+    r = Router()
+    r.add("GET", f"/v2/orders/{upper}", 200, resting)
+    status = await (await broker(r)).get_order(upper)
+    assert (status.order_id, status.status) == (upper, "new")
+    assert r.unrouted == []
+
+
 async def test_get_order_and_the_client_id_lookup_map_the_recorded_orders() -> None:
     final = probe("E-final")["json"]
     visible = probe("E-visible")["json"]
@@ -1048,7 +1060,7 @@ async def test_position_read_failures_are_broker_errors(
     assert e.value.__cause__ is None and r.unrouted == []
 
 
-async def test_error_messages_do_not_echo_sdk_messages() -> None:
+async def test_a_transport_error_text_is_not_echoed_by_connect() -> None:
     # The transport error text can carry request details; only the type name is surfaced.
     marker = f"https://user:pass@paper-api/... {SECRET}"
 
