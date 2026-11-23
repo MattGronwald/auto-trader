@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 import pytest
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import tests.unit.risk.test_engine as te
@@ -29,6 +30,7 @@ from autotrader.core.kill import ControlGate
 from autotrader.core.ledger import Ledger
 from autotrader.core.logging import configure_logging
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
+from autotrader.journal.models import Order
 from autotrader.risk.resolve import entry_client_id
 from autotrader.risk.types import ExitRequest
 from tests.unit.broker.alpaca_mock import KEY, SECRET, Router, probe
@@ -184,6 +186,46 @@ async def test_a_filled_status_with_no_fill_leaves_the_row_unsettled(
         await ledger.apply_all(synced)
         stored = await tr.order(sessions, row)
         assert (stored.status, stored.settled_at, stored.incident) == ("new", None, None)
+        assert router.unrouted == []
+    finally:
+        await broker.aclose()
+
+
+async def test_a_filled_status_short_of_its_qty_leaves_a_partly_booked_row_unsettled(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    # Codex round 3 (PR #43): qty 0.01 with 0.005 already booked. A `filled` read reporting
+    # 0.005 asked for no executions (nothing beyond the booked qty) and settled the row, so
+    # later passes could never book the rest. The read now fails and the row stays open.
+    final = {**probe("E-final")["json"], "qty": "0.01", "filled_qty": "0.005"}
+    oid = final["id"]
+    cid = entry_client_id(await tr.jid_of(sessions), 1)
+    row = await tr.insert_row(
+        sessions,
+        cid=cid,
+        status="partially_filled",
+        qty=D("0.01"),
+        broker_order_id=oid,
+        type_="limit",
+        limit_price=D(final["limit_price"]),
+    )
+    async with sessions() as s:
+        await s.execute(update(Order).where(Order.id == row).values(filled_qty=D("0.005")))
+        await s.commit()
+    router = Router()
+    router.add("GET", f"/v2/orders/{oid}", 200, final, repeat=True)
+    router.add("GET", "/v2/assets/BTC/USD", 200, probe("0-asset")["json"], repeat=True)
+    broker = spy(router)
+    try:
+        clock = te.Clock(NOW)
+        ledger = Ledger(EventBus(sessions), sessions, clock=clock)
+        engine = te.make_engine_(broker, sessions, gate, clock=clock, ledger=ledger)
+        synced = await engine.sync_orders()
+        assert row in synced.failed and not synced.complete
+        await ledger.apply_all(synced)
+        stored = await tr.order(sessions, row)
+        assert (stored.status, stored.settled_at) == ("partially_filled", None)
+        assert stored.filled_qty == D("0.005")
         assert router.unrouted == []
     finally:
         await broker.aclose()

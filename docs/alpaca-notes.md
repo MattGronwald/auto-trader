@@ -194,7 +194,8 @@ request rate before enabling writes (PLAN 1.6 row).
 recorded response uses; whitespace, `_`, a `+`, an exponent, NaN or Infinity fail the read) and in
 range: equity, a position's qty and entry price at least 0, `qty_available` between 0 and `qty`,
 one position row per symbol, an order's `qty` and `filled_avg_price` above 0, `filled_qty` at most
-`qty`. Account `cash` is not range-checked (a margin account can show it below zero). A value
+`qty`, and equal to `qty` for a `filled` order (every recorded `filled` response with a `qty`
+reports equality; Codex round 3 on PR #43, 2026-11-23). Account `cash` is not range-checked (a margin account can show it below zero). A value
 out of range is a `BrokerError` naming the request id, never the value (Fable review 2 M2,
 2026-11-23).
 

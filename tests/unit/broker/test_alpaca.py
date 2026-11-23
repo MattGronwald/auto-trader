@@ -1196,6 +1196,33 @@ async def test_an_impossible_order_read_is_a_broker_error(change: dict[str, str]
     assert e.value.__cause__ is None and r.unrouted == []
 
 
+@pytest.mark.parametrize("call", ["get_order", "by_client_id", "submit"])
+@pytest.mark.parametrize("filled", ["0.0001", "0.000204025"])
+async def test_filled_short_of_its_qty_is_a_broker_error(call: str, filled: str) -> None:
+    # Codex round 3 (PR #43): `filled` means completely filled. One that reports less than
+    # its qty would settle the row with executions still unbooked; every recorded paper
+    # `filled` response with a qty reports equality.
+    body = {**(ENTRY if call == "submit" else probe("E-visible"))["json"]}
+    body.update(status="filled", qty="0.000204026", filled_qty=filled)
+    if call == "get_order":
+        body["id"] = OID
+    r = Router()
+    r.add(*_ROUTES[call], 200, body)
+    with pytest.raises(BrokerError) as e:
+        await _invoke(await broker(r), call)
+    assert type(e.value) is BrokerError and "(request rid-1)" in str(e.value)
+    assert filled not in str(e.value)
+    assert e.value.__cause__ is None and r.unrouted == []
+
+
+async def test_a_partly_filled_order_that_ended_canceled_still_reads() -> None:
+    body = {**probe("E-final")["json"], "qty": "1", "status": "canceled", "filled_qty": "0.4"}
+    r = Router()
+    r.add("GET", f"/v2/orders/{body['id']}", 200, body)
+    status = await (await broker(r)).get_order(body["id"])
+    assert (status.status, status.filled_qty) == ("canceled", Decimal("0.4"))
+
+
 @pytest.mark.parametrize("call", ["by_client_id", "submit"])
 async def test_a_lookup_or_ack_filled_beyond_its_qty_is_a_broker_error(call: str) -> None:
     body = {**(probe("E-visible") if call == "by_client_id" else ENTRY)["json"]}

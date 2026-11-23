@@ -16,7 +16,8 @@ docs/alpaca-notes.md for sources, raw values and open questions.
   is malformed: `Decimal(0.5)` would be its binary expansion) and in range (Fable review 2
   M2): equity, a position's qty and entry price non-negative, `0 <= qty_available <= qty`,
   one row per symbol, an order's `qty` and `filled_avg_price` positive and `filled_qty <=
-  qty` where the body carries `qty`; account cash may be negative (margin). Timestamps must
+  qty` where the body carries `qty` (`==` for `filled`, Codex round 3); account cash may be
+  negative (margin). Timestamps must
   be timezone-aware, symbols go through
   `_slash_symbol`; a position's symbol must then match `BASE/QUOTE` (it goes into the
   `/assets/{symbol}` path, which `asset_rules` checks too). The positions body must be a JSON
@@ -432,8 +433,15 @@ class AlpacaBroker:
         filled = _decimal(raw.get("filled_qty"))
         state = order_state(status, filled, request_id)
         qty = raw.get("qty")  # every order we place has one; checked where the body carries it
-        if qty is not None and filled > _positive(qty):
-            raise ValueError("filled_qty exceeds qty")
+        if qty is not None:
+            ordered = _positive(qty)
+            if filled > ordered:
+                raise ValueError("filled_qty exceeds qty")
+            # `filled` means completely filled: one short of its qty would settle the row with
+            # executions still unbooked (Codex round 3, PR #43). A partly filled order that
+            # ended `canceled` reads as before.
+            if status == "filled" and filled != ordered:
+                raise ValueError("filled order reports less than its qty")
         return state, filled
 
     def _ack(self, order: BrokerOrder, result: HttpResult) -> OrderAck:
