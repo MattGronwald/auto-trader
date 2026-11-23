@@ -615,6 +615,8 @@ class RiskEngine:
                     symbol=row.symbol or "",
                     side=row.side,
                     qty=row.qty,
+                    order_type=row.type,
+                    limit_price=row.limit_price,
                     submitted_at=row.submitted_at,
                     broker_order_id=row.broker_order_id if kind == "b" else None,
                 ):

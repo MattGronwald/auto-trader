@@ -319,6 +319,24 @@ async def test_link_refuses_a_view_with_another_client_id(r: Rig) -> None:
         await prepare_link(r.sessions, row, oid, lying)
 
 
+async def test_link_refuses_a_limit_price_mismatch(r: Rig) -> None:
+    cid = await own_cid(r.sessions, 1)
+    ack = await r.sim.submit_order(
+        BrokerOrder(
+            symbol=BTC,
+            side="buy",
+            qty=D("0.01"),
+            type="limit",
+            limit_price=D("100"),
+            time_in_force="ioc",
+            client_order_id=cid,
+        )
+    )
+    row = await tr.insert_row(r.sessions, cid=cid, type_="limit", limit_price=D("101"))
+    with pytest.raises(RepairRefused, match="limit_price"):
+        await prepare_link(r.sessions, row, ack.order_id, lookup_of(r.sim))
+
+
 @pytest.mark.parametrize(
     ("status", "broker_order_id", "incident"),
     [

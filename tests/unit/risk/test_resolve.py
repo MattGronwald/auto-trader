@@ -10,6 +10,7 @@ from autotrader.risk.resolve import (
     CREATED_AT_SKEW,
     entry_client_id,
     exit_client_id,
+    expected_tif,
     mismatches,
     owns,
 )
@@ -25,6 +26,9 @@ def view(**kw: object) -> BrokerOrderView:
         symbol="BTC/USD",
         side="buy",
         qty=D("1"),
+        type="limit",
+        limit_price=D("100"),
+        time_in_force="ioc",
         status="new",
         filled_qty=D(0),
         created_at=SUBMITTED,
@@ -32,12 +36,19 @@ def view(**kw: object) -> BrokerOrderView:
     return BrokerOrderView(**{**base, **kw})
 
 
-def check(v: BrokerOrderView, broker_order_id: str | None = None) -> tuple[str, ...]:
+def check(
+    v: BrokerOrderView,
+    broker_order_id: str | None = None,
+    order_type: str = "limit",
+    limit_price: D | None = D("100"),
+) -> tuple[str, ...]:
     return mismatches(
         v,
         symbol="BTC/USD",
         side="buy",
         qty=D("1"),
+        order_type=order_type,
+        limit_price=limit_price,
         submitted_at=SUBMITTED,
         broker_order_id=broker_order_id,
     )
@@ -96,3 +107,23 @@ def test_created_at_bound_is_inclusive() -> None:
 def test_order_id_is_compared_only_when_given() -> None:
     assert check(view(order_id="anything")) == ()
     assert len(check(view(order_id="anything"), "b-1")) == 1
+
+
+def test_type_limit_price_and_tif_mismatches_are_reported() -> None:
+    assert check(view(type="market", limit_price=None, time_in_force="gtc")) == (
+        "type market != limit",
+        "limit_price None != 100",
+        "time_in_force gtc != ioc",
+    )
+    assert check(view(limit_price=D("100.0"))) == ()  # Decimal equality, not text
+    assert check(view(time_in_force="gtc")) == ("time_in_force gtc != ioc",)
+
+
+def test_market_row_expects_gtc_and_no_limit() -> None:
+    v = view(type="market", limit_price=None, time_in_force="gtc")
+    assert check(v, order_type="market", limit_price=None) == ()
+
+
+def test_unknown_row_type_is_a_mismatch() -> None:
+    assert expected_tif("stop") is None
+    assert "time_in_force ioc != none for type stop" in check(view(), order_type="stop")

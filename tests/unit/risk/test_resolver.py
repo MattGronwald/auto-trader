@@ -219,6 +219,8 @@ async def insert_row(
     symbol: str = BTC,
     submitted_at: datetime = NOW,
     broker_order_id: str | None = None,
+    type_: str = "market",
+    limit_price: D | None = None,
 ) -> int:
     async with sessions() as s:
         row = await repo.insert_order(
@@ -227,10 +229,10 @@ async def insert_row(
             client_order_id=cid,
             symbol=symbol,
             mode="paper",
-            type_="market",
+            type_=type_,
             side="buy",
             qty=qty,
-            limit_price=None,
+            limit_price=limit_price,
             stop_price=None,
             tp_price=None,
             status=status,
@@ -444,6 +446,24 @@ async def test_client_id_hit_with_wrong_qty_or_old_created_at_is_a_mismatch(
     marked = await order(r.sessions, row)
     assert (marked.incident, marked.broker_order_id) == ("client_id_mismatch", None)
     assert await events(r.sessions, "OrderResolved") == []
+
+
+async def test_client_id_hit_differing_only_in_limit_price_is_a_mismatch(r: Rig) -> None:
+    cid = entry_client_id(await jid_of(r.sessions), 7)
+    await r.sim.submit_order(
+        BrokerOrder(
+            symbol=BTC,
+            side="buy",
+            qty=D("0.01"),
+            type="limit",
+            limit_price=D("100"),
+            time_in_force="ioc",
+            client_order_id=cid,
+        )
+    )
+    row = await insert_row(r.sessions, cid=cid, type_="limit", limit_price=D("101"))
+    assert actions(await r.sync_at(0)) == [(row, "incident", "client_id_mismatch")]
+    assert (await order(r.sessions, row)).broker_order_id is None
 
 
 async def test_rows_without_ownership_proof_are_incidents_without_lookup(

@@ -99,14 +99,18 @@ class Position(_Frozen):
 class BrokerOrderView(_Frozen):
     """A broker order as found by its client order id (the order resolver's lookup).
 
-    Only what ownership and booking decisions need: identity, side/qty, status and how
-    much has filled. `created_at` is the broker's creation time."""
+    Only what ownership and booking decisions need: identity, side/qty, type, limit price
+    and time in force (the resolver's match check compares them), status and how much has
+    filled. `created_at` is the broker's creation time."""
 
     order_id: str
     client_order_id: str
     symbol: str
     side: Side
     qty: Dec
+    type: OrderType
+    limit_price: Dec | None
+    time_in_force: TimeInForce
     status: OrderState
     filled_qty: Dec
     created_at: AwareDatetime

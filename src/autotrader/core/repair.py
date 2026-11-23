@@ -11,8 +11,8 @@ broker id); otherwise nothing is written and it raises `RepairRefused`.
 
 - `link` (5.2): records the broker id of an unsettled row that has none (`pending`/`unknown`)
   or that is a type (b) incident, after the broker's order found by the row's own
-  journal-namespaced client id proved ownership and matched symbol, side, qty and the
-  `created_at` bound. No override: a wrong link books a foreign order.
+  journal-namespaced client id proved ownership and matched symbol, side, qty, type, limit
+  price, time in force and the `created_at` bound. No override: a wrong link books a foreign order.
 - `not_submitted` (5.3): marks an unsettled `pending`/`unknown` row without a broker id
   `not_submitted`; the next sync pass settles it with zero fill.
 - `oversell` (5.4): flags a sell row whose latest `LedgerAnomaly` is `oversell` as
@@ -133,6 +133,8 @@ async def prepare_link(
             symbol=order.symbol or "",
             side=order.side,
             qty=order.qty,
+            order_type=order.type,
+            limit_price=order.limit_price,
             submitted_at=order.submitted_at,
             broker_order_id=None,
         )
