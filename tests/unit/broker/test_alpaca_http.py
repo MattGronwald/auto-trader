@@ -11,6 +11,7 @@ from collections.abc import Callable, Coroutine
 from decimal import Decimal
 from typing import Any
 
+import httpcore
 import httpx
 import pytest
 import structlog
@@ -61,8 +62,13 @@ async def test_production_transports_ignore_env_and_never_retry(
     h = AlpacaHttp(base_url=PAPER_URL, key_id=KEY, secret_key=SECRET)
     for client, keepalive in ((h._read, 4), (h._write, 0)):
         pool = client._transport._pool  # type: ignore[attr-defined]
+        # no proxy (spec 3.2 condition): a proxy pool subclasses AsyncConnectionPool, so the
+        # type must be exact, and no env proxy is mounted (final review M3)
+        assert type(pool) is httpcore.AsyncConnectionPool
+        assert client._mounts == {}
         assert pool._retries == 0 and pool._http2 is False
         assert pool._max_keepalive_connections == keepalive
+        assert pool._ssl_context is not None
         assert pool._ssl_context.verify_mode is ssl.CERT_REQUIRED
         assert pool._ssl_context.check_hostname is True
         assert isinstance(pool._network_backend, ClosingBackend)

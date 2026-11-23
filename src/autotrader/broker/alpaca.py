@@ -14,9 +14,11 @@ docs/alpaca-notes.md for sources, raw values and open questions.
   through `sanitize_message`, every other response-derived value through `AlpacaHttp.diag`.
 - Responses: decimals must be JSON strings (a JSON number is malformed: `Decimal(0.5)` would
   be its binary expansion), timestamps must be timezone-aware, symbols go through
-  `_slash_symbol`. A status outside the spec 3.4 table raises `UnknownOrderStatus`. The
+  `_slash_symbol`. A status outside the spec 3.4 table raises `UnknownOrderStatus` (from the
+  submit ack it first logs `alpaca.ack_status_unknown` with the broker order id). The
   submit ack must echo the order (client id, symbol, side, type, TIF, qty, limit price);
   a difference logs `alpaca.ack_mismatch` with the broker order id and raises `BrokerError`.
+  Order ids from responses (ack, `get_order_by_client_id`) must match `[A-Za-z0-9-]+`.
 - Order writes (`submit_order`, `cancel_order`) are refused before any I/O unless
   `orders_enabled`, which `connect()` never sets (enabling is WP 1.6d; paper only).
   `order_fills` lands in WP 1.6b. Reads of one order work from 1.6a on (`repair link`).
@@ -307,8 +309,10 @@ class AlpacaBroker:
         with _parsing("get_order_by_client_id", rid):
             filled = _decimal(raw["filled_qty"])
             limit = raw.get("limit_price")
+            order_id = _str(raw["id"])
+            _check_order_id(order_id)  # it goes into a path (`get_order`) and log lines
             return BrokerOrderView(
-                order_id=_str(raw["id"]),
+                order_id=order_id,
                 client_order_id=_str(raw["client_order_id"]),
                 symbol=_slash_symbol(_str(raw["symbol"])),
                 side=raw["side"],
@@ -380,13 +384,23 @@ class AlpacaBroker:
                     request_id=rid,
                 )
                 raise BrokerError(f"alpaca ack does not match the order (request {rid})")
+            try:
+                status = self._state(raw["status"], _decimal(raw["filled_qty"]), rid)
+            except UnknownOrderStatus as e:  # the order is live; the operator needs its id
+                log.error(
+                    "alpaca.ack_status_unknown",
+                    order_id=diag(order_id, FIELD_RE),
+                    status=e.status,  # already filtered by `_state`
+                    request_id=rid,
+                )
+                raise
             submitted = raw.get("submitted_at") or raw["created_at"]
             cid = raw.get("client_order_id")
             return OrderAck(
                 order_id=order_id,
                 client_order_id=cid if isinstance(cid, str) else None,
                 symbol=order.symbol,
-                status=self._state(raw["status"], _decimal(raw["filled_qty"]), rid),
+                status=status,
                 submitted_at=_aware(submitted),
             )
 
@@ -399,7 +413,7 @@ def _body(result: HttpResult, what: str) -> Any:
 
 
 def _check_order_id(order_id: str) -> None:
-    # The id is withheld: in the ack check it is response data.
+    # The id is withheld: in the ack check and the client-id lookup it is response data.
     if not _ORDER_ID.fullmatch(order_id):
         raise BrokerError(f"refusing an unsafe order id: <withheld: {len(order_id)} chars>")
 

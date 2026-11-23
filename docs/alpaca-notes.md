@@ -168,8 +168,10 @@ Two owner-run probe runs against the paper trading API, plain HTTP with 3 s conn
 Since WP 1.6a every trading-API call (orders, account, positions, asset rules) goes through
 `broker/alpaca_http.py` on `httpx`. `alpaca-py` stays for market data only (until WP 1.6c).
 
-**Why not `alpaca-py` for trading.** Its `TradingClient` is built on `requests` with no timeout
-unless the caller passes one, and it retries (including POST). A retried `POST /orders` or a hang
+**Why not `alpaca-py` for trading.** Its `TradingClient` (0.44) is built on `requests` and sends
+every request without a timeout; `TradingClient.__init__` exposes no timeout or retry setting, so
+neither can be changed without writing private attributes. It retries 429 and 504 (including
+POST). A retried `POST /orders` or a hang
 the engine's I/O budget cannot cut off defeats the "not sent" argument (SPEC §4.6, PLAN D22).
 Its sync calls also needed `to_thread`, which cannot be cancelled once running. The new transport
 has fixed timeouts, no retries and no threads.
@@ -226,9 +228,12 @@ anyio 4.16.0** (h11 0.16.0 transitive). The mapping `ConnectError`, `ConnectTime
    during the TLS handshake skips the close and would leak the socket. Nothing is written by
    then, so the request is still "not sent", but the connection must not leak.
 
-**Conditions** the transport keeps and the argument needs (each pinned by a unit test):
+**Conditions** the transport keeps and the argument needs (each pinned by a unit test,
+`test_production_transports_ignore_env_and_never_retry`):
 - **no proxy**: the proxy modules call `start_tls` after bytes were written. A plain
   `httpcore.AsyncConnectionPool` is built (`proxy` unset) and the clients use `trust_env=False`;
+  the test checks the pool's type is exactly `AsyncConnectionPool` (`AsyncHTTPProxy` subclasses
+  it) and that no proxy transport is mounted;
 - **HTTP/1.1 only**: `http2=False` (ALPN offers `http/1.1` only);
 - **`retries=0`** on the transport;
 - **the anyio backend**: `ClosingBackend` delegates to `httpcore.AnyIOBackend`.
@@ -242,9 +247,11 @@ makes it fail.
 
 **Re-check all of this on any httpx, httpcore or anyio upgrade:** facts 1-5, the four conditions
 and the private `_pool._network_backend` hook (and the private pool attributes
-`test_production_transports_ignore_env_and_never_retry` reads). The versions are pinned in
-`pyproject.toml` (`httpx>=0.28.1,<0.29`, `httpcore>=1.0.9,<1.1`, `anyio>=4.16,<5`) so an upgrade
-is a deliberate step. If a fact no longer holds, `RequestNotSent` is unsafe: stop and take it to
+`test_production_transports_ignore_env_and_never_retry` reads). The verified versions are
+the ones `uv.lock` resolves (exact pins there). `pyproject.toml` declares ranges
+(`httpx>=0.28.1,<0.29`, `httpcore>=1.0.9,<1.1`, `anyio>=4.16,<5`) that allow upgrades, for
+example a `uv lock --upgrade`; any version change in the lock requires re-running this
+verification. If a fact no longer holds, `RequestNotSent` is unsafe: stop and take it to
 the owner.
 
 ## Market data (2026-10-11)

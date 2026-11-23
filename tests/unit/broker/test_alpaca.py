@@ -189,6 +189,21 @@ async def test_a_resting_order_reads_without_a_fill_price() -> None:
     assert r.unrouted == []
 
 
+@pytest.mark.parametrize("bad_id", ["../account", "a/b", f"id {KEY}", ""])
+async def test_the_client_id_lookup_refuses_an_unsafe_order_id(bad_id: str) -> None:
+    # Final review M1: the returned id is checked like the ack's and get_order's; it later
+    # goes into a path (`get_order`) and a log line (`risk.order_lookup_mismatch`).
+    r = Router()
+    r.add("GET", "/v2/orders:by_client_order_id", 200, {**probe("E-visible")["json"], "id": bad_id})
+    with pytest.raises(BrokerError) as e:
+        await (await broker(r)).get_order_by_client_id("at-0123abcd-c1-e")
+    assert type(e.value) is BrokerError and "(request rid-1)" in str(e.value)
+    assert f"<withheld: {len(bad_id)} chars>" in str(e.value)
+    assert "account" not in str(e.value) and KEY not in str(e.value)
+    assert e.value.__cause__ is None and e.value.__suppress_context__
+    assert r.unrouted == []
+
+
 @pytest.mark.parametrize("bad", ["../account", "", "a/b", "id?x=1", "id with space"])
 async def test_unsafe_order_ids_are_refused_before_io(bad: str) -> None:  # review M6
     r = Router()
@@ -519,11 +534,37 @@ async def test_ack_with_unlisted_status_is_unknown() -> None:  # RF 5
     r.add("POST", "/v2/orders", 200, {**ENTRY["json"], "status": "held"})
     r.add("POST", "/v2/orders", 200, {**ioc["json"], "status": "canceled"})
     b = await broker(r)
-    with pytest.raises(UnknownOrderStatus):
+    with capture_logs() as logs, pytest.raises(UnknownOrderStatus):
         await b.submit_order(order_from(ENTRY["body"]))
+    # final review M2: the order is live at the broker; the operator needs its id
+    (line,) = [x for x in logs if x["event"] == "alpaca.ack_status_unknown"]
+    assert line["log_level"] == "error"
+    assert (line["order_id"], line["status"], line["request_id"]) == (
+        ENTRY["json"]["id"],
+        "held",
+        "rid-1",
+    )
     ack = await b.submit_order(order_from(ioc["body"]))
     assert ack.status == "canceled"
     assert r.unrouted == []
+
+
+async def test_an_unknown_status_ack_logs_no_secret() -> None:  # final review M2
+    r = Router()
+    raw = f"held{SECRET}"
+    r.add("POST", "/v2/orders", 200, {**ENTRY["json"], "status": raw})
+    t = structlog.get_logger("t")
+    buf = io.StringIO()
+    configure_logging(stream=buf)  # production chain; tests/conftest.py restores it
+    with pytest.raises(UnknownOrderStatus):
+        try:
+            await (await broker(r)).submit_order(order_from(ENTRY["body"]))
+        except BrokerError:
+            t.exception("risk.order_unknown")
+            raise
+    rendered = buf.getvalue()
+    assert "alpaca.ack_status_unknown" in rendered and ENTRY["json"]["id"] in rendered
+    assert SECRET not in rendered and KEY not in rendered and raw not in rendered
 
 
 async def test_a_malformed_status_or_ack_leaks_no_secret_into_the_rendered_log() -> None:
