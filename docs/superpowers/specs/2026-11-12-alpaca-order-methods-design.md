@@ -279,6 +279,12 @@ reminder.
   fed only by direct reads, so a type (a) row whose last lookup fails ends as `lookup_failed`.
   The adapter logs `alpaca.ack_status_unknown` with the broker order id when an ack carries an
   unmapped status. The runbook procedure covers both kinds of row.
+- *Note 2026-11-23 (Fable review of the implementation, I1):* the limitation in the note above
+  is fixed. A client-id lookup that meets an unmapped status now adds the row to the in-memory
+  evidence too, and the evidence is read at the bound after that pass's lookup, so a type (a)
+  row whose last lookup fails ends as `unknown_status`, not `lookup_failed`. A lookup that links
+  the row (mapped status) clears it, like a successful direct read. A restart inside the window
+  still forgets the evidence for either kind of row.
 
 `OrderAck.submitted_at` is the response's `submitted_at` (else `created_at`); `OrderStatus.reason`
 is null. `avg_fill_price` from `filled_avg_price` (null until filled). Symbols map through the

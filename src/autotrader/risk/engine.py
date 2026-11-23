@@ -36,16 +36,16 @@ never marks a row `not_submitted` (D20.2): a zero match is no proof that an orde
 
 Unknown status (spec 3.4): a status read or lookup that meets an unmapped broker status
 (`UnknownOrderStatus`) means the order exists in a state we cannot book. A row whose direct read
-raised it is remembered in memory (`_status_unknown`) until a direct read of it succeeds or it
-leaves resolution (neither a candidate nor a failed read); while remembered, every inconclusive
-outcome at the bound (`lookup_failed`, `not_found`, `lookup_inconsistent`, not looked up) becomes
-the incident `unknown_status`, which `repair link` accepts only once the broker order is final.
-Only `no_ownership_proof` and `client_id_mismatch` (both returned before this check)
-still win. A restart inside the window forgets the evidence. A type (a) row (no broker id,
-e.g. the submit ack carried the unmapped status) has no direct read, so it is never
-remembered: its client-id lookup meeting the status sets the outcome `unknown_status`, and at
-the bound the outcome of its last lookup decides (a last lookup that fails gives
-`lookup_failed`). `repair not-submitted` refuses an `unknown_status` row.
+or client-id lookup raised it is remembered in memory (`_status_unknown`) until a direct read of
+it succeeds, a lookup links it (type (a)), or it leaves resolution (neither a candidate nor a
+failed read); while remembered, every inconclusive outcome at the bound (`lookup_failed`,
+`not_found`, `lookup_inconsistent`, not looked up) becomes the incident `unknown_status`, which
+`repair link` accepts only once the broker order is final. Only `no_ownership_proof` and
+`client_id_mismatch` (both returned before this check) still win. A restart inside the window
+forgets the evidence. A type (a) row (no broker id, e.g. the submit ack carried the unmapped
+status) is remembered from its first lookup that meets the status, so a later failed lookup
+cannot downgrade it to `lookup_failed` (Fable review I1, 2026-11-23). `repair not-submitted`
+refuses an `unknown_status` row.
 
 Daily-loss baseline (D19, spec 2026-11-09 3): the equity of the latest snapshot observed in
 the `2 x snapshot_interval_s` before the trading-day start; without one, entries are rejected
@@ -263,8 +263,9 @@ class RiskEngine:
         # Last lookup outcome per candidate row, for the incident reason when a later pass
         # cannot look it up (spent budget). Per process: after a restart the reason defaults.
         self._last_outcome: dict[int, IncidentReason] = {}
-        # Rows whose direct read raised `UnknownOrderStatus` (Codex P2-3, r2, r3): kept until a
-        # direct read succeeds or the row leaves resolution. Per process, like _last_outcome.
+        # Rows whose direct read or client-id lookup raised `UnknownOrderStatus` (Codex P2-3,
+        # r2, r3; Fable I1): kept until a direct read succeeds, a lookup links the row, or it
+        # leaves resolution. Per process, like _last_outcome.
         self._status_unknown: set[int] = set()
         self._incident_logged_at: float | None = None  # monotonic time of the last reminder
 
@@ -602,7 +603,6 @@ class RiskEngine:
                 deadline,
                 now,
                 resolutions,
-                status_unknown=row.id in self._status_unknown,
             )
             if reason is None:
                 continue
@@ -630,13 +630,11 @@ class RiskEngine:
         deadline: float,
         now: datetime,
         resolutions: list[OrderResolution],
-        *,
-        status_unknown: bool,
     ) -> IncidentReason | None:
         """One candidate: appends a link, or returns the incident reason (None = wait).
-        `status_unknown`: a direct read of the row met an unmapped status, so any
-        inconclusive outcome at the bound is `unknown_status`. A lookup meeting an unmapped
-        status sets that outcome for either kind of row, type (a) included."""
+        A direct read or a lookup (either kind of row, type (a) included) that met an
+        unmapped status is remembered in `_status_unknown`; read at the bound, after this
+        pass's lookup, it makes any inconclusive outcome `unknown_status`."""
         cid = row.client_order_id
         if cid is None or not owns(cid, jid):
             return "no_ownership_proof"
@@ -648,6 +646,7 @@ class RiskEngine:
                 )
             except UnknownOrderStatus as e:  # found, but in a state we do not map
                 log.warning("risk.order_status_unknown", order_row=row.id, status=e.status)
+                self._status_unknown.add(row.id)  # remembered like a direct read (Fable I1)
                 outcome = "unknown_status"
             except Exception:  # "don't know", never a zero match
                 log.warning("risk.order_lookup_failed", order_row=row.id, exc_info=True)
@@ -670,6 +669,7 @@ class RiskEngine:
                     )
                     return "client_id_mismatch"
                 elif kind == "a":
+                    self._status_unknown.discard(row.id)  # read in a mapped state: gone
                     resolutions.append(
                         OrderResolution(
                             order_row_id=row.id,
@@ -685,7 +685,7 @@ class RiskEngine:
         start = row.submitted_at if kind == "a" else since
         if now >= start + self._resolution_timeout:
             # only no_ownership_proof and client_id_mismatch (both returned before this check) win
-            if status_unknown:
+            if row.id in self._status_unknown:  # read after this pass's lookup (Fable I1)
                 return "unknown_status"
             return outcome or self._last_outcome.get(row.id, "lookup_failed")
         expected = (

@@ -675,11 +675,12 @@ class HeldThenLookupFails(HeldStatus):  # the lookup outcome is fed only by this
         return await super().get_order_by_client_id(client_order_id)
 
 
-async def test_a_type_a_row_whose_last_lookup_fails_ends_as_lookup_failed(
+async def test_a_failed_last_lookup_cannot_downgrade_a_type_a_unknown_status(
     sessions: async_sessionmaker[AsyncSession], gate: ControlGate
 ) -> None:
-    """A type (a) row has no direct read, so `_status_unknown` never holds it: the outcome
-    of the last lookup decides, and an `unknown_status` seen earlier does not carry over."""
+    """Fable review I1 (2026-11-23): a lookup that met the unmapped status is remembered
+    like a direct read, so one failed lookup at the bound cannot turn the row into
+    `lookup_failed`, which `repair not-submitted` would accept."""
     sim = make_sim(HeldThenLookupFails)
     assert isinstance(sim, HeldThenLookupFails)
     r = rig(sim, sessions, gate)
@@ -688,7 +689,48 @@ async def test_a_type_a_row_whose_last_lookup_fails_ends_as_lookup_failed(
     (row,) = await te.orders(sessions)
     assert actions(await r.sync_at(0)) == []
     sim.failing = True
-    assert actions(await r.sync_at(80)) == [(row.id, "incident", "lookup_failed")]
+    assert actions(await r.sync_at(80)) == [(row.id, "incident", "unknown_status")]
+
+
+class LookupScript(SimBroker):
+    """The client-id lookup plays `steps` in order (None = a real lookup), then 429s."""
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.steps: list[Exception | None] = []
+
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        step = (
+            self.steps.pop(0)
+            if self.steps
+            else BrokerError("alpaca GET /orders:by_client_order_id returned 429 (request r)")
+        )
+        if step is None:
+            return await super().get_order_by_client_id(client_order_id)
+        raise step
+
+
+async def test_a_link_clears_the_unknown_status_evidence_of_a_type_a_row(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    """A lookup that reads the order in a mapped state (and links it) is a successful read:
+    the earlier unmapped status no longer counts for a later, fresh resolution window."""
+    sim = make_sim(LookupScript)
+    assert isinstance(sim, LookupScript)
+    r = rig(sim, sessions, gate)
+    sim.fail_submit_after_accept()
+    await r.entry()
+    (row,) = await te.orders(sessions)
+    sim.steps = [UnknownOrderStatus("held", "rid-1"), None]
+    assert actions(await r.sync_at(0)) == []  # "held"
+    linked = await r.sync_at(10)
+    assert [a[:2] for a in actions(linked)] == [(row.id, "link")]
+    broker_id = (await order(sessions, row.id)).broker_order_id
+    assert broker_id is not None
+    sim.forget(broker_id)  # from now on a type (b) row whose lookups 429
+    assert actions(await r.sync_at(20)) == [(row.id, "start_clock", None)]
+    last = await r.sync_at(100)
+    assert actions(last) == [(row.id, "incident", "lookup_failed")]  # not "unknown_status"
 
 
 class HeldButLookupFails(HeldStatus):  # Codex P2-3: the lookup is inconclusive at the bound
