@@ -474,7 +474,7 @@ def test_status_mapping(raw: str, filled: str, ours: str) -> None:
 def test_a_fill_status_without_a_positive_fill_is_a_broker_error(raw: str, filled: str) -> None:
     # Codex P2-2 (PR #43): `filled` with `filled_qty` 0 would settle the row with nothing
     # booked. The status is known, the pair contradicts itself: a failed read, not
-    # `UnknownOrderStatus`. A negative fill fails for every status.
+    # `UnknownOrderStatus`. A negative fill fails for every mapped status.
     with pytest.raises(BrokerError) as e:
         order_state(raw, Decimal(filled), "rid-9")
     assert type(e.value) is BrokerError and "(request rid-9)" in str(e.value)
@@ -517,6 +517,15 @@ def test_unlisted_statuses_raise(raw: str) -> None:
     with pytest.raises(UnknownOrderStatus) as e:
         order_state(raw, Decimal(0), "rid-9")
     assert e.value.status == raw and "rid-9" in str(e.value)
+
+
+@pytest.mark.parametrize("filled", ["-1", "0", "0.5"])
+def test_an_unlisted_status_wins_over_a_contradictory_fill(filled: str) -> None:
+    # Codex round 1 review: an unlisted status takes the bounded `unknown_status` path
+    # (incident + reminders) whatever its `filled_qty`, never an endless plain read failure.
+    with pytest.raises(UnknownOrderStatus) as e:
+        order_state("held", Decimal(filled), "rid-9")
+    assert e.value.status == "held"
 
 
 @pytest.mark.parametrize("call", ["get_order", "by_client_id"])

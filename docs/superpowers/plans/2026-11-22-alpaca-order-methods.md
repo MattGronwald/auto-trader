@@ -1130,6 +1130,8 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
   `BrokerError` (request id, `from None`) for a negative `filled_qty` and for `filled` /
   `partially_filled` with `filled_qty` 0; callers let it pass unchanged (it names the request
   id, so `_parsing` does not append it again), and the read fails instead of settling the row.
+  These checks apply to mapped statuses only: an unlisted status is checked first and raises
+  `UnknownOrderStatus` whatever its `filled_qty`, so it keeps the bounded `unknown_status` path.
 
 - `_parsing(what: str, request_id: str | None)` turns the `TypeError` / `ValueError` /
   `KeyError` / `ArithmeticError` from parsing into `BrokerError` with ` (request <id>)`, and

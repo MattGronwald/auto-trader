@@ -138,6 +138,21 @@ def _check_symbol(symbol: str, *, shown: int | None = None) -> None:
         raise BrokerError(f"refusing an unsafe symbol: <withheld: {n} chars>") from None
 
 
+_MAPPED_STATUSES = frozenset(
+    {
+        "pending_new",
+        "accepted",
+        "new",
+        "pending_cancel",
+        "partially_filled",
+        "filled",
+        "canceled",
+        "expired",
+        "rejected",
+    }
+)
+
+
 def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) -> OrderState:
     """Alpaca order status -> ours (spec 3.4). Anything unlisted raises `UnknownOrderStatus`:
     we never place orders that should reach it, so fail closed rather than guess.
@@ -145,9 +160,13 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
     Pure: the exception carries `raw` as given. Callers in this module re-raise it with the
     status filtered through `AlpacaHttp.diag` (`AlpacaBroker._state`).
 
-    A negative `filled_qty`, or `filled` / `partially_filled` without a positive one,
-    contradicts itself and raises a plain `BrokerError`: the read failed, the row stays
-    unsettled (Codex P2-2, PR #43). The message names only a mapped status."""
+    For a mapped status, a negative `filled_qty`, or `filled` / `partially_filled` without a
+    positive one, contradicts itself and raises a plain `BrokerError`: the read failed, the row
+    stays unsettled (Codex P2-2, PR #43). The message names only a mapped status. An unlisted
+    status is checked first, so it always takes the bounded `unknown_status` path whatever its
+    `filled_qty`."""
+    if raw not in _MAPPED_STATUSES:
+        raise UnknownOrderStatus(raw, request_id)
     if filled_qty < 0:
         raise BrokerError(
             f"alpaca order reports a negative filled_qty (request {request_id})"
@@ -164,9 +183,7 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
         return "filled"
     if raw in ("canceled", "expired"):
         return "canceled"
-    if raw == "rejected":
-        return "rejected"
-    raise UnknownOrderStatus(raw, request_id)
+    return "rejected"
 
 
 class AlpacaBroker:
