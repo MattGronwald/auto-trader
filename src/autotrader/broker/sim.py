@@ -17,45 +17,44 @@ Fill model, driven by `process_bar()`:
   "{order_id}:{n}"). By default an order fills completely in one slice; a test can queue
   a `FillPlan` (`script()`) to split it over bars, cancel or reject it (spec 2026-10-12
   section 5). Partly filled orders are `partially_filled` (not final); reservations cover
-  only the unfilled remainder. `redeliver()` re-emits a fill for duplicate-delivery tests.
+  only the unfilled remainder.
 - Fees: sells pay in USD out of the proceeds. Buys follow `FeeSchedule.buy_fee_asset`:
   "quote" pays the fee in USD on top of the notional; "base" (Alpaca) pays exactly the
   notional and takes the fee from the coin, rounded up to `coin_precision` (default 1e-9). A
   slice too small for its rounded coin fee is rejected. `avg_entry_price` is the fill
   price (Alpaca's convention); cash is exact, never rounded to cents (spec section 3).
 - Spot only: sells can never exceed the position (no shorting).
-- `close_position` sells the exact held qty minus pending sell remainders, even when it
-  is not a multiple of `qty_increment` (Alpaca accepted the exact net qty on paper); a
-  remainder below `min_qty` is dust and is rejected with `DustRemainder` (spec section 4).
-  Whether Alpaca rejects a sell below `min_order_size` is unverified (WP 1.6).
-  A `submit_order` sell whose qty equals the free qty (`Position.qty_available`) behaves
-  the same way: a full close, increment check skipped, `DustRemainder` below `min_qty`.
-  Any other off-increment sell is still rejected.
+- A full close is a `submit_order` sell of the full free qty (`Position.qty_available`):
+  it may be off the `qty_increment` grid (Alpaca accepted the exact net qty on paper), and a
+  remainder below `min_qty` is dust, rejected with `DustRemainder` (spec section 4). Whether
+  Alpaca rejects a sell below `min_order_size` is unverified (WP 1.6). Any other off-increment
+  sell is rejected.
+- `cancel_order` follows Alpaca: a canceled order returns again (204), a filled or rejected one
+  raises `BrokerError` (422, not `OrderRejected`), an unknown id raises `OrderNotFound`.
 - Client order ids: `submit_order` rejects an id already used by a stored order, so
   `get_order_by_client_id` is unambiguous.
 - Test hooks for lost-order scenarios (order resolver): `hide()` (invisible until a
   predicate holds), `fail_submit_after_accept()` (order stored, response lost),
   `forget()` / `unforget()` (reads by broker id miss, lookup by client id still works),
-  `rekey()` (the order moves to a new broker id).
+  `rekey()` (the order moves to a new broker id), `fills()` / `take_fills()` (the emitted
+  fills; there is no stream).
 
 Cash is checked at submit (reserving pending buys) and again at fill, because the price
 can gap; a buy that no longer fits is rejected at fill. Bar floats are converted via
 `str()` so `0.1` becomes `Decimal("0.1")`, not its binary expansion.
 """
 
-import asyncio
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Literal, cast
 
-import structlog
-
 from autotrader.broker.base import (
     Account,
     AssetRules,
+    BrokerError,
     BrokerOrder,
     BrokerOrderView,
     DustRemainder,
@@ -74,7 +73,6 @@ from autotrader.core.types import Bar
 
 _BPS = Decimal(10_000)
 _D0 = Decimal(0)
-log = structlog.get_logger(__name__)
 
 
 def _dec(value: float) -> Decimal:
@@ -124,7 +122,7 @@ class _Order:
     fills: int = 0
     reason: str | None = None
     steps: deque[FillStep] = field(default_factory=deque)
-    full_close: bool = False  # close_position: may be off-increment (spec section 4)
+    full_close: bool = False  # a full-free sell: may be off-increment (spec section 4)
     fill_prefix: str = ""  # fill ids use the id the order was created with, even after rekey()
 
     def __post_init__(self) -> None:
@@ -190,8 +188,8 @@ class SimBroker:
         self._last_price: dict[str, Decimal] = {}
         self._now: datetime | None = None
         self._seq = 0
-        self._fills: asyncio.Queue[Fill] = asyncio.Queue()
-        self._fill_log: dict[str, Fill] = {}  # every emitted fill by id, for redeliver()
+        self._fill_log: dict[str, Fill] = {}  # every emitted fill by id, in emission order
+        self._taken = 0  # how many of _fill_log take_fills() has returned
         self._scripts: dict[tuple[str, str], deque[FillPlan]] = {}
         self._hidden: dict[str, Callable[[], bool]] = {}  # client id -> visible predicate
         self._forgotten: set[str] = set()  # broker ids whose reads miss
@@ -256,8 +254,10 @@ class SimBroker:
 
     async def cancel_order(self, order_id: str) -> None:
         o = self._get(order_id)
+        if o.status == "canceled":
+            return  # Alpaca answers 204 again
         if not o.is_open:
-            raise OrderRejected(f"order {order_id} is not open ({o.status})")
+            raise BrokerError(f"order {order_id} is not cancelable ({o.status})")
         o.status = "canceled"  # final; filled_qty is kept, the remainder is released
 
     async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
@@ -293,34 +293,6 @@ class SimBroker:
         self._get(order_id)
         return [f for f in self._fill_log.values() if f.order_id == order_id]
 
-    async def close_position(self, symbol: str) -> OrderAck:
-        if symbol not in self._holdings:
-            raise OrderRejected(f"no position in {symbol}")
-        qty = self._holdings[symbol].qty - self._pending_qty(symbol, "sell")
-        if qty <= 0:
-            raise OrderRejected(f"position in {symbol} is already fully reserved by pending sells")
-        rules = self.asset_rules_by_symbol[symbol]
-        if qty < rules.min_qty:  # unsellable remainder: stays as dust (HeldPosition.is_dust)
-            raise DustRemainder(symbol, qty, rules.min_qty)
-        return await self._submit(
-            BrokerOrder(symbol=symbol, side="sell", qty=qty, type="market"), full_close=True
-        )
-
-    async def close_all(self) -> list[OrderAck]:
-        """Close every position; a rejected symbol is logged and skipped so it cannot
-        stop the others from being flattened. Returns the acks of submitted closes."""
-        acks: list[OrderAck] = []
-        for symbol in sorted(self._holdings):
-            try:
-                acks.append(await self.close_position(symbol))
-            except OrderRejected as e:
-                log.warning("sim.close_skipped", symbol=symbol, reason=str(e))
-        return acks
-
-    async def stream_fills(self) -> AsyncIterator[Fill]:
-        while True:
-            yield await self._fills.get()
-
     # --- test hooks (lost-order scenarios) ------------------------------------------
 
     def hide(self, client_order_id: str, visible: Callable[[], bool]) -> None:
@@ -353,14 +325,21 @@ class SimBroker:
         self._forgotten.discard(order_id)
         return o.id
 
-    def redeliver(self, fill_id: str) -> None:
-        """Put an already emitted fill on the stream again (same `fill_id`), for duplicate
-        and out-of-order delivery tests. It never creates a new execution. Unknown ids
-        raise KeyError."""
-        self._fills.put_nowait(self._fill_log[fill_id])
+    def fills(self) -> list[Fill]:
+        """Test hook: every emitted fill, in emission order."""
+        return list(self._fill_log.values())
+
+    def take_fills(self) -> list[Fill]:
+        """Test hook: the fills emitted since the previous `take_fills()` call."""
+        out = self.fills()[self._taken :]
+        self._taken += len(out)
+        return out
 
     def can_place_orders(self) -> bool:
         return True
+
+    async def aclose(self) -> None:
+        return
 
     def mode(self) -> Mode:
         return self.broker_mode
@@ -490,7 +469,6 @@ class SimBroker:
             ts=ts,
         )
         self._fill_log[fill.fill_id] = fill
-        self._fills.put_nowait(fill)
 
     def _validate(self, order: BrokerOrder, *, full_close: bool = False) -> None:
         rules = self.asset_rules_by_symbol.get(order.symbol)

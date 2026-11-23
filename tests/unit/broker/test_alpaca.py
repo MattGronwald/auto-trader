@@ -152,13 +152,9 @@ async def test_order_methods_are_not_available_until_wp_1_6() -> None:
         broker.submit_order(order),
         broker.cancel_order("x"),
         broker.get_order("x"),
-        broker.close_position("BTC/USD"),
-        broker.close_all(),
     ):
         with pytest.raises(BrokerError, match=r"WP 1\.6"):
             await call
-    with pytest.raises(BrokerError, match=r"WP 1\.6"):
-        broker.stream_fills()
 
 
 def test_fee_tiers_match_published_schedule() -> None:
@@ -323,7 +319,9 @@ async def test_order_methods_raise_the_typed_unavailable_error() -> None:
     broker = await connect(FakeClient())
     assert broker.can_place_orders() is False
     calls: list[Callable[[], Awaitable[object]]] = [  # lazy: no un-awaited coroutine on failure
-        lambda: broker.close_position("BTC/USD"),
+        lambda: broker.submit_order(
+            BrokerOrder(symbol="BTC/USD", side="buy", qty=Decimal("0.001"), type="market")
+        ),
         lambda: broker.cancel_order("x"),
         lambda: broker.get_order("x"),
         lambda: broker.get_order_by_client_id("x"),

@@ -4,7 +4,7 @@
 decision, applies a pause side effect on rejection, writes the order row, asks the
 control gate and re-checks engine health right before submitting, then submits. `exit()` is
 reduce-only and ignores kill/pause; it sells the free qty through `submit_order` like an
-entry does (`close_position` is never called). Every order carries a journal-namespaced client
+entry does. Every order carries a journal-namespaced client
 id (`risk/resolve.py`); an entry fails closed without the journal id, an exit goes out without
 a client id (logged). Any failure while gathering rejects (fail closed).
 

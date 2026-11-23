@@ -111,6 +111,9 @@ class FakeBroker:
     def mode(self) -> str:
         return "paper"
 
+    async def aclose(self) -> None:
+        return
+
     def fee_schedule(self) -> FeeSchedule:
         return FeeSchedule(maker_bps=Decimal(15), taker_bps=Decimal(25), buy_fee_asset="quote")
 

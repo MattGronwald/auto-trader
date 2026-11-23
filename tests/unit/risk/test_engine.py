@@ -61,6 +61,7 @@ from autotrader.risk.types import (
 )
 from tests.dbhooks import CommitHook, hooked_sessionmaker
 from tests.health import seed_baseline
+from tests.sim_helpers import sell_free
 
 REPO = Path(__file__).resolve().parents[3]
 T = TypeVar("T")
@@ -287,18 +288,13 @@ async def test_missing_journal_id_rejects_entries_but_not_exits(
 
 
 class SellSpy(SimBroker):
-    """Records the orders submitted and any `close_position` call."""
+    """Records the orders submitted."""
 
     submitted: list[BrokerOrder]
-    closes: list[str]
 
     async def submit_order(self, order: BrokerOrder) -> OrderAck:
         self.submitted.append(order)
         return await super().submit_order(order)
-
-    async def close_position(self, symbol: str) -> OrderAck:
-        self.closes.append(symbol)
-        return await super().close_position(symbol)
 
 
 async def test_exit_submits_a_namespaced_market_sell_of_the_free_qty(
@@ -312,7 +308,7 @@ async def test_exit_submits_a_namespaced_market_sell_of_the_free_qty(
         timeframe="5m",
     )
     broker.process_bar(five(29))
-    broker.submitted, broker.closes = [], []
+    broker.submitted = []
     await broker.submit_order(BrokerOrder(symbol=BTC, side="buy", qty=D("1.0001"), type="market"))
     broker.process_bar(five(30))
     broker.submitted.clear()
@@ -325,7 +321,6 @@ async def test_exit_submits_a_namespaced_market_sell_of_the_free_qty(
     assert sent.client_order_id == f"at-{await _jid(sessions)}-o{row.id}"
     assert row.client_order_id == sent.client_order_id
     assert (sent.side, sent.type, sent.qty) == ("sell", "market", held.qty_available)
-    assert broker.closes == []
     broker.process_bar(five(31))
     assert await broker.get_positions() == []  # no holding and no dust remain
 
@@ -1268,7 +1263,7 @@ async def test_exit_on_a_fully_reserved_holding_is_a_plain_failure(
     sim: SimBroker, sessions: async_sessionmaker[AsyncSession], gate: ControlGate
 ) -> None:
     await _held_btc(sim)
-    await sim.close_position(BTC)  # an open sell (not ours) reserves the whole holding
+    await sell_free(sim, BTC)  # an open sell (not ours) reserves the whole holding
     result = await make_engine_(sim, sessions, gate).exit(ExitRequest(symbol=BTC, reason="stop"))
     assert not result.decision.approved
     assert result.decision.reasons == ("reserved by pending sells in BTC/USD",)
@@ -1280,7 +1275,7 @@ async def test_entry_exposure_counts_reserved_qty(
     sessions: async_sessionmaker[AsyncSession], gate: ControlGate, cycle_id: int
 ) -> None:
     broker = await _holding_eth()  # 1 ETH
-    await broker.close_position(ETH)  # a pending sell reserves all of it
+    await sell_free(broker, ETH)  # a pending sell reserves all of it
     (pos,) = [p for p in await broker.get_positions() if p.symbol == ETH]
     assert pos.qty_available == 0
     view = FakeView(prices={ETH: 400.0})  # at its free qty ETH would count 0: entry fits
@@ -2093,7 +2088,7 @@ async def test_cancel_open_entries_cancels_open_buys_only(
         BrokerOrder(symbol=BTC, side="buy", qty=D("1"), type="limit", limit_price=D("51"))
     )
     broker.fail.add(failing.order_id)
-    sell = await broker.close_position(BTC)
+    sell = await sell_free(broker, BTC)
     open_row = await _entry_row(sessions, "new", resting.order_id)
     failed_row = await _entry_row(sessions, "new", failing.order_id)
     unacked = await _entry_row(sessions, "unknown", None)

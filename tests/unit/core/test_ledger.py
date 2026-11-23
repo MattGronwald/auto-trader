@@ -36,6 +36,7 @@ from autotrader.journal import repo
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
 from autotrader.risk.types import OrderResolution, OrderUpdate, SyncResult
 from tests.dbhooks import CommitHook, hooked_sessionmaker
+from tests.sim_helpers import sell_free
 
 REPO = Path(__file__).resolve().parents[3]
 PROFILE = load_profile(REPO / "strategies" / "fast_momentum_v1.yaml")
@@ -126,10 +127,10 @@ async def place(
     external: bool = False,
 ) -> tuple[int, str]:
     """Submit like the Risk Engine does and journal the row. `side`: "buy" (market, or an
-    IOC limit with `limit`), "sell" (market) or "close" (close_position). `qty` is what
-    the row records. Returns (order row id, broker order id)."""
+    IOC limit with `limit`), "sell" (market) or "close" (a market sell of the free qty).
+    `qty` is what the row records. Returns (order row id, broker order id)."""
     if side == "close":
-        ack = await sim.close_position(symbol)
+        ack = await sell_free(sim, symbol)
     elif limit is None:
         ack = await sim.submit_order(
             BrokerOrder(

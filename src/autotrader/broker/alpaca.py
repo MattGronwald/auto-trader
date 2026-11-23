@@ -16,7 +16,7 @@ API; see docs/alpaca-notes.md for sources, raw values and open questions.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any, NoReturn, Protocol
@@ -159,14 +159,8 @@ class AlpacaBroker:
     async def order_fills(self, order_id: str) -> list[Fill]:
         _not_yet("order_fills")
 
-    async def close_position(self, symbol: str) -> OrderAck:
-        _not_yet("close_position")
-
-    async def close_all(self) -> list[OrderAck]:
-        _not_yet("close_all")
-
-    def stream_fills(self) -> AsyncIterator[Fill]:
-        _not_yet("stream_fills")
+    async def aclose(self) -> None:
+        return
 
 
 async def _call[T](what: str, fn: Callable[..., T], *args: Any) -> T:
