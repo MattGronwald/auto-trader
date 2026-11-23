@@ -40,7 +40,8 @@ raised it is remembered in memory (`_status_unknown`) until a direct read of it 
 leaves resolution (neither a candidate nor a failed read); while remembered, every inconclusive
 outcome at the bound (`lookup_failed`, `not_found`, `lookup_inconsistent`, not looked up) becomes
 the incident `unknown_status`, which `repair link` accepts only once the broker order is final.
-Only `client_id_mismatch` still wins. A restart inside the window forgets the evidence.
+Only `no_ownership_proof` and `client_id_mismatch` (both returned before this check)
+still win. A restart inside the window forgets the evidence.
 
 Daily-loss baseline (D19, spec 2026-11-09 3): the equity of the latest snapshot observed in
 the `2 x snapshot_interval_s` before the trading-day start; without one, entries are rejected
@@ -678,7 +679,8 @@ class RiskEngine:
             self._last_outcome[row.id] = outcome
         start = row.submitted_at if kind == "a" else since
         if now >= start + self._resolution_timeout:
-            if status_unknown:  # only client_id_mismatch (returned above) outranks it
+            # only no_ownership_proof and client_id_mismatch (both returned before this check) win
+            if status_unknown:
                 return "unknown_status"
             return outcome or self._last_outcome.get(row.id, "lookup_failed")
         expected = (
@@ -798,7 +800,7 @@ class RiskEngine:
             log.warning(
                 "risk.order_not_submitted",
                 order_row=row_id,
-                reason=f"request not sent: {type(e.__cause__ or e).__name__}",
+                reason=f"request not sent: {e}",
             )
             await self._set_status(row_id, "not_submitted")
             return OrderResult(decision, row_id, "not_submitted")

@@ -2027,7 +2027,7 @@ async def test_an_exit_on_a_broker_that_cannot_trade_is_not_submitted(
 
 class UnsentSubmit(SimBroker):
     async def submit_order(self, order: BrokerOrder) -> OrderAck:
-        raise RequestNotSent("alpaca POST /orders not sent: ConnectError")
+        raise RequestNotSent("alpaca POST /orders not sent: ConnectTimeout (request None)")
 
 
 class WrittenThenFailed(SimBroker):
@@ -2045,7 +2045,9 @@ async def test_an_unsent_entry_is_not_submitted(
     (row,) = await orders(sessions)
     assert (row.status, row.broker_order_id) == ("not_submitted", None)
     (line,) = [x for x in logs if x["event"] == "risk.order_not_submitted"]
-    assert line["reason"] == "request not sent: RequestNotSent"
+    assert line["reason"] == (
+        "request not sent: alpaca POST /orders not sent: ConnectTimeout (request None)"
+    )
 
 
 async def test_an_unsent_exit_is_not_submitted(
