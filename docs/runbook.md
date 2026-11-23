@@ -334,7 +334,7 @@ can never be accepted or become visible (PLAN.md section 3.2 item 4).
 | `not_found` | Zero match until the bound. The order may still exist. | Investigate at the broker, then `repair link` (found) or `repair not-submitted` (authoritative evidence). |
 | `lookup_failed` | The lookups raised until the bound (or the budget ran out), so nothing was learned. | Same as `not_found`. |
 | `lookup_inconsistent` | (b) only: `get_order` says not found while the client-id lookup finds the order, until the bound. | `repair link` with the broker id the lookup reports. |
-| `unknown_status` | (b): the broker reported an order status we do not map (`held`, `suspended`, `replaced`, ...; the log line `risk.order_status_unknown` names the status): the order exists but we cannot book it. Any inconclusive outcome at the bound (`not_found`, `lookup_failed`, `lookup_inconsistent`) of such a row is recorded as this reason; `no_ownership_proof` and `client_id_mismatch` still win. | Recovery below: bring the order to a final state at the broker, then `repair link`. |
+| `unknown_status` | (a) or (b): the broker reported an order status we do not map (`held`, `suspended`, `replaced`, ...; the log line `risk.order_status_unknown` names the status): the order exists but we cannot book it. (a): the client-id lookup met the status in the pass that decides at the bound; this happens e.g. when the submit ack itself carried the status (`alpaca.ack_status_unknown` names the broker order id). (b): a direct read met it, and any inconclusive outcome at the bound (`not_found`, `lookup_failed`, `lookup_inconsistent`) of such a row is recorded as this reason. `no_ownership_proof` and `client_id_mismatch` still win. | Recovery below: bring the order to a final state at the broker, then `repair link`. Never `repair not-submitted` (it refuses this reason). |
 
 The reason is not always the result of a final lookup. A row past its bound whose lookup the
 pass budget (10 s, shared by every unsettled row) did not reach becomes an incident in that
@@ -397,7 +397,8 @@ never migrates: it refuses a journal path that does not exist (`no journal at <p
    `broker_order_id` and clears the incident fields. On `AlpacaBroker` it works since WP 1.6a
    (reads only; no order is written).
 4. **Not found, with authoritative evidence:** `repair not-submitted <row>`, only for an unsettled
-   `pending`/`unknown` row without a broker id. Use it only with what PLAN.md section 3.2 item 4
+   `pending`/`unknown` row without a broker id. It refuses an `unknown_status` incident: that
+   reason is positive evidence the order exists (see "Recovering an `unknown_status` incident"). Use it only with what PLAN.md section 3.2 item 4
    requires: the original worker is quiescent (the core is stopped) **and** authoritative broker
    evidence rules out that the order was or will ever be accepted or become visible, such as a
    broker-confirmed final rejection. A grace window plus a zero-match lookup does not qualify,
@@ -439,19 +440,27 @@ against the broker by hand and expect to correct them.
 ### Recovering an `unknown_status` incident
 
 The broker holds the order in a state the adapter does not map, so nothing can be booked and the
-row keeps its symbol blocked (the fail-closed outcome). Neither `repair not-submitted` (refuses
-rows with a broker id) nor a plain `repair link` (refuses a non-final order) fits:
+row keeps its symbol blocked (the fail-closed outcome). The row may have a broker id (type (b))
+or none (type (a), e.g. the submit ack carried the unmapped status). `repair not-submitted`
+refuses every `unknown_status` row (the order exists), and a plain `repair link` refuses a
+non-final order:
 
 1. Stop the core (Ctrl-C). Note the status in the `risk.order_status_unknown` log line, and the
-   Alpaca request id from the matching `alpaca.http` line, for a support ticket if needed.
-2. Look the order up at the broker by its broker id. **Before linking, check its status there
-   yourself.** The evidence that this was an unmapped status is kept in memory only: after a
-   restart inside the 80 s resolution window an inconclusive lookup can end the row as
-   `lookup_failed` (or `not_found`) instead of `unknown_status`. If the order's status is
-   unmapped, treat the row as `unknown_status` whatever reason it carries.
+   Alpaca request id from the matching `alpaca.http` line, for a support ticket if needed. For a
+   row without a broker id, `alpaca.ack_status_unknown` (if the ack carried the status) names
+   the broker order id.
+2. Look the order up at the broker by its broker id, or for a row without one by its client
+   order id (`client_order_id` column). **Before linking, check its status there yourself**, for
+   both kinds of row. The evidence that this was an unmapped status is weak: for a (b) row it is
+   kept in memory only, so after a restart inside the 80 s resolution window an inconclusive
+   lookup can end the row as `lookup_failed` (or `not_found`) instead of `unknown_status`; for
+   an (a) row only the outcome of its last lookup counts, so a row whose last lookup failed ends
+   as `lookup_failed` even without a restart. If the order's status is unmapped, treat the row
+   as `unknown_status` whatever reason it carries, and do not use `repair not-submitted` on it.
 3. Bring the order to a final state: cancel it in the Alpaca dashboard, or wait until it finishes
    (`filled`, `canceled`, `rejected`).
-4. `repair link <row> <same broker id> --evidence "..."`. It refuses while the order is not final
+4. `repair link <row> <broker id> --evidence "..."` (the row's own broker id, or for an id-less
+   row the id the broker shows for its client order id). It refuses while the order is not final
    (`broker order is not final: <status>`). Do not use it to get past that; the check keeps a row
    from being linked while the order can still move.
 5. Start the core: the ledger books the row's fills from the final state on the next pass.

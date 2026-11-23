@@ -158,8 +158,10 @@ class RequestNotSent(BrokerError):
 
 class UnknownOrderStatus(BrokerError):
     """The broker reported an order status outside the mapped table (spec 3.4). The order
-    exists but its state is unknown: the resolver treats it as type (b) and, at the bound,
-    records the incident `unknown_status`."""
+    exists but its state is unknown. From a direct read (`get_order`) the resolver treats the
+    row as type (b); from the client-id lookup of a row without a broker id (type (a), e.g.
+    the submit ack carried the status) it stays type (a). Either way it can end, at the bound,
+    as the incident `unknown_status`."""
 
     def __init__(self, status: str, request_id: str | None = None) -> None:
         super().__init__(f"unmapped alpaca order status {status!r} (request {request_id})")

@@ -41,7 +41,11 @@ leaves resolution (neither a candidate nor a failed read); while remembered, eve
 outcome at the bound (`lookup_failed`, `not_found`, `lookup_inconsistent`, not looked up) becomes
 the incident `unknown_status`, which `repair link` accepts only once the broker order is final.
 Only `no_ownership_proof` and `client_id_mismatch` (both returned before this check)
-still win. A restart inside the window forgets the evidence.
+still win. A restart inside the window forgets the evidence. A type (a) row (no broker id,
+e.g. the submit ack carried the unmapped status) has no direct read, so it is never
+remembered: its client-id lookup meeting the status sets the outcome `unknown_status`, and at
+the bound the outcome of its last lookup decides (a last lookup that fails gives
+`lookup_failed`). `repair not-submitted` refuses an `unknown_status` row.
 
 Daily-loss baseline (D19, spec 2026-11-09 3): the equity of the latest snapshot observed in
 the `2 x snapshot_interval_s` before the trading-day start; without one, entries are rejected
@@ -631,7 +635,8 @@ class RiskEngine:
     ) -> IncidentReason | None:
         """One candidate: appends a link, or returns the incident reason (None = wait).
         `status_unknown`: a direct read of the row met an unmapped status, so any
-        inconclusive outcome at the bound is `unknown_status`."""
+        inconclusive outcome at the bound is `unknown_status`. A lookup meeting an unmapped
+        status sets that outcome for either kind of row, type (a) included."""
         cid = row.client_order_id
         if cid is None or not owns(cid, jid):
             return "no_ownership_proof"

@@ -536,6 +536,22 @@ async def test_not_submitted_refuses_wrong_state_rows(
         await prepare_not_submitted(r.sessions, row)
 
 
+async def test_not_submitted_refuses_an_unknown_status_incident(r: Rig) -> None:
+    """An `unknown_status` incident is positive evidence that the order exists at the broker
+    (final review I1): a type (a) row (no broker id) can carry it after a client-id lookup met
+    an unmapped status, and marking it `not_submitted` would drop a live order."""
+    row = await tr.insert_row(r.sessions, cid=None, status="unknown", broker_order_id=None)
+    async with r.sessions() as s:
+        await s.execute(
+            update(m.Order)
+            .where(m.Order.id == row)
+            .values(incident="unknown_status", incident_at=NOW)
+        )
+        await s.commit()
+    with pytest.raises(RepairRefused, match="unknown_status incident: the order exists"):
+        await prepare_not_submitted(r.sessions, row)
+
+
 # --- oversell (5.4) ---------------------------------------------------------------------
 
 

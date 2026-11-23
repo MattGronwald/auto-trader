@@ -270,6 +270,15 @@ reminder.
   state (`held`, `suspended`, ...), escalate to Alpaca support; meanwhile the row stays an incident
   and keeps its symbol blocked, the fail-closed outcome. The ledger books the row's fills from the
   final state on the next pass after restart.
+- *Note 2026-11-23 (final review of the implementation, I1):* `unknown_status` is not type (b)
+  only. A row without a broker id (type (a); e.g. the submit ack itself carried the unmapped
+  status, so the row is `unknown`) whose client-id lookup meets the status until the bound
+  becomes the incident `unknown_status` too. Such a row has no broker id, so the operator finds
+  the order by its client order id, and `repair not-submitted` (which accepts id-less rows) would
+  drop a live order: it now refuses every `unknown_status` row. The in-memory evidence above is
+  fed only by direct reads, so a type (a) row whose last lookup fails ends as `lookup_failed`.
+  The adapter logs `alpaca.ack_status_unknown` with the broker order id when an ack carries an
+  unmapped status. The runbook procedure covers both kinds of row.
 
 `OrderAck.submitted_at` is the response's `submitted_at` (else `created_at`); `OrderStatus.reason`
 is null. `avg_fill_price` from `filled_avg_price` (null until filled). Symbols map through the

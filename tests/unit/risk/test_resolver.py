@@ -646,6 +646,51 @@ async def test_an_unknown_status_read_makes_a_type_b_candidate_then_an_incident(
     assert (await order(r.sessions, row_id)).incident == "unknown_status"
 
 
+async def test_a_type_a_row_whose_lookup_meets_an_unknown_status_becomes_that_incident(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    """Final review I1: the submit ack was lost (or carried `held`), so the row has no broker
+    id; its client-id lookup finds the order in an unmapped state until the bound. The
+    incident is `unknown_status` on an id-less row, which `repair not-submitted` refuses."""
+    r = rig(make_sim(HeldStatus), sessions, gate)
+    r.sim.fail_submit_after_accept()
+    await r.entry()
+    (row,) = await te.orders(sessions)
+    assert (row.status, row.broker_order_id) == ("unknown", None)
+    with capture_logs() as logs:
+        for t in (0, 40, 79):
+            assert actions(await r.sync_at(t)) == []
+    assert any(x["event"] == "risk.order_status_unknown" for x in logs)
+    assert actions(await r.sync_at(80)) == [(row.id, "incident", "unknown_status")]
+    marked = await order(sessions, row.id)
+    assert (marked.incident, marked.broker_order_id) == ("unknown_status", None)
+
+
+class HeldThenLookupFails(HeldStatus):  # the lookup outcome is fed only by this pass's lookup
+    failing = False
+
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        if self.failing:
+            raise BrokerError("alpaca GET /orders:by_client_order_id returned 429 (request rid-4)")
+        return await super().get_order_by_client_id(client_order_id)
+
+
+async def test_a_type_a_row_whose_last_lookup_fails_ends_as_lookup_failed(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    """A type (a) row has no direct read, so `_status_unknown` never holds it: the outcome
+    of the last lookup decides, and an `unknown_status` seen earlier does not carry over."""
+    sim = make_sim(HeldThenLookupFails)
+    assert isinstance(sim, HeldThenLookupFails)
+    r = rig(sim, sessions, gate)
+    sim.fail_submit_after_accept()
+    await r.entry()
+    (row,) = await te.orders(sessions)
+    assert actions(await r.sync_at(0)) == []
+    sim.failing = True
+    assert actions(await r.sync_at(80)) == [(row.id, "incident", "lookup_failed")]
+
+
 class HeldButLookupFails(HeldStatus):  # Codex P2-3: the lookup is inconclusive at the bound
     async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
         raise BrokerError("alpaca GET /orders:by_client_order_id returned 429 (request rid-3)")
