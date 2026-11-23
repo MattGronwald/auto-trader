@@ -18,7 +18,7 @@ from structlog.testing import capture_logs
 
 import tests.unit.risk.test_engine as te
 import tests.unit.risk.test_resolver as tr
-from autotrader.broker.base import BrokerOrder, BrokerOrderView
+from autotrader.broker.base import BrokerOrder, BrokerOrderView, UnknownOrderStatus
 from autotrader.broker.sim import SimBroker
 from autotrader.core.bus import CommitUncertain, EventBus
 from autotrader.core.kill import PAUSED_KEY, ControlGate
@@ -319,6 +319,49 @@ async def test_link_refuses_a_view_with_another_client_id(r: Rig) -> None:
         await prepare_link(r.sessions, row, oid, lying)
 
 
+async def test_link_refuses_a_limit_price_mismatch(r: Rig) -> None:
+    cid = await own_cid(r.sessions, 1)
+    ack = await r.sim.submit_order(
+        BrokerOrder(
+            symbol=BTC,
+            side="buy",
+            qty=D("0.01"),
+            type="limit",
+            limit_price=D("100"),
+            time_in_force="ioc",
+            client_order_id=cid,
+        )
+    )
+    row = await tr.insert_row(r.sessions, cid=cid, type_="limit", limit_price=D("101"))
+    with pytest.raises(RepairRefused, match="limit_price"):
+        await prepare_link(r.sessions, row, ack.order_id, lookup_of(r.sim))
+
+
+async def test_link_of_an_unknown_status_incident_needs_a_final_broker_order(r: Rig) -> None:
+    cid = await own_cid(r.sessions, 1)
+    broker_id = await submit(r.sim, cid)
+    row = await tr.insert_row(r.sessions, cid=cid, status="new", broker_order_id=broker_id)
+    async with r.sessions() as s:
+        await s.execute(
+            update(m.Order)
+            .where(m.Order.id == row)
+            .values(incident="unknown_status", incident_at=NOW)
+        )
+        await s.commit()
+
+    async def held(cid: str) -> BrokerOrderView | None:
+        raise UnknownOrderStatus("held", "rid-1")
+
+    with pytest.raises(RepairRefused, match="broker lookup failed: UnknownOrderStatus"):
+        await prepare_link(r.sessions, row, broker_id, held)
+    # the sim's order is open ("new"): refused
+    with pytest.raises(RepairRefused, match="broker order is not final: new"):
+        await prepare_link(r.sessions, row, broker_id, lookup_of(r.sim))
+    await r.sim.cancel_order(broker_id)
+    plan = await prepare_link(r.sessions, row, broker_id, lookup_of(r.sim))
+    assert plan.after["incident"] is None
+
+
 @pytest.mark.parametrize(
     ("status", "broker_order_id", "incident"),
     [
@@ -491,6 +534,25 @@ async def test_not_submitted_refuses_wrong_state_rows(
     row = await tr.insert_row(r.sessions, cid=None, status=status, broker_order_id=broker_order_id)
     with pytest.raises(RepairRefused, match="needs no broker id"):
         await prepare_not_submitted(r.sessions, row)
+
+
+@pytest.mark.parametrize("reason", ["unknown_status", "client_id_mismatch"])
+async def test_not_submitted_refuses_an_incident_that_proves_the_order_exists(
+    r: Rig, reason: str
+) -> None:
+    """Both reasons are positive evidence that the order exists at the broker: a type (a) row
+    (no broker id) gets `unknown_status` when a client-id lookup met an unmapped status (final
+    review I1) and `client_id_mismatch` when the lookup found a differing order under our
+    client id (Fable review I2). Marking it `not_submitted` would drop a live order."""
+    row = await tr.insert_row(r.sessions, cid=None, status="unknown", broker_order_id=None)
+    async with r.sessions() as s:
+        await s.execute(
+            update(m.Order).where(m.Order.id == row).values(incident=reason, incident_at=NOW)
+        )
+        await s.commit()
+    with pytest.raises(RepairRefused, match=f"{reason} incident: the order exists") as refused:
+        await prepare_not_submitted(r.sessions, row)
+    assert "runbook" in str(refused.value)
 
 
 # --- oversell (5.4) ---------------------------------------------------------------------

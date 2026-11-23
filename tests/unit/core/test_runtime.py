@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import dataclasses
 import gc
 import io
 import json
@@ -113,6 +114,11 @@ class FakeBroker:
 
     def fee_schedule(self) -> FeeSchedule:
         return FeeSchedule(maker_bps=Decimal(15), taker_bps=Decimal(25), buy_fee_asset="quote")
+
+    closed = False  # a class attribute: subclasses define `__init__` without `super()`
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class HangingSnapshotBroker(FakeBroker):
@@ -1460,6 +1466,162 @@ async def test_mode_mismatch_fails_startup(
     events = [ln["event"] for ln in _log_lines(buf)]
     assert "core.failed" in events and "core.started" not in events
     assert supervised == [] and not source.streamed
+
+
+# --- broker ownership: connect, check, holder, teardown step (WP 1.6a spec 3.5, 3.7) ------
+
+
+class GatedAccount(FakeBroker):
+    """The first `get_account` (the startup check) waits for `release`; later ones answer."""
+
+    def __init__(self) -> None:
+        self.waiting, self.release = asyncio.Event(), asyncio.Event()
+        self.calls = 0
+
+    async def get_account(self) -> Account:
+        self.calls += 1
+        if self.calls == 1:
+            self.waiting.set()
+            await self.release.wait()
+        return await super().get_account()
+
+
+class FailingAccount(FakeBroker):
+    async def get_account(self) -> Account:
+        raise BrokerError("account read failed")
+
+
+class HangingClose(FakeBroker):
+    async def aclose(self) -> None:
+        await asyncio.Event().wait()
+
+
+async def test_a_clean_shutdown_closes_the_broker(cfg: AppConfig, lock: JournalLock) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    broker = FakeBroker()
+    control, _ = make_control()
+    task = start_core(cfg, lock, control, connect_broker=sim_connect(broker))
+    await _wait_for(lambda: any(ln["event"] == "core.started" for ln in _log_lines(buf)))
+    control.begin("stop")
+    assert await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN and broker.closed
+
+
+async def test_a_mode_mismatch_closes_the_broker(cfg: AppConfig, lock: JournalLock) -> None:
+    broker = LiveBroker()  # mode() == "live" against a paper config
+    control, _ = make_control()
+    with pytest.raises(RuntimeError, match="does not match"):
+        await asyncio.wait_for(
+            start_core(cfg, lock, control, connect_broker=sim_connect(broker)), timeout=5
+        )
+    assert broker.closed
+
+
+async def test_a_stop_during_the_backfill_closes_the_broker(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    in_backfill, go = asyncio.Event(), asyncio.Event()
+
+    async def slow_backfill(self: Any) -> None:
+        in_backfill.set()
+        await go.wait()
+
+    monkeypatch.setattr("autotrader.core.runtime.MarketFeed.backfill", slow_backfill)
+    broker = FakeBroker()
+    control, _ = make_control()
+    task = start_core(cfg, lock, control, connect_broker=sim_connect(broker))
+    await asyncio.wait_for(in_backfill.wait(), timeout=5)
+    control.begin("signal")
+    await asyncio.sleep(0)
+    go.set()  # startup returns None (stop requested); teardown's broker step closes it
+    assert await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN and broker.closed
+
+
+async def test_a_stop_while_the_check_blocks_then_succeeds_closes_the_broker(
+    cfg: AppConfig, lock: JournalLock
+) -> None:
+    broker = GatedAccount()
+    control, _ = make_control()
+    task = start_core(cfg, lock, control, connect_broker=sim_connect(broker))
+    await asyncio.wait_for(broker.waiting.wait(), timeout=5)
+    control.begin("signal")  # teardown starts while the holder is still empty
+    await asyncio.sleep(0)
+    broker.release.set()  # the check succeeds inside the shutdown budget
+    assert await asyncio.wait_for(task, timeout=5) == EXIT_CLEAN and broker.closed
+
+
+async def test_a_failing_or_timed_out_startup_check_closes_the_broker() -> None:
+    failing = FailingAccount()
+    with pytest.raises(BrokerError, match="account read failed"):
+        await runtime._check_broker(sim_connect(failing), Settings(_env_file=None))
+    assert failing.closed
+    gated = GatedAccount()  # its release is never set
+    with pytest.raises(TimeoutError):
+        await runtime._check_broker(sim_connect(gated), Settings(_env_file=None), timeout_s=0.01)
+    assert gated.closed  # outcome only, no timing assert
+
+
+async def test_a_forced_broker_close_makes_the_exit_unclean(
+    cfg: AppConfig, lock: JournalLock
+) -> None:
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    control, _ = make_control(timeout_s=0.5)
+    task = start_core(cfg, lock, control, connect_broker=sim_connect(HangingClose()))
+    await _wait_for(lambda: any(ln["event"] == "core.started" for ln in _log_lines(buf)))
+    control.begin("stop")
+    assert await asyncio.wait_for(task, timeout=5) == EXIT_FAILED
+    forced = next(ln for ln in _log_lines(buf) if ln["event"] == "core.shutdown_forced")
+    assert "broker" in forced["steps"]
+
+
+def test_the_teardown_holder_keeps_only_the_close_callable() -> None:
+    """Fable review 2 M4: the runtime keeps the broker's `aclose` for teardown's `broker`
+    step, not the broker itself (SPEC §0.1: only the Risk Engine holds a `Broker`)."""
+    assert [f.name for f in dataclasses.fields(runtime._BrokerHolder)] == ["close"]
+    assert runtime._BrokerHolder().close is None
+
+
+async def test_teardown_closes_the_broker_after_the_flatten_and_the_bus(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec 3.7 (Fable review 2 M6): the broker step runs after the shutdown flatten and
+    `bus.close`, so no exit or cancel still in flight loses its client."""
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    order: list[str] = []
+    real_request = request_flatten
+
+    async def request(*a: Any, **kw: Any) -> Any:
+        result = await real_request(*a, **kw)
+        order.append("flatten.request")
+        return result
+
+    class OrderedBus(EventBus):
+        async def close(self, budget_s: float = 1.0) -> None:
+            order.append("bus.close")
+            await super().close(budget_s)
+
+    class OrderedClose(FakeBroker):
+        async def aclose(self) -> None:
+            order.append("broker.aclose")
+            await super().aclose()
+
+    monkeypatch.setattr(runtime, "request_flatten", request)
+    monkeypatch.setattr(runtime, "EventBus", OrderedBus)
+    control, _ = make_control()
+    task = start_core(
+        _with_shutdown_flatten(cfg),
+        lock,
+        control,
+        connect_broker=sim_connect(OrderedClose()),
+        sync_s=0.01,
+        manage_s=0.01,
+    )
+    await _wait_for(lambda: bool(_named(buf, "core.started")))
+    control.begin("stop")
+    assert await asyncio.wait_for(task, timeout=10) == EXIT_CLEAN
+    assert order == ["flatten.request", "bus.close", "broker.aclose"]
 
 
 class CountingBroker(FakeBroker):

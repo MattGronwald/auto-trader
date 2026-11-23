@@ -11,18 +11,30 @@ alpaca-py method (the public `run()` starts its own loop); it reconnects on its 
 and a smoke test against the real stream; re-check on alpaca-py upgrades.
 """
 
+import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
 import structlog
 
-from autotrader.broker.alpaca import _call
+from autotrader.broker.base import BrokerError
 from autotrader.core.config import Settings
 from autotrader.core.feed import Latest
 from autotrader.core.types import Bar, Quote
 
 log = structlog.get_logger(__name__)
+
+
+async def _call[T](what: str, fn: Callable[..., T], *args: Any) -> T:
+    """Run a sync SDK call in a thread; any failure becomes a `BrokerError`.
+
+    Market data stays on alpaca-py until WP 1.6c; the trading API moved to our own
+    transport (`alpaca_http.py`) in WP 1.6a."""
+    try:
+        return await asyncio.to_thread(fn, *args)
+    except Exception as e:  # CancelledError is a BaseException and propagates
+        raise BrokerError(f"alpaca {what} failed: {type(e).__name__}") from e
 
 
 class _Historical(Protocol):
@@ -86,8 +98,6 @@ class AlpacaBarSource:
             else None
         )
         if key is None or secret is None:
-            from autotrader.broker.base import BrokerError
-
             raise BrokerError("ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY are not set")
         historical: _Historical = CryptoHistoricalDataClient(key, secret, raw_data=True)
         stream: _Stream = CryptoDataStream(key, secret, raw_data=True)

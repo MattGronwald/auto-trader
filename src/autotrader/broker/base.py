@@ -6,7 +6,6 @@ Only the Risk Engine holds a `Broker` (SPEC §0.1). All money and quantities are
 client-side by the Position Manager.
 """
 
-from collections.abc import AsyncIterator
 from decimal import Decimal
 from typing import Annotated, Literal, Protocol, Self
 
@@ -100,14 +99,18 @@ class Position(_Frozen):
 class BrokerOrderView(_Frozen):
     """A broker order as found by its client order id (the order resolver's lookup).
 
-    Only what ownership and booking decisions need: identity, side/qty, status and how
-    much has filled. `created_at` is the broker's creation time."""
+    Only what ownership and booking decisions need: identity, side/qty, type, limit price
+    and time in force (the resolver's match check compares them), status and how much has
+    filled. `created_at` is the broker's creation time."""
 
     order_id: str
     client_order_id: str
     symbol: str
     side: Side
     qty: Dec
+    type: OrderType
+    limit_price: Dec | None
+    time_in_force: TimeInForce
     status: OrderState
     filled_qty: Dec
     created_at: AwareDatetime
@@ -142,9 +145,27 @@ class BrokerError(Exception):
 
 
 class OrderMethodsUnavailable(BrokerError):
-    """The adapter cannot place, cancel or read orders yet (Alpaca until WP 1.6).
+    """The adapter refuses order writes (Alpaca until WP 1.6d) or cannot serve the call
+    yet (`order_fills` until WP 1.6b).
 
     Nothing was sent, so callers record `not_submitted` (D18 decision 10)."""
+
+
+class RequestNotSent(BrokerError):
+    """The request failed before any byte of it was written (connect, DNS, TLS, pool
+    wait); no order can exist. Submit records `not_submitted` (D22.5)."""
+
+
+class UnknownOrderStatus(BrokerError):
+    """The broker reported an order status outside the mapped table (spec 3.4). The order
+    exists but its state is unknown. From a direct read (`get_order`) the resolver treats the
+    row as type (b); from the client-id lookup of a row without a broker id (type (a), e.g.
+    the submit ack carried the status) it stays type (a). Either way it can end, at the bound,
+    as the incident `unknown_status`."""
+
+    def __init__(self, status: str, request_id: str | None = None) -> None:
+        super().__init__(f"unmapped alpaca order status {status!r} (request {request_id})")
+        self.status = status
 
 
 class OrderRejected(BrokerError):
@@ -176,10 +197,8 @@ class Broker(Protocol):
     async def get_order(self, order_id: str) -> OrderStatus: ...
     async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None: ...
     async def order_fills(self, order_id: str) -> list[Fill]: ...
-    async def close_position(self, symbol: str) -> OrderAck: ...
-    async def close_all(self) -> list[OrderAck]: ...
-    def stream_fills(self) -> AsyncIterator[Fill]: ...
     def can_place_orders(self) -> bool: ...
     def mode(self) -> Mode: ...
     def fee_schedule(self) -> FeeSchedule: ...
     async def asset_rules(self, symbol: str) -> AssetRules: ...
+    async def aclose(self) -> None: ...

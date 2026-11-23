@@ -136,6 +136,11 @@ created by `AlpacaBroker.connect` and closed by `AlpacaBroker.aclose()` (3.7):
   its own field), status or exception type, elapsed ms and Alpaca's `X-Request-ID`. Non-2xx
   responses add Alpaca's `message`. Never headers, never keys. The request id also goes into every
   `BrokerError` message raised from a response.
+  *2026-11-23 note (owner's Codex review of PR #43, P2-3):* that order id field is logged
+  unredacted, so every broker order id (ack, client-id lookup, and the ids `get_order` and
+  `cancel_order` put into a path) must fully match Alpaca's UUID form; anything else raises
+  `BrokerError` with the id withheld, before any I/O for a path. A UUID cannot contain the key
+  id or the secret (no dash-free run longer than 12 characters).
 - **Request budget** (Fable I5): `asset_rules` is cached per symbol for 5 minutes **(builder
   call:** TTL). Today the 2 s sync loop calls it once per symbol per pass, and `exit()`/`check()`
   once per held symbol; uncached, three unsettled orders on three symbols already use about 180 of
@@ -208,7 +213,7 @@ resolver) does the rest.
 | submit **403 with a parsable JSON body** | `OrderRejected` (status, Alpaca's `message`, request id) | row `rejected`. A 403 without a parsable body is `BrokerError` |
 | submit **any other 4xx** (400, 401, 404, 422, …) | `BrokerError` | row `unknown`: the resolver looks the client id up. A 422 is also "client_order_id must be unique", which means an order with that id exists; it must be found, not recorded as rejected. A malformed order shape (a bug) becomes an operator incident after `order_resolution_timeout_s` instead of a silent rejection: deliberate. 401 and 429 stay here in 1.6a; whether they may be `not_submitted` is a 1.6d decision with paper evidence (Fable I5) |
 | `get_order` **404** | `OrderNotFound` | resolver type (b), unchanged |
-| `get_order` with a status 3.4 does not list | `UnknownOrderStatus(BrokerError)` carrying the raw status | resolver type (b), like `OrderNotFound` (3.4) |
+| `get_order` with a status 3.4 does not list | `UnknownOrderStatus(BrokerError)` carrying the raw status *(correction 2026-11-23: it carries the status filtered through `diag`; the raw value only drives the mapping)* | resolver type (b), like `OrderNotFound` (3.4) |
 | `get_order_by_client_id` **404** | returns `None` | resolver: zero match, unchanged |
 | `cancel_order` **204** | returns | |
 | `cancel_order` **422** (order already final, e.g. filled) | `BrokerError` (Fable M4) | `cancel_open_entries` counts it `failed` and retries with backoff until the sync books the final status and it is no longer an open entry. Returning normally would put it into the Position Manager's `_cancel_requested`, which is never retried |
@@ -245,11 +250,17 @@ operator needs its id.
 | `rejected` | `rejected` |
 | anything else (`done_for_day`, `replaced`, `pending_replace`, `stopped`, `suspended`, `calculated`, `held`, `accepted_for_bidding`, unknown values) | `UnknownOrderStatus`: we never place orders that should reach them; fail closed rather than guess |
 
+**2026-11-23 note (owner's Codex review of PR #43, P2-2):** the table assumes a consistent
+`filled_qty`. `filled` or `partially_filled` with `filled_qty` 0, or any status with a negative
+`filled_qty`, raises a plain `BrokerError` (not `UnknownOrderStatus`: the status is known, the
+pair contradicts itself). The read or lookup fails and the row stays unsettled; it is not booked
+as a fill of nothing.
+
 **An unknown status has a bounded path** (Fable I6). Today a `get_order` that raises anything but
 `OrderNotFound` fails the row on every 2 s pass, forever, and the row never becomes a resolver
 candidate (`engine.py` `_read`). `_read` catches `UnknownOrderStatus` like `OrderNotFound`: the
 row becomes a type (b) candidate (clock `resolve_since`), logged `risk.order_status_unknown` with
-the raw status. The resolver's client-id lookup meets the same status; that outcome is recorded
+the raw status *(correction 2026-11-23: the implementation logs the `diag`-filtered status; the raw value only drives the mapping)*. The resolver's client-id lookup meets the same status; that outcome is recorded
 as the new incident reason **`unknown_status`** (fits `orders.incident`, `String(24)`, no
 migration), so after `order_resolution_timeout_s` the row is an incident with the existing
 reminder.
@@ -270,6 +281,27 @@ reminder.
   state (`held`, `suspended`, ...), escalate to Alpaca support; meanwhile the row stays an incident
   and keeps its symbol blocked, the fail-closed outcome. The ledger books the row's fills from the
   final state on the next pass after restart.
+- *Note 2026-11-23 (final review of the implementation, I1):* `unknown_status` is not type (b)
+  only. A row without a broker id (type (a); e.g. the submit ack itself carried the unmapped
+  status, so the row is `unknown`) whose client-id lookup meets the status until the bound
+  becomes the incident `unknown_status` too. Such a row has no broker id, so the operator finds
+  the order by its client order id, and `repair not-submitted` (which accepts id-less rows) would
+  drop a live order: it now refuses every `unknown_status` row. The in-memory evidence above is
+  fed only by direct reads, so a type (a) row whose last lookup fails ends as `lookup_failed`.
+  The adapter logs `alpaca.ack_status_unknown` with the broker order id when an ack carries an
+  unmapped status. The runbook procedure covers both kinds of row.
+- *Note 2026-11-23 (Fable review of the implementation, I1):* the limitation in the note above
+  is fixed. A client-id lookup that meets an unmapped status now adds the row to the in-memory
+  evidence too, and the evidence is read at the bound after that pass's lookup, so a type (a)
+  row whose last lookup fails ends as `unknown_status`, not `lookup_failed`. A lookup that links
+  the row (mapped status) clears it, like a successful direct read. A restart inside the window
+  still forgets the evidence for either kind of row.
+- *Note 2026-11-23 (Fable review of the implementation, I2):* `repair not-submitted` also
+  refuses a `client_id_mismatch` incident. On a row without a broker id it is the same positive
+  evidence (an order exists under our client id), and with the ack identity check of this WP a
+  normal submit can reach it (the ack does not echo the order, the row becomes `unknown`, the
+  first lookup finds the differing order). `repair link` still refuses the mismatch; the
+  runbook sends such a row to escalation.
 
 `OrderAck.submitted_at` is the response's `submitted_at` (else `created_at`); `OrderStatus.reason`
 is null. `avg_fill_price` from `filled_avg_price` (null until filled). Symbols map through the
@@ -285,6 +317,18 @@ it moves there unchanged until 1.6c. Startup's broker check
 (`core/runtime.py` `_check_broker`: `connect()` then `get_account()`) gets one overall timeout of
 `io_timeout_s` **(builder call)**, so a hung connect no longer blocks startup unbounded (Fable M7).
 Both steps close the clients on failure (3.7).
+
+**2026-11-23 note (owner's Codex review of PR #43, P2-1):** `get_positions` parsing is no longer
+unchanged. An empty holdings list means "flat" to the Position Manager, so the body must be a
+JSON array whose rows are objects with a string `asset_class`; a `200 {}`, a `""` or an
+unclassed row raises `BrokerError` (request id, no response data) instead of reading as no
+holdings. Rows of another asset class are still skipped.
+*2026-11-23 follow-up (owner's Codex round 2 on PR #43):* only the known non-spot classes are
+skipped (`us_equity`, `us_option`, `crypto_perp`, as listed by alpaca-py 0.44); a blank or
+unknown `asset_class` fails the read, so a class Alpaca adds later blocks positions reads until
+it is listed. On every order read and the submit ack the status is classified before
+`filled_qty` is decoded, so an unlisted status raises `UnknownOrderStatus` even when the
+quantity is missing or unparsable.
 
 ### 3.6 Match check: `BrokerOrderView` and `mismatches`
 
@@ -338,6 +382,11 @@ stop request, or any later startup error. So:
   so the exit is already unclean). The cancellation lands either before the holder is filled,
   where `connect()` / `_check_broker` close the clients in their own cleanup (best effort, not
   awaited by teardown), or after, where the `broker` step closes it.
+- *Note 2026-11-23 (Fable review 2 of PR #43, M4):* the holder keeps the broker's `aclose`
+  callable, not the broker (`_BrokerHolder.close`; `_teardown(broker_close=...)`), so the
+  runtime holds no `Broker` (SPEC §0.1). The chain, the step position and the accessor rule
+  above are unchanged; a test pins that the `broker` step runs after the shutdown flatten and
+  `bus.close`.
 
 ### 3.8 Writes stay off (defence in depth)
 

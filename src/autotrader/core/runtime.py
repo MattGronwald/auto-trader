@@ -2,7 +2,8 @@
 
 Connects the broker, backfills and streams bars for the universe, persists 1m bars, runs the
 Signal Scanner on closed bars (WP 1.2) and snapshots equity for the daily-loss/drawdown
-checks. The broker is handed to the `RiskEngine`, its only holder from then on (SPEC §0.1).
+checks. The broker is handed to the `RiskEngine`, its only holder from then on (SPEC §0.1);
+the runtime keeps only its `aclose` for teardown (WP 1.6a spec 3.7, Fable review 2 M4).
 
 WP 1.5d-1 (spec 2026-11-09, 5): every `risk.snapshot` step also runs the ledger's cash check
 (guard, snapshot, `check_cash`) and drives the engine's cash-reconciliation fault, which rejects
@@ -54,6 +55,11 @@ WP 1.5a (spec 2026-10-14):
   stream gets the remaining budget to end on its own, so a bar in flight finishes its journal
   writes; a stream error, including one that lands as the stop is requested, fails the
   `stream` step (`core.shutdown_failed`, exit 1).
+- Broker ownership (WP 1.6a spec 3.5, 3.7): `connect()` and the account read of the startup
+  check run under one `BROKER_CHECK_S` timeout and close the broker's clients on their own
+  failure; once the check returns, a holder keeps the broker's `aclose` (not the broker:
+  SPEC §0.1) and teardown calls it in its `broker` step (after `bus.close`, before
+  `engine.dispose`) on every path.
 """
 
 import asyncio
@@ -100,6 +106,17 @@ SYNC_STALL_S = 30.0
 MANAGE_S = 1.0  # Position Manager step
 MANAGE_STALL_S = 30.0
 CLOSE_MARGIN_S = 1.0  # runner.close's budget stays this far below what teardown has left
+BROKER_CHECK_S = 10.0  # startup broker check (connect + get_account), the engine's io_timeout_s
+
+
+@dataclass
+class _BrokerHolder:
+    """The broker's close callable, set in the statement after `_check_broker` returns;
+    teardown's `broker` step calls it (WP 1.6a spec 3.7, runtime ownership). Only the close
+    is kept, not the broker (SPEC §0.1, Fable review 2 M4): a bound `aclose` still refers to
+    its broker object, but nothing here can reach `submit_order` through the holder's type."""
+
+    close: Callable[[], Awaitable[None]] | None = None
 
 
 class _Snapshotter(Protocol):
@@ -332,6 +349,7 @@ async def run_core(
         async with sessions() as session:
             strategy = await repo.register_strategy(session, profile, profile_yaml)
         broker = await _check_broker(connect_broker, settings)
+        holder.close = broker.aclose  # no await in between: from here on teardown closes it
         if broker.mode() != cfg.mode:  # exit() would reject every exit: nothing to protect
             raise RuntimeError(
                 f"broker mode {broker.mode()!r} does not match config mode {cfg.mode!r}"
@@ -461,6 +479,7 @@ async def run_core(
         )
         return _Started(supervisor, stream_task, runner)
 
+    holder = _BrokerHolder()
     startup: asyncio.Task[_Started | None] | None = None
     supervisor: Supervisor | None = None
     stream_task: asyncio.Task[None] | None = None
@@ -519,6 +538,7 @@ async def run_core(
         stream_died=stream_died,
         flatten_step=flatten_step,
         runner=runner,
+        broker_close=lambda: holder.close,
     )
     if failure is not None:
         raise failure
@@ -537,11 +557,15 @@ async def _teardown(
     stream_died: bool = False,
     flatten_step: Callable[[], Awaitable[None]] | None = None,
     runner: CycleRunner | None = None,
+    broker_close: Callable[[], Callable[[], Awaitable[None]] | None] = lambda: None,
 ) -> list[str]:
-    """Ordered, bounded teardown (spec section 4). Each step gets what is left of the
-    deadline; a step still running then is cancelled once and left behind (forced). A step
-    that raises or is cancelled is failed. Either way the remaining steps still run, and
-    the returned list (forced + failed) makes the exit unclean."""
+    """Ordered, bounded teardown (spec section 4). Steps: `startup` (if unfinished),
+    `runner.close`, `flatten`, `source.stop`, the loops, `stream`, `bus.close`, `broker`,
+    `engine.dispose`. Each step gets what is left of the deadline; a step still running then
+    is cancelled once and left behind (forced). A step that raises or is cancelled is failed.
+    Either way the remaining steps still run, and the returned list (forced + failed) makes
+    the exit unclean. `broker_close` is an accessor read only inside the `broker` step: an
+    unfinished startup can still fill the holder (WP 1.6a spec 3.7)."""
     deadline = control.deadline
     if deadline is None:
         raise RuntimeError("teardown before ShutdownControl.begin()")
@@ -585,6 +609,13 @@ async def _teardown(
         # clean.
         await bounded("stream", stream_task)
     await bounded("bus.close", bus.close(budget_s=control.remaining()))
+
+    async def close_broker() -> None:  # after every step that may still use it
+        close = broker_close()
+        if close is not None:
+            await close()
+
+    await bounded("broker", close_broker())
     # A floor even after the deadline (inside the watchdog's 5 s grace): a forced teardown
     # still disposes the journal's pool (dry run, spec revision 2026-10-14). That holds at this
     # moment only: a task abandoned earlier (an uncancelled `check()`) may reopen a connection
@@ -604,9 +635,19 @@ async def _teardown(
     return forced + failed  # any entry makes the exit unclean
 
 
-async def _check_broker(connect_broker: BrokerConnect, settings: Settings) -> Any:
-    broker = await connect_broker(settings)
-    account = await broker.get_account()
+async def _check_broker(
+    connect_broker: BrokerConnect, settings: Settings, timeout_s: float = BROKER_CHECK_S
+) -> Any:
+    """Connect and read the account under one overall timeout. `connect()` closes what it
+    created on its own failure; if `get_account` fails, times out or is cancelled, the
+    broker is closed here before re-raising (WP 1.6a spec 3.5, 3.7)."""
+    async with asyncio.timeout(timeout_s):
+        broker = await connect_broker(settings)
+        try:
+            account = await broker.get_account()
+        except BaseException:
+            await broker.aclose()
+            raise
     fees = broker.fee_schedule()
     log.info(
         "core.broker_connected",

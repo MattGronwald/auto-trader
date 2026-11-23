@@ -10,11 +10,16 @@ plan read (conditional `UPDATE`; `not_submitted` also re-checks that the row sti
 broker id); otherwise nothing is written and it raises `RepairRefused`.
 
 - `link` (5.2): records the broker id of an unsettled row that has none (`pending`/`unknown`)
-  or that is a type (b) incident, after the broker's order found by the row's own
-  journal-namespaced client id proved ownership and matched symbol, side, qty and the
-  `created_at` bound. No override: a wrong link books a foreign order.
+  or that is a type (b) incident; an `unknown_status` incident (either kind of row) only once
+  the broker order is final (filled, canceled or rejected), after the broker's order found by
+  the row's own journal-namespaced client id proved ownership and matched symbol, side, qty,
+  type, limit price, time in force and the `created_at` bound. No override: a wrong link
+  books a foreign order.
 - `not_submitted` (5.3): marks an unsettled `pending`/`unknown` row without a broker id
-  `not_submitted`; the next sync pass settles it with zero fill.
+  `not_submitted`; the next sync pass settles it with zero fill. Refused for an
+  `unknown_status` or `client_id_mismatch` incident: each is positive evidence the order
+  exists at the broker (a type (a) row gets one when its client-id lookup meets an unmapped
+  status, or finds an order under our client id that differs from the row).
 - `oversell` (5.4): flags a sell row whose latest `LedgerAnomaly` is `oversell` as
   `excess_external`; the ledger books the excess as an external holding on the next pass.
 
@@ -44,8 +49,9 @@ Lookup = Callable[[str], Awaitable[BrokerOrderView | None]]
 
 # Type (b) incidents (a row with a broker id) that `repair link` may re-link (spec 5.2, D20.11).
 LINKABLE_INCIDENTS = frozenset(
-    {"not_found", "lookup_failed", "lookup_inconsistent", "client_id_mismatch"}
+    {"not_found", "lookup_failed", "lookup_inconsistent", "client_id_mismatch", "unknown_status"}
 )
+_FINAL = ("filled", "canceled", "rejected")
 _UNRESOLVED = ("pending", "unknown")
 _DATETIME_COLUMNS = frozenset({"incident_at", "resolve_since"})
 
@@ -127,12 +133,16 @@ async def prepare_link(
         raise RepairRefused(f"broker lookup failed: {type(e).__name__}: {e}") from e
     if view is None:
         raise RepairRefused(f"the broker has no order with client id {cid}")
+    if order.incident == "unknown_status" and view.status not in _FINAL:
+        raise RepairRefused(f"broker order is not final: {view.status}")
     differences = list(
         mismatches(
             view,
             symbol=order.symbol or "",
             side=order.side,
             qty=order.qty,
+            order_type=order.type,
+            limit_price=order.limit_price,
             submitted_at=order.submitted_at,
             broker_order_id=None,
         )
@@ -164,6 +174,18 @@ async def prepare_not_submitted(
         raise RepairRefused(
             f"order row {row_id} needs no broker id and status pending/unknown "
             f"(status {order.status}, broker id {order.broker_order_id})"
+        )
+    if order.incident == "unknown_status":
+        raise RepairRefused(
+            f"order row {row_id} is an unknown_status incident: the order exists at the broker "
+            "(a lookup met an unmapped status); find it by its client order id and use "
+            "`repair link` once it is final (runbook)"
+        )
+    if order.incident == "client_id_mismatch":  # Fable review I2
+        raise RepairRefused(
+            f"order row {row_id} is a client_id_mismatch incident: the order exists at the "
+            "broker (a lookup found an order under our client id that differs from the row); "
+            "follow the runbook's client_id_mismatch procedure"
         )
     return _plan(
         order, "not_submitted", {"status": "not_submitted", "incident": None, "incident_at": None}

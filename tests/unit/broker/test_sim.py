@@ -9,6 +9,7 @@ from hypothesis import strategies as st
 from autotrader.broker.base import (
     AssetRules,
     Broker,
+    BrokerError,
     BrokerOrder,
     BrokerOrderView,
     DustRemainder,
@@ -20,6 +21,7 @@ from autotrader.broker.base import (
 from autotrader.broker.sim import FillPlan, SimBroker
 from autotrader.core.types import Bar
 from autotrader.risk.checks import net_pnl_per_unit
+from tests.sim_helpers import sell_free
 
 T0 = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 BTC = "BTC/USD"
@@ -280,7 +282,7 @@ async def test_cancel_filled_or_unknown_order_raises() -> None:
     ack = await sim.submit_order(market("buy", "1"))
     sim.process_bar(bar(1, 100.0))
 
-    with pytest.raises(OrderRejected, match="not open"):
+    with pytest.raises(BrokerError, match="not cancelable"):
         await sim.cancel_order(ack.order_id)
     with pytest.raises(OrderNotFound):
         await sim.cancel_order("nope")
@@ -301,32 +303,32 @@ async def test_client_order_id_is_echoed() -> None:
     assert ack.status == "new"
 
 
-async def test_close_position_and_close_all() -> None:
-    sim = make_sim(cash="10000")
-    sim.process_bar(bar(0, 100.0))
-    sim.process_bar(bar(0, 10.0, symbol="ETH/USD"))
-    await sim.submit_order(market("buy", "1"))
-    await sim.submit_order(market("buy", "2", symbol="ETH/USD"))
-    sim.process_bar(bar(1, 100.0))
-    sim.process_bar(bar(1, 10.0, symbol="ETH/USD"))
-
-    acks = await sim.close_all()
-    sim.process_bar(bar(2, 100.0))
-    sim.process_bar(bar(2, 10.0, symbol="ETH/USD"))
-
-    assert sorted(a.symbol for a in acks) == ["BTC/USD", "ETH/USD"]
-    assert await sim.get_positions() == []
-
-
-async def test_close_position_without_position_raises() -> None:
+async def test_cancel_follows_the_alpaca_contract() -> None:
     sim = make_sim()
     sim.process_bar(bar(0, 100.0))
+    resting = await sim.submit_order(  # gtc limit far below the market: rests
+        BrokerOrder(
+            symbol=BTC, side="buy", qty=Decimal("1"), type="limit", limit_price=Decimal("50")
+        )
+    )
+    await sim.cancel_order(resting.order_id)
+    await sim.cancel_order(resting.order_id)  # canceled again: returns (Alpaca 204)
+    filled = await sim.submit_order(market("buy", "1"))
+    sim.process_bar(bar(1, 100.0))
+    with pytest.raises(BrokerError) as e:
+        await sim.cancel_order(filled.order_id)
+    assert not isinstance(e.value, OrderRejected)  # 422, not a rejection
+    with pytest.raises(OrderNotFound):
+        await sim.cancel_order("sim-999")
 
-    with pytest.raises(OrderRejected, match="no position"):
-        await sim.close_position(BTC)
+
+def test_removed_methods_are_gone() -> None:
+    for name in ("close_position", "close_all", "stream_fills", "redeliver"):
+        assert not hasattr(SimBroker, name)
+    assert not {"close_position", "close_all", "stream_fills"} & set(dir(Broker))
 
 
-# --- account / fills stream ----------------------------------------------------------
+# --- account / fills ----------------------------------------------------------------
 
 
 async def test_equity_is_marked_to_last_close() -> None:
@@ -343,15 +345,14 @@ async def test_equity_is_marked_to_last_close() -> None:
     assert account.equity == Decimal("800") + 2 * Decimal("125")
 
 
-async def test_fills_are_streamed_in_order() -> None:
+async def test_fills_are_listed_in_emission_order() -> None:
     sim = make_sim(cash="10000")
     sim.process_bar(bar(0, 100.0))
     a = await sim.submit_order(market("buy", "1"))
     b = await sim.submit_order(market("buy", "2"))
     sim.process_bar(bar(1, 100.0))
 
-    stream = sim.stream_fills()
-    fills = [await asyncio.wait_for(anext(stream), timeout=1) for _ in range(2)]
+    fills = sim.fills()
 
     assert [f.order_id for f in fills] == [a.order_id, b.order_id]
     assert fills[0].ts == T0 + timedelta(minutes=1)
@@ -365,26 +366,10 @@ async def test_fills_carry_stable_unique_ids_and_fee_asset() -> None:
     b = await sim.submit_order(market("buy", "2"))
     sim.process_bar(bar(1, 100.0))
 
-    stream = sim.stream_fills()
-    fills = [await asyncio.wait_for(anext(stream), timeout=1) for _ in range(2)]
+    fills = sim.fills()
 
     assert [f.fill_id for f in fills] == [f"{a.order_id}:1", f"{b.order_id}:1"]
     assert all(f.fee_asset == "quote" for f in fills)
-
-
-async def test_redeliver_repeats_the_identical_fill() -> None:
-    sim = make_sim()
-    sim.process_bar(bar(0, 100.0))
-    await sim.submit_order(market("buy", "1"))
-    sim.process_bar(bar(1, 100.0))
-    stream = sim.stream_fills()
-    first = await asyncio.wait_for(anext(stream), timeout=1)
-
-    sim.redeliver(first.fill_id)
-
-    assert await asyncio.wait_for(anext(stream), timeout=1) == first
-    with pytest.raises(KeyError):
-        sim.redeliver("sim-999:1")
 
 
 # --- invariants ----------------------------------------------------------------------
@@ -408,7 +393,6 @@ def test_cash_and_positions_never_go_negative_and_cash_is_conserved(
         sim = make_sim(slippage_bps="5")
         sim.process_bar(bar(0, 100.0))
         spent = Decimal(0)
-        stream = sim.stream_fills()
         for i, (kind, n, price) in enumerate(actions, start=1):
             qty = str(Decimal(n) / 100)
             p = str(round(price, 2))
@@ -424,11 +408,7 @@ def test_cash_and_positions_never_go_negative_and_cash_is_conserved(
             account = await sim.get_account()
             assert account.cash >= 0
             assert all(pos.qty > 0 for pos in await sim.get_positions())
-        while True:
-            try:
-                fill = await asyncio.wait_for(anext(stream), timeout=0.001)
-            except TimeoutError:
-                break
+        for fill in sim.fills():
             signed = fill.qty * fill.price
             spent += (signed if fill.side == "buy" else -signed) + fill.fee
         # Exact up to Decimal's 28-significant-digit rounding (summation order differs
@@ -522,7 +502,7 @@ async def test_close_of_fully_reserved_position_is_a_typed_rejection() -> None:
     await sim.submit_order(limit("sell", "1", "200"))
 
     with pytest.raises(OrderRejected, match="fully reserved"):
-        await sim.close_position(BTC)
+        await sell_free(sim, BTC)
 
 
 async def test_repeated_close_is_a_typed_rejection() -> None:
@@ -530,25 +510,10 @@ async def test_repeated_close_is_a_typed_rejection() -> None:
     sim.process_bar(bar(0, 100.0))
     await sim.submit_order(market("buy", "1"))
     sim.process_bar(bar(1, 100.0))
-    await sim.close_position(BTC)
+    await sell_free(sim, BTC)
 
     with pytest.raises(OrderRejected, match="fully reserved"):
-        await sim.close_position(BTC)
-
-
-async def test_close_all_continues_past_a_rejected_symbol() -> None:
-    sim = make_sim(cash="10000")
-    sim.process_bar(bar(0, 100.0))
-    sim.process_bar(bar(0, 10.0, symbol="ETH/USD"))
-    await sim.submit_order(market("buy", "1"))
-    await sim.submit_order(market("buy", "2", symbol="ETH/USD"))
-    sim.process_bar(bar(1, 100.0))
-    sim.process_bar(bar(1, 10.0, symbol="ETH/USD"))
-    await sim.submit_order(limit("sell", "1", "500"))  # BTC fully reserved
-
-    acks = await sim.close_all()
-
-    assert [a.symbol for a in acks] == ["ETH/USD"]
+        await sell_free(sim, BTC)
 
 
 async def test_order_never_fills_on_a_bar_before_its_submission() -> None:
@@ -599,7 +564,7 @@ async def test_ioc_limit_fills_through_limit_with_taker_fee() -> None:
     status = await sim.get_order(ack.order_id)
     assert status.status == "filled"
     assert status.avg_fill_price == Decimal("100.05")  # better of open and limit
-    fill = await anext(sim.stream_fills())
+    (fill,) = sim.fills()
     assert fill.fee == Decimal("100.05") * Decimal("25") / Decimal(10_000)  # taker
 
 
@@ -627,13 +592,7 @@ D = Decimal
 
 
 async def drain(sim: SimBroker) -> list[Fill]:
-    stream = sim.stream_fills()
-    out: list[Fill] = []
-    while True:
-        try:
-            out.append(await asyncio.wait_for(anext(stream), timeout=0.01))
-        except TimeoutError:
-            return out
+    return sim.take_fills()
 
 
 def test_fill_plan_rejects_invalid_steps() -> None:
@@ -777,9 +736,9 @@ async def test_partial_sell_blocks_close_until_canceled() -> None:
     assert (await sim.get_order(sell.order_id)).status == "partially_filled"
 
     with pytest.raises(OrderRejected, match="fully reserved"):
-        await sim.close_position(BTC)  # held 0.5, open sell remainder 0.5
+        await sell_free(sim, BTC)  # held 0.5, open sell remainder 0.5
     await sim.cancel_order(sell.order_id)
-    ack = await sim.close_position(BTC)
+    ack = await sell_free(sim, BTC)
     sim.process_bar(bar(3, 100.0))
 
     assert (await sim.get_order(ack.order_id)).filled_qty == D("0.5")
@@ -827,7 +786,7 @@ async def test_pre_cancel_fill_is_delivered_after_cancel() -> None:
     sim.script(BTC, "buy", FillPlan((D("0.5"),)))
     ack = await sim.submit_order(market("buy", "1"))
     sim.process_bar(bar(1, 100.0))
-    await sim.cancel_order(ack.order_id)  # nobody has read the stream yet
+    await sim.cancel_order(ack.order_id)  # nobody has taken the fills yet
 
     (fill,) = await drain(sim)  # delayed delivery: executed before the cancel
     assert (fill.order_id, fill.qty) == (ack.order_id, D("0.5"))
@@ -957,7 +916,7 @@ async def test_close_sells_an_off_increment_holding_exactly() -> None:
 
     with pytest.raises(OrderRejected, match="not a multiple"):
         await sim.submit_order(market("sell", "0.99779924"))  # ordinary orders still checked
-    ack = await sim.close_position(BTC)
+    ack = await sell_free(sim, BTC)
     sim.process_bar(bar(2, 100.0))
 
     assert (await sim.get_order(ack.order_id)).filled_qty == D("0.99779925")
@@ -971,7 +930,7 @@ async def test_close_of_dust_is_rejected_and_the_position_stays() -> None:
     sim.process_bar(bar(1, 20000.0))  # net 0.00009975 < min_qty 0.0001
 
     with pytest.raises(OrderRejected, match="dust below minimum"):
-        await sim.close_position(BTC)
+        await sell_free(sim, BTC)
     (pos,) = await sim.get_positions()
     assert pos.qty == D("0.00009975")
 
@@ -991,7 +950,7 @@ async def test_tiny_partial_ioc_entry_fill_still_leaves_dust() -> None:
     (pos,) = await sim.get_positions()
     assert pos.qty == D("0.00009975")  # below min_qty 0.0001
     with pytest.raises(OrderRejected, match="dust below minimum"):
-        await sim.close_position(BTC)
+        await sell_free(sim, BTC)
 
 
 # --- properties (WP 1.R2) ---------------------------------------------------------------
@@ -1041,7 +1000,7 @@ def test_replaying_fills_reproduces_cash_and_positions(
                 elif kind == "limit_buy":
                     await sim.submit_order(limit("buy", qty, str(round(price, 2))))
                 elif kind == "close":
-                    await sim.close_position(BTC)
+                    await sell_free(sim, BTC)
                 else:
                     side = kind.removeprefix("script_")
                     sim.script(BTC, side, FillPlan((D(n) / 50,)))  # type: ignore[arg-type]
@@ -1074,7 +1033,7 @@ async def stop_out(
     sim.process_bar(bar(0, float(entry)))
     await sim.submit_order(ioc_buy(str(qty), str(entry)))
     sim.process_bar(bar(1, float(entry)))  # IOC limit fills at entry, taker, no slip
-    await sim.close_position(BTC)
+    await sell_free(sim, BTC)
     sim.process_bar(bar(2, float(stop)))  # market sell at stop x (1 - 10 bps)
     loss = D("1000000") - sim.cash
     expected = -net_pnl_per_unit(entry, stop, fees, exit_slippage) * qty
@@ -1158,7 +1117,7 @@ async def test_dust_close_raises_the_typed_dust_signal() -> None:
     sim.process_bar(bar(1, 20000.0))  # net 0.00009975 < min_qty 0.0001
 
     with pytest.raises(DustRemainder) as caught:
-        await sim.close_position(BTC)
+        await sell_free(sim, BTC)
     assert (caught.value.symbol, caught.value.qty, caught.value.min_qty) == (
         BTC,
         D("0.00009975"),
@@ -1232,6 +1191,9 @@ async def test_get_order_by_client_id_returns_view_or_none() -> None:
         symbol=BTC,
         side="buy",
         qty=D("1"),
+        type="market",
+        limit_price=None,
+        time_in_force="gtc",
         status="new",
         filled_qty=D("0"),
         created_at=ack.submitted_at,

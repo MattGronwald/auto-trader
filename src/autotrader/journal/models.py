@@ -142,8 +142,9 @@ class Order(Base):
     external: Mapped[bool] = mapped_column(default=False, server_default=false())
     # WP 1.5d-2: order resolver. `incident` is the reason an unresolved order needs an
     # operator (NULL = none), `incident_at` when it was raised, `resolve_since` the start of
-    # the not-found clock. `excess_external`: the sell exceeds the journal position (the
-    # excess is a broker holding without a journal position).
+    # the type (b) resolution clock (the first `OrderNotFound` or, since WP 1.6a, unmapped-
+    # status read). `excess_external`: the sell exceeds the journal position (the excess is a
+    # broker holding without a journal position).
     incident: Mapped[str | None] = mapped_column(String(24))
     incident_at: Mapped[datetime | None]
     resolve_since: Mapped[datetime | None]

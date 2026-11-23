@@ -20,7 +20,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
 import tests.unit.risk.test_engine as te
-from autotrader.broker.base import BrokerOrder, BrokerOrderView, OrderAck, OrderStatus
+from autotrader.broker.base import (
+    BrokerError,
+    BrokerOrder,
+    BrokerOrderView,
+    OrderAck,
+    OrderNotFound,
+    OrderStatus,
+    UnknownOrderStatus,
+)
 from autotrader.broker.sim import SimBroker
 from autotrader.core.bus import EventBus
 from autotrader.core.kill import ControlGate
@@ -219,6 +227,8 @@ async def insert_row(
     symbol: str = BTC,
     submitted_at: datetime = NOW,
     broker_order_id: str | None = None,
+    type_: str = "market",
+    limit_price: D | None = None,
 ) -> int:
     async with sessions() as s:
         row = await repo.insert_order(
@@ -227,10 +237,10 @@ async def insert_row(
             client_order_id=cid,
             symbol=symbol,
             mode="paper",
-            type_="market",
+            type_=type_,
             side="buy",
             qty=qty,
-            limit_price=None,
+            limit_price=limit_price,
             stop_price=None,
             tp_price=None,
             status=status,
@@ -446,6 +456,24 @@ async def test_client_id_hit_with_wrong_qty_or_old_created_at_is_a_mismatch(
     assert await events(r.sessions, "OrderResolved") == []
 
 
+async def test_client_id_hit_differing_only_in_limit_price_is_a_mismatch(r: Rig) -> None:
+    cid = entry_client_id(await jid_of(r.sessions), 7)
+    await r.sim.submit_order(
+        BrokerOrder(
+            symbol=BTC,
+            side="buy",
+            qty=D("0.01"),
+            type="limit",
+            limit_price=D("100"),
+            time_in_force="ioc",
+            client_order_id=cid,
+        )
+    )
+    row = await insert_row(r.sessions, cid=cid, type_="limit", limit_price=D("101"))
+    assert actions(await r.sync_at(0)) == [(row, "incident", "client_id_mismatch")]
+    assert (await order(r.sessions, row)).broker_order_id is None
+
+
 async def test_rows_without_ownership_proof_are_incidents_without_lookup(
     sessions: async_sessionmaker[AsyncSession], gate: ControlGate
 ) -> None:
@@ -593,6 +621,237 @@ async def test_incident_holds_back_later_rows_on_its_symbol(r: Rig) -> None:
     assert len(await fills(r.sessions, entry.id)) == len(await fills(r.sessions, second.id)) == 1
     async with r.sessions() as s:
         assert await repo.open_position_symbols(s) == {ETH}
+
+
+class HeldStatus(SimBroker):  # every read of any order meets Alpaca status "held"
+    async def get_order(self, order_id: str) -> OrderStatus:
+        raise UnknownOrderStatus("held", "rid-1")
+
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        raise UnknownOrderStatus("held", "rid-2")
+
+
+async def test_an_unknown_status_read_makes_a_type_b_candidate_then_an_incident(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    r = rig(make_sim(HeldStatus), sessions, gate)
+    row_id, _ = await acked_entry(r)
+    with capture_logs() as logs:
+        first = await r.sync_at(0)
+    assert row_id in first.failed
+    assert actions(first) == [(row_id, "start_clock", None)]
+    assert any(x["event"] == "risk.order_status_unknown" and x["status"] == "held" for x in logs)
+    later = await r.sync_at(80)  # order_resolution_timeout_s after the clock started
+    assert (row_id, "incident", "unknown_status") in actions(later)
+    assert (await order(r.sessions, row_id)).incident == "unknown_status"
+
+
+async def test_the_unknown_status_memory_forgets_a_row_that_left_resolution(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    """Fable review 2 M6: a row that became an incident is no longer read or resolved, so the
+    in-memory evidence for it is dropped instead of growing for the life of the process."""
+    r = rig(make_sim(HeldStatus), sessions, gate)
+    row_id, _ = await acked_entry(r)
+    await r.sync_at(0)
+    assert r.engine._status_unknown == {row_id}
+    assert (row_id, "incident", "unknown_status") in actions(await r.sync_at(80))
+    await r.sync_at(81)  # the incident row is skipped: neither a candidate nor a failure
+    assert r.engine._status_unknown == set()
+
+
+async def test_a_type_a_row_whose_lookup_meets_an_unknown_status_becomes_that_incident(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    """Final review I1: the submit ack was lost (or carried `held`), so the row has no broker
+    id; its client-id lookup finds the order in an unmapped state until the bound. The
+    incident is `unknown_status` on an id-less row, which `repair not-submitted` refuses."""
+    r = rig(make_sim(HeldStatus), sessions, gate)
+    r.sim.fail_submit_after_accept()
+    await r.entry()
+    (row,) = await te.orders(sessions)
+    assert (row.status, row.broker_order_id) == ("unknown", None)
+    with capture_logs() as logs:
+        for t in (0, 40, 79):
+            assert actions(await r.sync_at(t)) == []
+    assert any(x["event"] == "risk.order_status_unknown" for x in logs)
+    assert actions(await r.sync_at(80)) == [(row.id, "incident", "unknown_status")]
+    marked = await order(sessions, row.id)
+    assert (marked.incident, marked.broker_order_id) == ("unknown_status", None)
+
+
+class HeldThenLookupFails(HeldStatus):  # the lookup outcome is fed only by this pass's lookup
+    failing = False
+
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        if self.failing:
+            raise BrokerError("alpaca GET /orders:by_client_order_id returned 429 (request rid-4)")
+        return await super().get_order_by_client_id(client_order_id)
+
+
+async def test_a_failed_last_lookup_cannot_downgrade_a_type_a_unknown_status(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    """Fable review I1 (2026-11-23): a lookup that met the unmapped status is remembered
+    like a direct read, so one failed lookup at the bound cannot turn the row into
+    `lookup_failed`, which `repair not-submitted` would accept."""
+    sim = make_sim(HeldThenLookupFails)
+    assert isinstance(sim, HeldThenLookupFails)
+    r = rig(sim, sessions, gate)
+    sim.fail_submit_after_accept()
+    await r.entry()
+    (row,) = await te.orders(sessions)
+    assert actions(await r.sync_at(0)) == []
+    sim.failing = True
+    assert actions(await r.sync_at(80)) == [(row.id, "incident", "unknown_status")]
+
+
+class LookupScript(SimBroker):
+    """The client-id lookup plays `steps` in order (None = a real lookup), then 429s."""
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.steps: list[Exception | None] = []
+
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        step = (
+            self.steps.pop(0)
+            if self.steps
+            else BrokerError("alpaca GET /orders:by_client_order_id returned 429 (request r)")
+        )
+        if step is None:
+            return await super().get_order_by_client_id(client_order_id)
+        raise step
+
+
+async def test_a_link_clears_the_unknown_status_evidence_of_a_type_a_row(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    """A lookup that reads the order in a mapped state (and links it) is a successful read:
+    the earlier unmapped status no longer counts for a later, fresh resolution window."""
+    sim = make_sim(LookupScript)
+    assert isinstance(sim, LookupScript)
+    r = rig(sim, sessions, gate)
+    sim.fail_submit_after_accept()
+    await r.entry()
+    (row,) = await te.orders(sessions)
+    sim.steps = [UnknownOrderStatus("held", "rid-1"), None]
+    assert actions(await r.sync_at(0)) == []  # "held"
+    linked = await r.sync_at(10)
+    assert [a[:2] for a in actions(linked)] == [(row.id, "link")]
+    broker_id = (await order(sessions, row.id)).broker_order_id
+    assert broker_id is not None
+    sim.forget(broker_id)  # from now on a type (b) row whose lookups 429
+    assert actions(await r.sync_at(20)) == [(row.id, "start_clock", None)]
+    last = await r.sync_at(100)
+    assert actions(last) == [(row.id, "incident", "lookup_failed")]  # not "unknown_status"
+
+
+class HeldButLookupFails(HeldStatus):  # Codex P2-3: the lookup is inconclusive at the bound
+    async def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderView | None:
+        raise BrokerError("alpaca GET /orders:by_client_order_id returned 429 (request rid-3)")
+
+
+async def test_a_failed_lookup_cannot_downgrade_an_unknown_status(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    r = rig(make_sim(HeldButLookupFails), sessions, gate)
+    row_id, _ = await acked_entry(r)
+    await r.sync_at(0)
+    later = await r.sync_at(80)
+    assert (row_id, "incident", "unknown_status") in actions(later)  # not "lookup_failed"
+
+
+class HeldThenGone(HeldButLookupFails):  # Codex r2: the evidence outlives the pass
+    reads = 0
+
+    async def get_order(self, order_id: str) -> OrderStatus:
+        self.reads += 1
+        if self.reads == 1:
+            raise UnknownOrderStatus("held", "rid-1")
+        raise OrderNotFound(f"{order_id} (request rid-4)")
+
+
+async def test_unknown_status_evidence_lasts_the_resolution_window(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    r = rig(make_sim(HeldThenGone), sessions, gate)
+    row_id, _ = await acked_entry(r)
+    await r.sync_at(0)  # direct read "held"
+    later = await r.sync_at(80)  # direct read 404, lookup 429
+    assert (row_id, "incident", "unknown_status") in actions(later)
+
+
+class ScriptedRead(HeldButLookupFails):
+    """`get_order` of the `target` id plays `steps` in order (None = a real read), then
+    404s; every other id reads normally. The client-id lookup always 429s."""
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.target = ""
+        self.steps: list[Exception | None] = []
+
+    async def get_order(self, order_id: str) -> OrderStatus:
+        if order_id != self.target:
+            return await SimBroker.get_order(self, order_id)
+        step = self.steps.pop(0) if self.steps else OrderNotFound(order_id)
+        if step is None:
+            return await SimBroker.get_order(self, order_id)
+        raise step
+
+
+def scripted(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> tuple[Rig, ScriptedRead]:
+    r = rig(make_sim(ScriptedRead), sessions, gate)
+    assert isinstance(r.sim, ScriptedRead)
+    return r, r.sim
+
+
+async def test_unknown_status_evidence_survives_a_failed_direct_read(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    r, sim = scripted(sessions, gate)
+    row_id, sim.target = await acked_entry(r)
+    busy = BrokerError("alpaca GET /orders/{id} returned 429 (request rid-5)")
+    sim.steps = [UnknownOrderStatus("held", "rid-1"), busy]
+    await r.sync_at(0)  # direct read "held"
+    second = await r.sync_at(40)  # direct read 429: failed, not a candidate
+    assert row_id in second.failed and actions(second) == []
+    last = await r.sync_at(80)  # direct read 404, lookup 429, at the bound
+    assert (row_id, "incident", "unknown_status") in actions(last)
+
+
+async def test_a_successful_read_clears_the_unknown_status_evidence(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    r, sim = scripted(sessions, gate)
+    row_id, sim.target = await acked_entry(r)
+    sim.steps = [UnknownOrderStatus("held", "rid-1"), None]
+    await r.sync_at(0)  # "held"
+    assert actions(await r.sync_at(10)) == [(row_id, "clear_clock", None)]  # readable again
+    assert actions(await r.sync_at(20)) == [(row_id, "start_clock", None)]  # a fresh 404
+    last = await r.sync_at(100)  # that window's bound: 404, lookup 429
+    assert actions(last) == [(row_id, "incident", "lookup_failed")]  # not "unknown_status"
+
+
+async def test_a_successful_check_read_clears_the_unknown_status_evidence(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    # check() reads without resolving, so only its own read can clear the evidence before a
+    # failed sync read would keep it (pruning keeps `failed` rows)
+    r, sim = scripted(sessions, gate)
+    row_id, sim.target = await acked_entry(r)
+    busy = BrokerError("alpaca GET /orders/{id} returned 429 (request rid-5)")
+    sim.steps = [UnknownOrderStatus("held", "rid-1"), None, busy]
+    await r.sync_at(0)  # "held"
+    r.clock.now = NOW + 10 * SEC
+    await r.entry(ETH)  # check()'s read of the row succeeds
+    assert (await order(r.sessions, row_id)).resolve_since is None
+    assert row_id in (await r.sync_at(20)).failed  # 429
+    assert actions(await r.sync_at(30)) == [(row_id, "start_clock", None)]  # a fresh 404
+    last = await r.sync_at(110)
+    assert actions(last) == [(row_id, "incident", "lookup_failed")]
 
 
 class BrokenRead(LookupSpy):

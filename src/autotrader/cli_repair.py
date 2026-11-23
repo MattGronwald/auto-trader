@@ -6,10 +6,9 @@ schema is not at head (it never migrates: run `autotrader db upgrade` first), pr
 repair, shows the row, the change and (for `link`) the broker order, asks for confirmation,
 commits and prints the exit hint. For `link` the CLI connects the broker
 and hands it straight to `risk.engine.read_order_by_client_id` (SPEC 0.1); `core/repair.py`
-only receives the lookup callable. The broker is not closed: the `Broker` protocol has no close
-(the Alpaca REST client holds only an HTTP session) and the process exits right after, as
-`run core` does. The lock is held for the whole run: process exit releases
-it (tests call `release()`).
+only receives the lookup callable. `link` closes the broker in a `finally` after the lookup
+(D22 (8)). The lock is held for the whole run: process exit releases it (tests call
+`release()`).
 """
 
 import asyncio
@@ -85,7 +84,10 @@ async def _prepare(
         lookup: Callable[[str], Awaitable[BrokerOrderView | None]] = partial(
             read_order_by_client_id, broker, timeout_s=LOOKUP_TIMEOUT_S
         )
-        return await repair.prepare_link(sessions, row_id, broker_order_id, lookup)
+        try:
+            return await repair.prepare_link(sessions, row_id, broker_order_id, lookup)
+        finally:
+            await broker.aclose()
     if action == "not_submitted":
         return await repair.prepare_not_submitted(sessions, row_id)
     return await repair.prepare_oversell(sessions, row_id)
