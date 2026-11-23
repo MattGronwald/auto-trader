@@ -5,6 +5,7 @@ servers on 127.0.0.1 (`loopback.py`) for what only the real httpx/httpcore stack
 """
 
 import asyncio
+import importlib.metadata
 import io
 import ssl
 from collections.abc import Callable, Coroutine
@@ -75,6 +76,26 @@ async def test_production_transports_ignore_env_and_never_retry(
         assert pool._ssl_context.check_hostname is True
         assert isinstance(pool._network_backend, ClosingBackend)
     await h.aclose()
+
+
+# The versions whose sources the `RequestNotSent` argument was verified against (spec D22,
+# docs/alpaca-notes.md "Why a connect failure proves 'not sent'"). Fable review 2 M3.
+VERIFIED_TRANSPORT_VERSIONS = {
+    "httpx": "0.28.1",
+    "httpcore": "1.0.9",
+    "anyio": "4.16.0",
+    "h11": "0.16.0",
+}
+
+
+def test_the_transport_runs_on_the_versions_the_not_sent_proof_was_verified_on() -> None:
+    installed = {p: importlib.metadata.version(p) for p in VERIFIED_TRANSPORT_VERSIONS}
+    assert installed == VERIFIED_TRANSPORT_VERSIONS, (
+        "httpx/httpcore/anyio/h11 changed: before updating VERIFIED_TRANSPORT_VERSIONS, "
+        "re-verify the ConnectError/ConnectTimeout/PoolTimeout raise sites and the other "
+        "facts in docs/alpaca-notes.md ('Why a connect failure proves \"not sent\"'; "
+        "WP 1.6a spec 3.2, PLAN D22). If one no longer holds, RequestNotSent is unsafe."
+    )
 
 
 async def test_a_set_cookie_is_not_kept() -> None:
