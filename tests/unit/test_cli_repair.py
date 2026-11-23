@@ -139,8 +139,10 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
         lock.release()
 
 
-def sim_with(cid: str, qty: D = D("0.01")) -> tuple[SimBroker, str]:
-    sim = tr.make_sim()
+def sim_with(
+    cid: str, qty: D = D("0.01"), cls: type[SimBroker] = SimBroker
+) -> tuple[SimBroker, str]:
+    sim = tr.make_sim(cls)
     ack = asyncio.run(
         sim.submit_order(
             BrokerOrder(symbol=tr.BTC, side="buy", qty=qty, type="market", client_order_id=cid)
@@ -291,6 +293,25 @@ def test_link_applies_and_records_the_operator(
     assert event.payload["operator"] == "bob" and event.payload["evidence"] == EVIDENCE
     assert "broker order found by client id:" in out and f"order_id = {oid}" in out
     assert event.payload["broker_view"]["order_id"] == oid
+
+
+class ClosingSim(SimBroker):
+    closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_link_closes_the_broker_on_refusal_and_success(rig: Rig) -> None:
+    refused_cid, applied_cid = rig.cid(1), rig.cid(2)
+    refused, refused_oid = sim_with(refused_cid, qty=D("0.02"), cls=ClosingSim)
+    row = rig.insert(cid=refused_cid, qty=D("0.01"))  # qty mismatch: refused
+    code = rig.run("link", row, broker=connect_to(refused), broker_order_id=refused_oid, yes=True)
+    assert code == 1 and isinstance(refused, ClosingSim) and refused.closed
+    applied, applied_oid = sim_with(applied_cid, cls=ClosingSim)
+    row = rig.insert(cid=applied_cid)
+    code = rig.run("link", row, broker=connect_to(applied), broker_order_id=applied_oid, yes=True)
+    assert code == 0 and isinstance(applied, ClosingSim) and applied.closed
 
 
 def test_yes_skips_confirm_and_declined_confirm_writes_nothing(rig: Rig) -> None:
