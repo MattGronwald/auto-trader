@@ -312,7 +312,8 @@ The ledger's 2 s sync pass (`RiskEngine.sync_orders`) resolves two kinds of unse
 
 A row without a client id of this journal becomes a `no_ownership_proof` incident at once (no
 lookup, no bound). Otherwise it looks the order up by client id. For (a), a match on symbol, side,
-qty and creation time (5 minutes of skew) links the row (`risk.order_resolved`, `OrderResolved`
+qty, order type, limit price, time in force (the one our own submits use for that type) and
+creation time (no earlier than 5 minutes before `submitted_at`) links the row (`risk.order_resolved`, `OrderResolved`
 event; the next read books its fills and settles it; on `AlpacaBroker` before WP 1.6b only
 when there is no unbooked fill, see "Current limits"). For (b), a match links nothing: the row
 keeps its clock and becomes `lookup_inconsistent` at the bound. A zero match or a failed lookup
@@ -334,7 +335,7 @@ can never be accepted or become visible (PLAN.md section 3.2 item 4).
 
 | Incident reason | Meaning | Repair |
 |---|---|---|
-| `no_ownership_proof` | The row has no client id of this journal (NULL or legacy form), so no lookup was made. | Manual procedure below. |
+| `no_ownership_proof` | The row has no client id of this journal (NULL or legacy form), so no lookup was made. A (b) row (it has a broker id, e.g. an exit sent without a client id) gets this reason on its first `OrderNotFound` or unmapped-status read, without the 80 s window; `risk.order_status_unknown` before it shows that an unmapped status was the cause (a known gap until WP 1.6d, PLAN 1.6 row). | Manual procedure below. If the cause was an unmapped status, bring the order to a final state at the broker first: the hand-written link only holds once the status is mapped, otherwise the next read raises the incident again. |
 | `client_id_mismatch` | The broker has an order under our client id that differs from the row (symbol, side, qty, order type, limit price, time in force, the `created_at` bound, or broker id). The order exists; a broker inconsistency. | Find out which is right; `repair link` only if it matches after all, else escalate ("Repair commands", step 4). Never `repair not-submitted` (it refuses this reason). |
 | `not_found` | Zero match until the bound. The order may still exist. | Investigate at the broker, then `repair link` (found) or `repair not-submitted` (authoritative evidence). |
 | `lookup_failed` | The lookups raised until the bound (or the budget ran out), so nothing was learned. | Same as `not_found`. |
@@ -491,18 +492,78 @@ support; the row stays an incident and keeps reminding every 60 s.
 
 ### Alpaca request log
 
-Every trading-API call writes one `alpaca.http` line: `method`, `path` (the template, e.g.
+Every trading-API call that returns or raises writes one `alpaca.http` line: `method`, `path` (the template, e.g.
 `/orders/{id}`), `order_id` for a single-order call, `status` or `error` (the exception type
 name), `elapsed_ms`, and `request_id` (Alpaca's `X-Request-ID`); a non-2xx adds Alpaca's
 `message`. It is `info` for a 2xx and `warning` otherwise; headers and keys are never logged. The
 request id is also in the text of every `BrokerError` raised from a response, so the incident or
-`risk.*` line carries it too: quote it when asking Alpaca about a call.
+`risk.*` line carries it too: quote it when asking Alpaca about a call. A call cancelled while in
+flight (the engine's I/O budget ran out, or a shutdown cut it) writes **no** `alpaca.http` line
+until WP 1.6d adds one (PLAN 1.6 row): for such a call, e.g. a submit that ended `unknown` on a
+timeout, the engine's `risk.*` line is the only record, and there is no request id.
 
 Broker order ids must be Alpaca's UUID form (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, hex). The
 adapter refuses any other id before the request, and an off-pattern id in a response, with
-`refusing an unsafe order id: <withheld: N chars>`. A broker id typed into `repair link` or set
-by hand with SQL (steps above) that is not a UUID fails every read of the row with that message:
-copy the id exactly as Alpaca shows it.
+`refusing an unsafe order id: <withheld: N chars>`. `repair link` cannot store such an id: it
+links only when the typed id equals the id the broker's lookup returns, which is a UUID (copy it
+exactly as Alpaca shows it, lower case). A broker id set by hand with SQL (step 5 above) that is
+not a UUID fails every read of the row with that message, as in "A linked order whose read keeps
+failing" below; correct the id with the same SQL. Upper-case hex reads, but `repair link`
+compares the id exactly.
+
+### A linked order whose read keeps failing
+
+Symptom: `risk.order_sync_failed` for the same `order_row`, with a `BrokerError` traceback, every
+sync pass (about every 2 s) without end, and no `risk.order_incident` for the row. Entries are
+rejected on every symbol (`state unavailable: SyncIncomplete`, `order rows not synced: [<row>]`)
+and the unsettled row holds back flatten.
+
+Meaning: the row has a broker id and Alpaca keeps answering `get_order` with a 2xx the adapter
+refuses as malformed: a status contradicted by `filled_qty` (`alpaca order status 'filled' with
+no filled_qty`, `alpaca order reports a negative filled_qty`), a value out of range or not a
+plain decimal string, another order's id, or a missing field (`unexpected alpaca get_order
+response: <type> (request ...)`), or an id that is not a UUID (`refusing an unsafe order id`).
+A transient failure (5xx, timeout) looks the same but stops on its own; this one does not. Unlike
+`OrderNotFound` or an unmapped status, it starts no resolution clock and never becomes an
+incident, so `repair link` and `repair not-submitted` both refuse the row (it has a broker id and
+no incident). Nothing is booked from the malformed answer (fail-closed). A bounded path with an
+incident is a precondition of WP 1.6d (PLAN 1.6 row).
+
+Recovery:
+1. Keep the manual pause; stop the core (Ctrl-C) if the repeating traceback floods the log.
+2. Note the request id from the `BrokerError` text and the `alpaca.http` line, and look the order
+   up in the Alpaca dashboard by the row's `broker_order_id` (step 1 of "Repair commands").
+3. If the id itself is wrong (set by hand, not a UUID or not the order you meant), correct it
+   with the step 5 SQL and record your evidence. Otherwise there is no supported repair before
+   WP 1.6d: escalate (owner; Alpaca support with the request id). Do not mark the row
+   `not_submitted` or clear it by SQL to get entries going: the order exists at the broker.
+
+### Positions read refused (unknown `asset_class` or symbol)
+
+Symptom: every broker positions read fails with `unexpected alpaca positions response: not a list
+of positions with a known asset_class (request ...)`, `refusing an unsafe symbol: <withheld: N
+chars>` or `cannot map position symbol to BASE/QUOTE: <withheld: N chars>`, or the generic
+`unexpected alpaca positions response: ValueError (request ...)` for an impossible value. You see
+it in `risk.snapshot_failed` (the snapshot loses its exposure),
+`positions.flatten_read_failed` (external sales and the flatten check cannot run, so a flatten
+never completes), `risk.exit_state_unavailable` for every exit attempt on any symbol (an exit
+reads the positions first; `positions.exit_failing` follows after repeated failures), and
+admission's holdings check keeps failing.
+
+Meaning: the adapter fails the whole read closed rather than hide a holding: a row whose
+`asset_class` is missing or not one of `crypto`, `us_equity`, `us_option`, `crypto_perp`, a crypto
+symbol it cannot map to `BASE/QUOTE` or that is off the config's symbol pattern, or (Fable review
+2 M2) an impossible value (a negative qty, `qty_available` above `qty`, two rows for one symbol).
+No exit can be sent while it lasts; the kill switch and the manual pause still work.
+
+Recovery:
+1. Check the positions in the Alpaca dashboard. A holding you did not expect (a new asset class,
+   a transferred coin, an option) is the usual cause.
+2. If a position must be closed now, close it in the Alpaca dashboard; the bot cannot.
+3. A new asset class Alpaca introduced needs a code change adding it to `_ASSET_CLASSES` in
+   `broker/alpaca.py` (spot `crypto` stays the only one held); an odd symbol or value is a broker
+   inconsistency to escalate with the request id. Once the read succeeds again the loops recover
+   on their own.
 
 A submit the transport proved unsent is marked `not_submitted` and logged
 `risk.order_not_submitted` with `reason="request not sent: <message>"`. Only a connect error, a

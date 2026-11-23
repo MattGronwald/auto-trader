@@ -198,8 +198,10 @@ one position row per symbol, an order's `qty` and `filled_avg_price` above 0, `f
 out of range is a `BrokerError` naming the request id, never the value (Fable review 2 M2,
 2026-11-23).
 
-**Logging.** One `alpaca.http` line per call: method, path template, order id (own field), status
-or error type, elapsed ms, `X-Request-ID`; Alpaca's `message` for a non-2xx. Never headers or keys.
+**Logging.** One `alpaca.http` line per call that returns or raises: method, path template, order
+id (own field), status or error type, elapsed ms, `X-Request-ID`; Alpaca's `message` for a non-2xx.
+Never headers or keys. A call cancelled in flight (the engine's I/O budget, a shutdown) writes
+none until WP 1.6d (PLAN 1.6 row).
 The request id is also in every `BrokerError` message raised from a response, so an operator can
 quote it to Alpaca.
 
@@ -259,7 +261,9 @@ and the private `_pool._network_backend` hook (and the private pool attributes
 the ones `uv.lock` resolves (exact pins there). `pyproject.toml` declares ranges
 (`httpx>=0.28.1,<0.29`, `httpcore>=1.0.9,<1.1`, `anyio>=4.16,<5`) that allow upgrades, for
 example a `uv lock --upgrade`; any version change in the lock requires re-running this
-verification. If a fact no longer holds, `RequestNotSent` is unsafe: stop and take it to
+verification. `test_the_transport_runs_on_the_versions_the_not_sent_proof_was_verified_on`
+(`tests/unit/broker/test_alpaca_http.py`, `VERIFIED_TRANSPORT_VERSIONS`, also pins h11) fails on
+any such change until the pin is moved, which is done only after this verification. If a fact no longer holds, `RequestNotSent` is unsafe: stop and take it to
 the owner.
 
 ## Market data (2026-10-11)

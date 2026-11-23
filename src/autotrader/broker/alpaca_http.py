@@ -21,9 +21,10 @@ keep-alive), so a silently dropped pooled connection can never swallow a write.
 - `ClosingBackend` wraps httpcore's anyio backend and closes the socket when a request is
   cancelled during the TLS handshake (httpcore closes it only on `Exception`). httpx has no
   public hook for a backend, so `make_transport` sets the pool's private `_network_backend`.
-- One `alpaca.http` log line per call: method, path template, order id, status or error
-  type, elapsed ms, `X-Request-ID`, and Alpaca's `message` for a non-2xx. `info` for a 2xx,
-  `warning` otherwise.
+- One `alpaca.http` log line per call that returns or raises: method, path template, order
+  id, status or error type, elapsed ms, `X-Request-ID`, and Alpaca's `message` for a non-2xx.
+  `info` for a 2xx, `warning` otherwise. A call cancelled in flight (`CancelledError`, e.g.
+  the engine's `wait_for` or a shutdown) writes none; WP 1.6d adds that line (PLAN 1.6 row).
 - Response-derived text is filtered before it reaches a log field or an exception message:
   Alpaca's `message` through `sanitize`, every other value through `AlpacaHttp.diag` (shown
   only if it fully matches the pattern for its kind, then the keys redacted). The request id
