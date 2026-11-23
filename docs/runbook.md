@@ -7,23 +7,24 @@ Requirements live in `SPEC.md`, delivery status in `PLAN.md`.
 The examples assume the default `config.yaml` (journal `data/autotrader.db`, SQLite). Run SQL with
 `sqlite3 data/autotrader.db`. Never delete journal rows; change only the columns a procedure names.
 
-## Current limits (WP 1.5d-3)
+## Current limits (WP 1.6a)
 
-- `run core` connects `AlpacaBroker`, which cannot place orders until WP 1.6: its order methods
-  raise `OrderMethodsUnavailable` and `can_place_orders()` is false. The Position Manager still
+- `run core` connects `AlpacaBroker`, which cannot place orders until WP 1.6d: its order writes
+  (submit, cancel) raise `OrderMethodsUnavailable` and `can_place_orders()` is false. Single-order
+  reads and the client-id lookup work since WP 1.6a; `order_fills` waits for 1.6b. The Position Manager still
   evaluates and latches triggers (`positions.exit_triggered`) and logs
   `positions.broker_cannot_trade` once, but sends no exits and no cancels. A flatten stays pending
   with `reason: "broker cannot place orders"`.
 - With `SimBroker` the Cycle Runner places entries once admission opens; with `AlpacaBroker`
-  admission stays disabled until WP 1.6 (`cycle.admission_disabled`, reason `broker cannot place
+  admission stays disabled until WP 1.6d (`cycle.admission_disabled`, reason `broker cannot place
   orders`), so `run core` places no entries there. The rejection reasons in "Entries rejected"
   below are enforced by `RiskEngine.check()` for every admitted candidate. How admission opens
   is in "Startup and admission".
 - An order the engine cannot account for (no broker id, or one the broker no longer knows) is
   looked up by its client id for 80 s, then becomes an incident. The resolver never marks
   `not_submitted` by itself and never retries the order: the operator repairs it with
-  `autotrader repair` (see "Resolving an order incident"). On `AlpacaBroker` the lookup, and so
-  `repair link`, is unavailable until WP 1.6; no such rows exist before then.
+  `autotrader repair` (see "Resolving an order incident"). On `AlpacaBroker` the lookup and `repair link` work since WP 1.6a; no order rows
+  exist there before 1.6d enables writes, so no such incident arises in production yet.
 - Recovering from an `oversell` anomaly is `autotrader repair oversell` (see "Manual coins in a
   traded symbol").
 - An external sale that failed is retried only after the order-sync loop has settled the failed
@@ -142,7 +143,7 @@ Known costs (revisited in WP 1.6):
 `RiskEngine.check()` rejects an entry with one of these reasons. Each reason in the table
 below is a gather-time rejection: a persisted risk decision, no pause is set and no order row is
 written (the pre-submit case after the table is different). Exits are never affected. With
-`AlpacaBroker` `run core` calls no `check()` until WP 1.6 (admission is disabled), so there these
+`AlpacaBroker` `run core` calls no `check()` until WP 1.6d (admission is disabled), so there these
 describe what the engine will do.
 
 | Reason | Meaning | Clears when |
@@ -268,7 +269,7 @@ clears the request, publishes `FlattenCompleted` and logs `positions.flat`.
 `flatten --cancel` clears a pending request and records `flatten_result = {request_ts, flat:
 false, cancelled: true}` (exit 0; `no flatten request pending` if there was none). It does not
 lift the pause and does not un-latch triggers already set. Cancel a request that cannot finish
-(for example with Alpaca before WP 1.6): otherwise it latches `flatten` on every new position
+(for example with Alpaca before WP 1.6d): otherwise it latches `flatten` on every new position
 after a resume.
 
 `shutdown.flatten: true` in `config.yaml` runs the same request on every graceful stop after a
@@ -292,7 +293,7 @@ Every order carries a client id, so the engine can find it at the broker even wh
 response was lost. Entries use `at-{jid}-c{cycle_id}-e`, exits `at-{jid}-o{order_row_id}`; `jid`
 is the journal's own 8-hex id (`control_state.journal_id`), so ids of another journal or the
 legacy `at-c<cycle>-e` form are never taken as ours. Exits are sent with `submit_order` for the
-free qty (`qty_available`) of the broker holding, not with `close_position`; a holding fully
+free qty (`qty_available`) of the broker holding; a holding fully
 reserved by pending sells rejects the exit (`reserved by pending sells in <SYM>`) until they
 settle. A journal without a `journal_id` row (hand-deleted) fails entries closed
 (`state unavailable`); exits still go out without a client id and log `risk.journal_id_missing`.
@@ -302,7 +303,8 @@ settle. A journal without a `journal_id` row (hand-deleted) fails entries closed
 The ledger's 2 s sync pass (`RiskEngine.sync_orders`) resolves two kinds of unsettled row
 (`check()` runs its own order read before an entry, without the resolver):
 - (a) `pending`/`unknown` with no broker id and no submit call in flight;
-- (b) a row with a broker id whose `get_order` raised `OrderNotFound`.
+- (b) a row with a broker id whose `get_order` raised `OrderNotFound` or `UnknownOrderStatus` (the
+  broker reported a status we do not map).
 
 A row without a client id of this journal becomes a `no_ownership_proof` incident at once (no
 lookup, no bound). Otherwise it looks the order up by client id. For (a), a match on symbol, side,
@@ -310,7 +312,7 @@ qty and creation time (5 minutes of skew) links the row (`risk.order_resolved`, 
 event; the next read books its fills and settles it). For (b), a match links nothing: the row
 keeps its clock and becomes `lookup_inconsistent` at the bound. A zero match or a failed lookup
 waits: the bound is 80 s from `submitted_at`
-for (a), or from the first `OrderNotFound` (persisted as `resolve_since`, restart-safe) for (b).
+for (a), or from the first `OrderNotFound` / `UnknownOrderStatus` (persisted as `resolve_since`, restart-safe) for (b).
 Past it, or at once on a mismatch, the row becomes an incident: `risk.order_incident` (error),
 an `OrderIncident` event, and a reminder `risk.order_incident_open` every 60 s while it is
 unsettled. While a (b) row is within its bound, entries fail closed on all symbols; afterwards
@@ -332,6 +334,7 @@ can never be accepted or become visible (PLAN.md section 3.2 item 4).
 | `not_found` | Zero match until the bound. The order may still exist. | Investigate at the broker, then `repair link` (found) or `repair not-submitted` (authoritative evidence). |
 | `lookup_failed` | The lookups raised until the bound (or the budget ran out), so nothing was learned. | Same as `not_found`. |
 | `lookup_inconsistent` | (b) only: `get_order` says not found while the client-id lookup finds the order, until the bound. | `repair link` with the broker id the lookup reports. |
+| `unknown_status` | (b): the broker reported an order status we do not map (`held`, `suspended`, `replaced`, ...; the log line `risk.order_status_unknown` names the status): the order exists but we cannot book it. Any inconclusive outcome at the bound (`not_found`, `lookup_failed`, `lookup_inconsistent`) of such a row is recorded as this reason; `no_ownership_proof` and `client_id_mismatch` still win. | Recovery below: bring the order to a final state at the broker, then `repair link`. |
 
 The reason is not always the result of a final lookup. A row past its bound whose lookup the
 pass budget (10 s, shared by every unsettled row) did not reach becomes an incident in that
@@ -384,12 +387,15 @@ never migrates: it refuses a journal path that does not exist (`no journal at <p
    `symbol_dust`). If the position changed by the row's qty, the order executed: find its id.
 3. **Found at the broker:** `repair link <row> <broker_order_id>`. It reads the order (read-only)
    and requires the broker order's client id to equal the row's, plus symbol, side, qty and the
-   5-minute `created_at` check. It accepts id-less `pending`/`unknown` rows and (b) incident rows
-   (`not_found`, `lookup_failed`, `lookup_inconsistent`, `client_id_mismatch`; the broker id is
-   then replaced, `before` keeps the old one). It refuses lookup misses, mismatches (the
+   5-minute `created_at` check, plus the order type, limit price and time in force our own
+   submits use. It accepts id-less `pending`/`unknown` rows and (b) incident rows
+   (`not_found`, `lookup_failed`, `lookup_inconsistent`, `client_id_mismatch`, `unknown_status`;
+   the broker id is then replaced, `before` keeps the old one). For an `unknown_status` row it also
+   requires the broker order to be **final** (`filled`, `canceled` or `rejected`) and refuses with
+   `broker order is not final: <status>` otherwise (see "Recovering an `unknown_status` incident"). It refuses lookup misses, mismatches (the
    differences are printed) and rows without ownership proof; there is no `--force`. It writes
-   `broker_order_id` and clears the incident fields. On `AlpacaBroker` it fails with
-   `broker lookup failed: OrderMethodsUnavailable` until 1.6.
+   `broker_order_id` and clears the incident fields. On `AlpacaBroker` it works since WP 1.6a
+   (reads only; no order is written).
 4. **Not found, with authoritative evidence:** `repair not-submitted <row>`, only for an unsettled
    `pending`/`unknown` row without a broker id. Use it only with what PLAN.md section 3.2 item 4
    requires: the original worker is quiescent (the core is stopped) **and** authoritative broker
@@ -430,7 +436,45 @@ WHERE id = <row>;
 This does not undo bookings made after the mark: check the symbol's position, fills and cash
 against the broker by hand and expect to correct them.
 
-With `AlpacaBroker` no order is ever placed before 1.6 (`can_place_orders()` is false and
+### Recovering an `unknown_status` incident
+
+The broker holds the order in a state the adapter does not map, so nothing can be booked and the
+row keeps its symbol blocked (the fail-closed outcome). Neither `repair not-submitted` (refuses
+rows with a broker id) nor a plain `repair link` (refuses a non-final order) fits:
+
+1. Stop the core (Ctrl-C). Note the status in the `risk.order_status_unknown` log line, and the
+   Alpaca request id from the matching `alpaca.http` line, for a support ticket if needed.
+2. Look the order up at the broker by its broker id. **Before linking, check its status there
+   yourself.** The evidence that this was an unmapped status is kept in memory only: after a
+   restart inside the 80 s resolution window an inconclusive lookup can end the row as
+   `lookup_failed` (or `not_found`) instead of `unknown_status`. If the order's status is
+   unmapped, treat the row as `unknown_status` whatever reason it carries.
+3. Bring the order to a final state: cancel it in the Alpaca dashboard, or wait until it finishes
+   (`filled`, `canceled`, `rejected`).
+4. `repair link <row> <same broker id> --evidence "..."`. It refuses while the order is not final
+   (`broker order is not final: <status>`). Do not use it to get past that; the check keeps a row
+   from being linked while the order can still move.
+5. Start the core: the ledger books the row's fills from the final state on the next pass.
+
+While Alpaca keeps the order in the unmapped state (`held`, `suspended`, ...), escalate to Alpaca
+support; the row stays an incident and keeps reminding every 60 s.
+
+### Alpaca request log
+
+Every trading-API call writes one `alpaca.http` line: `method`, `path` (the template, e.g.
+`/orders/{id}`), `order_id` for a single-order call, `status` or `error` (the exception type
+name), `elapsed_ms`, and `request_id` (Alpaca's `X-Request-ID`); a non-2xx adds Alpaca's
+`message`. It is `info` for a 2xx and `warning` otherwise; headers and keys are never logged. The
+request id is also in the text of every `BrokerError` raised from a response, so the incident or
+`risk.*` line carries it too: quote it when asking Alpaca about a call.
+
+A submit the transport proved unsent (connect, DNS, TLS or pool wait failed or was cancelled
+before any byte was written) is marked `not_submitted` and logged `risk.order_not_submitted` with
+`reason="request not sent: <message>"`; the message carries the cause's type name and the request
+id, never the cause's text. It needs no repair: nothing reached Alpaca. A failure after the
+request may have been written becomes `unknown` and goes to the resolver as before.
+
+With `AlpacaBroker` no order is ever placed before 1.6d (`can_place_orders()` is false and
 admission is disabled), so none of this arises in production yet.
 
 ## Accounting for an external sale

@@ -62,11 +62,11 @@ Volume tiers (30-day volume in USD → maker / taker bps):
 | SOL/USD | 0.009084302 | 0.000000001 | 0.000000001 |
 
 - **The docs' BTC example (`0.0001` / `0.0001` / `1`) is outdated.** Use the API values.
-- `min_order_size` differs per asset and looks like **~1 USD at current prices**. This is inferred, not documented, so it likely moves with price. Fetch it at sizing time; don't cache it for long.
+- `min_order_size` differs per asset and looks like **~1 USD at current prices**. This is inferred, not documented, so it likely moves with price. Fetch it at sizing time; don't cache it for long. *(WP 1.6a: `AlpacaBroker` caches it for 5 minutes, see "Trading transport".)*
 - **No minimum notional is published.** There is a **maximum of $200k notional per order**, irrelevant at PoC size. `AssetRules.min_notional` is therefore `0` for Alpaca.
   *Corrected 2026-11-12 (WP 1.6a probes):* paper refuses a **buy** worth under $10 (403, "cost basis must be >= minimal amount of order 10"), measured at qty × limit price; market sells under $10 were accepted. See "Order endpoint probes (WP 1.6a)". `AssetRules.min_notional` is still `0` for Alpaca until 1.6c.
 - `price_increment` is mapped into `AssetRules.price_increment` (WP 1.3) and used to round the marketable entry limit up.
-- **The API returns these as strings.** The `alpaca-py` models turn them into floats, so `AlpacaBroker` uses `raw_data=True` and reads them as exact `Decimal`s.
+- **The API returns these as strings.** The `alpaca-py` models turn them into floats, so `AlpacaBroker` read them with `raw_data=True` as exact `Decimal`s. *Since WP 1.6a (2026-11-22) the trading calls no longer use `alpaca-py`: `AlpacaBroker` reads the JSON itself and requires these values to be JSON strings (see "Trading transport"). `raw_data=True` still applies to market data.*
 
 ## Account
 
@@ -162,6 +162,90 @@ Two owner-run probe runs against the paper trading API, plain HTTP with 3 s conn
 - **A duplicate client id is refused with 422 and does not return the existing order.** The first order is unaffected. The error `code` is not stable across requests, so the adapter must not branch on it.
 - **Status codes, not body codes, carry the meaning.** 403 and 422 on submit were refusals (no order created). 404 means unknown. Cancel is idempotent for a cancelled order (204) but not for a filled one (422).
 - **Visibility within 0.3 s is three samples, not a guarantee.** The 60 s `order_visibility_allowance_s` stays an operational bound.
+
+## Trading transport (WP 1.6a, verified 2026-11-22)
+
+Since WP 1.6a every trading-API call (orders, account, positions, asset rules) goes through
+`broker/alpaca_http.py` on `httpx`. `alpaca-py` stays for market data only (until WP 1.6c).
+
+**Why not `alpaca-py` for trading.** Its `TradingClient` is built on `requests` with no timeout
+unless the caller passes one, and it retries (including POST). A retried `POST /orders` or a hang
+the engine's I/O budget cannot cut off defeats the "not sent" argument (SPEC §4.6, PLAN D22).
+Its sync calls also needed `to_thread`, which cannot be cancelled once running. The new transport
+has fixed timeouts, no retries and no threads.
+
+**Settings.** `httpx.Timeout(connect=3, write=5, read=5, pool=2)`. The connect timeout applies to
+TCP and to the TLS handshake **separately**, so a connect that never completes raises
+`RequestNotSent` after up to 6 s (3 s TCP + 3 s TLS), under the engine's 10 s budget. Read client: keep-alive
+pool, 4 connections; write client (`POST /orders`, `DELETE /orders/{id}`): 4 connections, no
+keep-alive, a fresh connection per write. `retries=0`, no redirects, `trust_env=False`, TLS
+verification on, no cookies kept.
+
+**Rate limit and request budget.** Alpaca's trading API allows 200 requests per minute. The 2 s
+order-sync loop and the Position Manager call `asset_rules` per symbol, so uncached, three
+unsettled orders on three symbols already use about 180 of the 200. `AlpacaBroker` caches
+`asset_rules` per symbol for 5 minutes (`ASSET_RULES_TTL_S`); the $10 buy minimum, not
+`min_order_size`, decides what is orderable, so the cache is safe. 1.6d has to measure the real
+request rate before enabling writes (PLAN 1.6 row).
+
+**Logging.** One `alpaca.http` line per call: method, path template, order id (own field), status
+or error type, elapsed ms, `X-Request-ID`; Alpaca's `message` for a non-2xx. Never headers or keys.
+The request id is also in every `BrokerError` message raised from a response, so an operator can
+quote it to Alpaca.
+
+### Why a connect failure proves "not sent" (httpx/httpcore verification)
+
+`RequestNotSent` (recorded `not_submitted`, no resolver, no incident) rests on httpcore/httpx
+internals. Verified 2026-11-22 by reading the installed sources: **httpx 0.28.1, httpcore 1.0.9,
+anyio 4.16.0** (h11 0.16.0 transitive). The mapping `ConnectError`, `ConnectTimeout` and
+`PoolTimeout` to `RequestNotSent` is safe only if these five facts hold:
+
+1. **The connection is fully established before the first request byte.** In
+   `httpcore/_async/connection.py` `AsyncHTTPConnection.handle_async_request`, `_connect()`
+   (`connect_tcp`, then `start_tls` for https) returns before the request reaches the HTTP/1.1
+   connection. `ConnectError` / `ConnectTimeout` are raised only by the exception maps in
+   `httpcore/_backends/anyio.py` (`connect_tcp`, `connect_unix_socket`, `start_tls`); there is no
+   other raise site (`connection.py` only catches them, in the retry loop that `retries=0`
+   disables).
+2. **A write-phase failure closes the connection.** `httpcore/_async/http11.py`
+   `handle_async_request`: `WriteError` is suppressed and the response is read (so the outcome
+   is a read error or a status, never a connect error); any other exception, `CancelledError`
+   included, runs `_response_closed` under `AsyncShieldCancellation` in the `except BaseException`
+   path, which closes the stream. A cancelled write is cut off, not finished.
+3. **`PoolTimeout` only around the wait for a connection.** `httpcore/_synchronization.py`
+   `AsyncEvent.wait` is its only async raise site, reached from
+   `AsyncPoolRequest.wait_for_connection` (`connection_pool.py`) before any connection handles the
+   request. The pool's retry loop re-queues only on `ConnectionNotAvailable`, which HTTP/1.1
+   raises only in a state check before any write (`http11.py`).
+4. **httpx maps the three 1:1.** `httpx/_transports/default.py` `_load_httpcore_exceptions` /
+   `map_httpcore_exceptions` map `httpcore.ConnectError`, `ConnectTimeout` and `PoolTimeout` to the
+   `httpx` exceptions of the same name. None of the three has a subclass and httpx raises them
+   nowhere else.
+5. **(C1) `start_tls` closes the socket only on `Exception`.** `httpcore/_backends/anyio.py`
+   `AnyIOStream.start_tls`: `except Exception: await self.aclose(); raise`. A `CancelledError`
+   during the TLS handshake skips the close and would leak the socket. Nothing is written by
+   then, so the request is still "not sent", but the connection must not leak.
+
+**Conditions** the transport keeps and the argument needs (each pinned by a unit test):
+- **no proxy**: the proxy modules call `start_tls` after bytes were written. A plain
+  `httpcore.AsyncConnectionPool` is built (`proxy` unset) and the clients use `trust_env=False`;
+- **HTTP/1.1 only**: `http2=False` (ALPN offers `http/1.1` only);
+- **`retries=0`** on the transport;
+- **the anyio backend**: `ClosingBackend` delegates to `httpcore.AnyIOBackend`.
+
+**The closing backend (C1).** `ClosingBackend` wraps httpcore's anyio backend and closes the
+inner stream when `start_tls` ends in a `BaseException` (cancellation), then re-raises. httpx has
+no public hook for a network backend, so `make_transport` sets the **private**
+`transport._pool._network_backend` after construction (httpcore reads it per new connection). A
+loopback test (a server that never answers the handshake) pins the closing; removing the line
+makes it fail.
+
+**Re-check all of this on any httpx, httpcore or anyio upgrade:** facts 1-5, the four conditions
+and the private `_pool._network_backend` hook (and the private pool attributes
+`test_production_transports_ignore_env_and_never_retry` reads). The versions are pinned in
+`pyproject.toml` (`httpx>=0.28.1,<0.29`, `httpcore>=1.0.9,<1.1`, `anyio>=4.16,<5`) so an upgrade
+is a deliberate step. If a fact no longer holds, `RequestNotSent` is unsafe: stop and take it to
+the owner.
 
 ## Market data (2026-10-11)
 

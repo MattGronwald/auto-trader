@@ -208,7 +208,7 @@ resolver) does the rest.
 | submit **403 with a parsable JSON body** | `OrderRejected` (status, Alpaca's `message`, request id) | row `rejected`. A 403 without a parsable body is `BrokerError` |
 | submit **any other 4xx** (400, 401, 404, 422, …) | `BrokerError` | row `unknown`: the resolver looks the client id up. A 422 is also "client_order_id must be unique", which means an order with that id exists; it must be found, not recorded as rejected. A malformed order shape (a bug) becomes an operator incident after `order_resolution_timeout_s` instead of a silent rejection: deliberate. 401 and 429 stay here in 1.6a; whether they may be `not_submitted` is a 1.6d decision with paper evidence (Fable I5) |
 | `get_order` **404** | `OrderNotFound` | resolver type (b), unchanged |
-| `get_order` with a status 3.4 does not list | `UnknownOrderStatus(BrokerError)` carrying the raw status | resolver type (b), like `OrderNotFound` (3.4) |
+| `get_order` with a status 3.4 does not list | `UnknownOrderStatus(BrokerError)` carrying the raw status *(correction 2026-11-23: it carries the status filtered through `diag`; the raw value only drives the mapping)* | resolver type (b), like `OrderNotFound` (3.4) |
 | `get_order_by_client_id` **404** | returns `None` | resolver: zero match, unchanged |
 | `cancel_order` **204** | returns | |
 | `cancel_order` **422** (order already final, e.g. filled) | `BrokerError` (Fable M4) | `cancel_open_entries` counts it `failed` and retries with backoff until the sync books the final status and it is no longer an open entry. Returning normally would put it into the Position Manager's `_cancel_requested`, which is never retried |
@@ -249,7 +249,7 @@ operator needs its id.
 `OrderNotFound` fails the row on every 2 s pass, forever, and the row never becomes a resolver
 candidate (`engine.py` `_read`). `_read` catches `UnknownOrderStatus` like `OrderNotFound`: the
 row becomes a type (b) candidate (clock `resolve_since`), logged `risk.order_status_unknown` with
-the raw status. The resolver's client-id lookup meets the same status; that outcome is recorded
+the raw status *(correction 2026-11-23: the implementation logs the `diag`-filtered status; the raw value only drives the mapping)*. The resolver's client-id lookup meets the same status; that outcome is recorded
 as the new incident reason **`unknown_status`** (fits `orders.incident`, `String(24)`, no
 migration), so after `order_resolution_timeout_s` the row is an incident with the existing
 reminder.
