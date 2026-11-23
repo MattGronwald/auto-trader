@@ -2,7 +2,8 @@
 
 Connects the broker, backfills and streams bars for the universe, persists 1m bars, runs the
 Signal Scanner on closed bars (WP 1.2) and snapshots equity for the daily-loss/drawdown
-checks. The broker is handed to the `RiskEngine`, its only holder from then on (SPEC §0.1).
+checks. The broker is handed to the `RiskEngine`, its only holder from then on (SPEC §0.1);
+the runtime keeps only its `aclose` for teardown (WP 1.6a spec 3.7, Fable review 2 M4).
 
 WP 1.5d-1 (spec 2026-11-09, 5): every `risk.snapshot` step also runs the ledger's cash check
 (guard, snapshot, `check_cash`) and drives the engine's cash-reconciliation fault, which rejects
@@ -56,8 +57,9 @@ WP 1.5a (spec 2026-10-14):
   `stream` step (`core.shutdown_failed`, exit 1).
 - Broker ownership (WP 1.6a spec 3.5, 3.7): `connect()` and the account read of the startup
   check run under one `BROKER_CHECK_S` timeout and close the broker's clients on their own
-  failure; once the check returns, a holder owns the broker and teardown closes it in its
-  `broker` step (after `bus.close`, before `engine.dispose`) on every path.
+  failure; once the check returns, a holder keeps the broker's `aclose` (not the broker:
+  SPEC §0.1) and teardown calls it in its `broker` step (after `bus.close`, before
+  `engine.dispose`) on every path.
 """
 
 import asyncio
@@ -109,10 +111,12 @@ BROKER_CHECK_S = 10.0  # startup broker check (connect + get_account), the engin
 
 @dataclass
 class _BrokerHolder:
-    """Owns the broker from the statement after `_check_broker` returns; teardown's
-    `broker` step reads it (WP 1.6a spec 3.7, runtime ownership)."""
+    """The broker's close callable, set in the statement after `_check_broker` returns;
+    teardown's `broker` step calls it (WP 1.6a spec 3.7, runtime ownership). Only the close
+    is kept, not the broker (SPEC §0.1, Fable review 2 M4): a bound `aclose` still refers to
+    its broker object, but nothing here can reach `submit_order` through the holder's type."""
 
-    broker: Any = None
+    close: Callable[[], Awaitable[None]] | None = None
 
 
 class _Snapshotter(Protocol):
@@ -345,7 +349,7 @@ async def run_core(
         async with sessions() as session:
             strategy = await repo.register_strategy(session, profile, profile_yaml)
         broker = await _check_broker(connect_broker, settings)
-        holder.broker = broker  # no await in between: from here on teardown closes it
+        holder.close = broker.aclose  # no await in between: from here on teardown closes it
         if broker.mode() != cfg.mode:  # exit() would reject every exit: nothing to protect
             raise RuntimeError(
                 f"broker mode {broker.mode()!r} does not match config mode {cfg.mode!r}"
@@ -534,7 +538,7 @@ async def run_core(
         stream_died=stream_died,
         flatten_step=flatten_step,
         runner=runner,
-        broker=lambda: holder.broker,
+        broker_close=lambda: holder.close,
     )
     if failure is not None:
         raise failure
@@ -553,14 +557,14 @@ async def _teardown(
     stream_died: bool = False,
     flatten_step: Callable[[], Awaitable[None]] | None = None,
     runner: CycleRunner | None = None,
-    broker: Callable[[], Any] = lambda: None,
+    broker_close: Callable[[], Callable[[], Awaitable[None]] | None] = lambda: None,
 ) -> list[str]:
     """Ordered, bounded teardown (spec section 4). Steps: `startup` (if unfinished),
     `runner.close`, `flatten`, `source.stop`, the loops, `stream`, `bus.close`, `broker`,
     `engine.dispose`. Each step gets what is left of the deadline; a step still running then
     is cancelled once and left behind (forced). A step that raises or is cancelled is failed.
     Either way the remaining steps still run, and the returned list (forced + failed) makes
-    the exit unclean. `broker` is an accessor read only inside the `broker` step: an
+    the exit unclean. `broker_close` is an accessor read only inside the `broker` step: an
     unfinished startup can still fill the holder (WP 1.6a spec 3.7)."""
     deadline = control.deadline
     if deadline is None:
@@ -607,9 +611,9 @@ async def _teardown(
     await bounded("bus.close", bus.close(budget_s=control.remaining()))
 
     async def close_broker() -> None:  # after every step that may still use it
-        b = broker()
-        if b is not None:
-            await b.aclose()
+        close = broker_close()
+        if close is not None:
+            await close()
 
     await bounded("broker", close_broker())
     # A floor even after the deadline (inside the watchdog's 5 s grace): a forced teardown

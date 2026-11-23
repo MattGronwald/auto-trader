@@ -382,6 +382,11 @@ stop request, or any later startup error. So:
   so the exit is already unclean). The cancellation lands either before the holder is filled,
   where `connect()` / `_check_broker` close the clients in their own cleanup (best effort, not
   awaited by teardown), or after, where the `broker` step closes it.
+- *Note 2026-11-23 (Fable review 2 of PR #43, M4):* the holder keeps the broker's `aclose`
+  callable, not the broker (`_BrokerHolder.close`; `_teardown(broker_close=...)`), so the
+  runtime holds no `Broker` (SPEC §0.1). The chain, the step position and the accessor rule
+  above are unchanged; a test pins that the `broker` step runs after the shutdown flatten and
+  `bus.close`.
 
 ### 3.8 Writes stay off (defence in depth)
 

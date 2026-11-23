@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import dataclasses
 import gc
 import io
 import json
@@ -1572,6 +1573,13 @@ async def test_a_forced_broker_close_makes_the_exit_unclean(
     assert await asyncio.wait_for(task, timeout=5) == EXIT_FAILED
     forced = next(ln for ln in _log_lines(buf) if ln["event"] == "core.shutdown_forced")
     assert "broker" in forced["steps"]
+
+
+def test_the_teardown_holder_keeps_only_the_close_callable() -> None:
+    """Fable review 2 M4: the runtime keeps the broker's `aclose` for teardown's `broker`
+    step, not the broker itself (SPEC §0.1: only the Risk Engine holds a `Broker`)."""
+    assert [f.name for f in dataclasses.fields(runtime._BrokerHolder)] == ["close"]
+    assert runtime._BrokerHolder().close is None
 
 
 async def test_teardown_closes_the_broker_after_the_flatten_and_the_bus(
