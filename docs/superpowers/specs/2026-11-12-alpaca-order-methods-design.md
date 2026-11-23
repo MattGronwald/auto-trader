@@ -245,6 +245,12 @@ operator needs its id.
 | `rejected` | `rejected` |
 | anything else (`done_for_day`, `replaced`, `pending_replace`, `stopped`, `suspended`, `calculated`, `held`, `accepted_for_bidding`, unknown values) | `UnknownOrderStatus`: we never place orders that should reach them; fail closed rather than guess |
 
+**2026-11-23 note (owner's Codex review of PR #43, P2-2):** the table assumes a consistent
+`filled_qty`. `filled` or `partially_filled` with `filled_qty` 0, or any status with a negative
+`filled_qty`, raises a plain `BrokerError` (not `UnknownOrderStatus`: the status is known, the
+pair contradicts itself). The read or lookup fails and the row stays unsettled; it is not booked
+as a fill of nothing.
+
 **An unknown status has a bounded path** (Fable I6). Today a `get_order` that raises anything but
 `OrderNotFound` fails the row on every 2 s pass, forever, and the row never becomes a resolver
 candidate (`engine.py` `_read`). `_read` catches `UnknownOrderStatus` like `OrderNotFound`: the

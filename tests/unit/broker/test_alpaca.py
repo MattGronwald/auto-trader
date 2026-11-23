@@ -411,6 +411,44 @@ def test_status_mapping(raw: str, filled: str, ours: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("raw", "filled"),
+    [
+        ("filled", "0"),
+        ("partially_filled", "0"),
+        ("filled", "-1"),
+        ("partially_filled", "-0.5"),
+        *[(raw, "-0.000000001") for raw in dict.fromkeys(raw for raw, _, _ in STATUS_TABLE)],
+    ],
+)
+def test_a_fill_status_without_a_positive_fill_is_a_broker_error(raw: str, filled: str) -> None:
+    # Codex P2-2 (PR #43): `filled` with `filled_qty` 0 would settle the row with nothing
+    # booked. The status is known, the pair contradicts itself: a failed read, not
+    # `UnknownOrderStatus`. A negative fill fails for every status.
+    with pytest.raises(BrokerError) as e:
+        order_state(raw, Decimal(filled), "rid-9")
+    assert type(e.value) is BrokerError and "(request rid-9)" in str(e.value)
+    assert filled not in str(e.value)
+
+
+@pytest.mark.parametrize("call", ["get_order", "by_client_id", "submit"])
+async def test_order_reads_and_acks_with_filled_and_no_fill_are_broker_errors(call: str) -> None:
+    body = {**probe("E-final")["json"], "status": "filled", "filled_qty": "0"}
+    if call == "submit":
+        body = {**ENTRY["json"], "status": "filled", "filled_qty": "0"}
+    if call == "get_order":
+        body["id"] = OID
+    r = Router()
+    method, path = _ROUTES[call]
+    r.add(method, path, 200, body)
+    with pytest.raises(BrokerError) as e:
+        await _invoke(await broker(r), call)
+    assert type(e.value) is BrokerError  # not UnknownOrderStatus: the read failed
+    assert str(e.value).count("(request rid-1)") == 1  # `_parsing` does not append it again
+    assert e.value.__cause__ is None and e.value.__suppress_context__
+    assert r.unrouted == []
+
+
+@pytest.mark.parametrize(
     "raw",
     [
         "done_for_day",

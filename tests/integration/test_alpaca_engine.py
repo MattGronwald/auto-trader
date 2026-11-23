@@ -149,3 +149,39 @@ async def test_an_unknown_status_row_becomes_an_unknown_status_incident(
         assert router.unrouted == []
     finally:
         await broker.aclose()
+
+
+async def test_a_filled_status_with_no_fill_leaves_the_row_unsettled(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    # Codex P2-2 (PR #43): `filled` with `filled_qty` "0" contradicts itself; the read fails
+    # (`BrokerError`, not `UnknownOrderStatus`), so the ledger books nothing and the row stays
+    # open, instead of settling a filled order with no fill.
+    final = {**probe("E-final")["json"], "filled_qty": "0"}
+    oid = final["id"]
+    cid = entry_client_id(await tr.jid_of(sessions), 1)
+    row = await tr.insert_row(
+        sessions,
+        cid=cid,
+        status="new",
+        broker_order_id=oid,
+        type_="limit",
+        limit_price=D(final["limit_price"]),
+    )
+    router = Router()
+    router.add("GET", f"/v2/orders/{oid}", 200, final, repeat=True)
+    router.add("GET", "/v2/assets/BTC/USD", 200, probe("0-asset")["json"], repeat=True)
+    broker = spy(router)
+    try:
+        clock = te.Clock(NOW)
+        ledger = Ledger(EventBus(sessions), sessions, clock=clock)
+        engine = te.make_engine_(broker, sessions, gate, clock=clock, ledger=ledger)
+        synced = await engine.sync_orders()
+        assert row in synced.failed and not synced.complete
+        assert [u for u in synced.updates if u.order_row_id == row] == []
+        await ledger.apply_all(synced)
+        stored = await tr.order(sessions, row)
+        assert (stored.status, stored.settled_at, stored.incident) == ("new", None, None)
+        assert router.unrouted == []
+    finally:
+        await broker.aclose()

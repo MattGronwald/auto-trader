@@ -19,7 +19,9 @@ docs/alpaca-notes.md for sources, raw values and open questions.
   array of objects that each carry a string `asset_class` (an empty array means flat, so a
   `{}` or an unclassed row fails the read; Codex P2-1). A status outside the spec 3.4
   table raises `UnknownOrderStatus` (from the submit ack it first logs
-  `alpaca.ack_status_unknown` with the broker order id). The submit ack must echo the
+  `alpaca.ack_status_unknown` with the broker order id); a mapped status contradicted by
+  `filled_qty` (`filled` with none, any negative) raises `BrokerError` (Codex P2-2), so the
+  read fails and the row stays unsettled. The submit ack must echo the
   order (client id, symbol, side, type, TIF, qty, limit price);
   a difference logs `alpaca.ack_mismatch` with the broker order id and raises `BrokerError`.
   Order ids from responses (ack, `get_order_by_client_id`) must match `[A-Za-z0-9-]+`.
@@ -134,7 +136,19 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
     we never place orders that should reach it, so fail closed rather than guess.
 
     Pure: the exception carries `raw` as given. Callers in this module re-raise it with the
-    status filtered through `AlpacaHttp.diag` (`AlpacaBroker._state`)."""
+    status filtered through `AlpacaHttp.diag` (`AlpacaBroker._state`).
+
+    A negative `filled_qty`, or `filled` / `partially_filled` without a positive one,
+    contradicts itself and raises a plain `BrokerError`: the read failed, the row stays
+    unsettled (Codex P2-2, PR #43). The message names only a mapped status."""
+    if filled_qty < 0:
+        raise BrokerError(
+            f"alpaca order reports a negative filled_qty (request {request_id})"
+        ) from None
+    if raw in ("filled", "partially_filled") and filled_qty == 0:
+        raise BrokerError(
+            f"alpaca order status {raw!r} with no filled_qty (request {request_id})"
+        ) from None
     if raw in ("pending_new", "accepted", "new", "pending_cancel"):
         return "partially_filled" if filled_qty > 0 else "new"
     if raw == "partially_filled":
@@ -490,7 +504,8 @@ def _parsing(what: str, request_id: str | None) -> Iterator[None]:
     crash. The message carries the cause's type name and the request id, never the cause's
     text (it can quote response data). A nested `BrokerError` (`_slash_symbol`, an unsafe
     ack id) gets the request id appended; one that already names it (`UnknownOrderStatus`,
-    the ack mismatch) passes unchanged. Every raise is `from None`."""
+    `order_state`'s fill contradiction, the ack mismatch) passes unchanged. Every raise is
+    `from None`."""
     try:
         yield
     except BrokerError as e:

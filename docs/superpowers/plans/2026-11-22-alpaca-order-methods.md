@@ -1119,6 +1119,10 @@ def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) ->
   re-raises `UnknownOrderStatus(http.diag(e.status, STATUS_RE), rid) from None`, so the status
   the engine logs (`risk.order_status_unknown`, `status=e.status`) is already filtered (Codex
   r2).
+  *2026-11-23 note (owner's Codex review of PR #43, P2-2):* `order_state` also raises a plain
+  `BrokerError` (request id, `from None`) for a negative `filled_qty` and for `filled` /
+  `partially_filled` with `filled_qty` 0; callers let it pass unchanged (it names the request
+  id, so `_parsing` does not append it again), and the read fails instead of settling the row.
 
 - `_parsing(what: str, request_id: str | None)` turns the `TypeError` / `ValueError` /
   `KeyError` / `ArithmeticError` from parsing into `BrokerError` with ` (request <id>)`, and
