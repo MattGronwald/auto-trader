@@ -136,6 +136,11 @@ created by `AlpacaBroker.connect` and closed by `AlpacaBroker.aclose()` (3.7):
   its own field), status or exception type, elapsed ms and Alpaca's `X-Request-ID`. Non-2xx
   responses add Alpaca's `message`. Never headers, never keys. The request id also goes into every
   `BrokerError` message raised from a response.
+  *2026-11-23 note (owner's Codex review of PR #43, P2-3):* that order id field is logged
+  unredacted, so every broker order id (ack, client-id lookup, and the ids `get_order` and
+  `cancel_order` put into a path) must fully match Alpaca's UUID form; anything else raises
+  `BrokerError` with the id withheld, before any I/O for a path. A UUID cannot contain the key
+  id or the secret (no dash-free run longer than 12 characters).
 - **Request budget** (Fable I5): `asset_rules` is cached per symbol for 5 minutes **(builder
   call:** TTL). Today the 2 s sync loop calls it once per symbol per pass, and `exit()`/`check()`
   once per held symbol; uncached, three unsettled orders on three symbols already use about 180 of

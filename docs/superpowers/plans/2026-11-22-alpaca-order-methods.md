@@ -170,6 +170,13 @@ file already has, which each task names.
 - Order ids are checked against `[A-Za-z0-9-]+` before they go into a path (in `get_order`,
   `cancel_order` and the ack check). Anything else raises `BrokerError` before any I/O: httpx
   normalises `/orders/../account`, and `DELETE /v2/orders` is Alpaca's cancel-all (review M6).
+  *2026-11-23 note (owner's Codex review of PR #43, P2-3, owner decision):* the check is now
+  Alpaca's UUID form, `[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}`
+  (fullmatch), wherever `_check_order_id` runs: the ack, the client-id lookup, `get_order` and
+  `cancel_order` (journal ids included). `[A-Za-z0-9-]+` let a response id that embeds the key
+  id reach the journal and unredacted log lines; a UUID has no dash-free run longer than 12
+  characters, so it cannot contain the 20-character key id or the 40-character secret, and no
+  log site needs redaction.
 - Every `BrokerError` raised from a response carries the request id: `UnknownOrderStatus`,
   parse errors and `OrderNotFound` included (spec 3.1, review M4; `OrderNotFound` owner
   decision after the dry run).

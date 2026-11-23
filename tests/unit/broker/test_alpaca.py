@@ -133,7 +133,20 @@ async def test_an_order_without_client_id_is_sent_without_one() -> None:
     assert r.unrouted == []
 
 
-@pytest.mark.parametrize("bad_id", ["", 7, None, "../account"])
+# Off Alpaca's UUID form (Codex P2-3, PR #43): ids that the old `[A-Za-z0-9-]+` check let
+# through, KEY itself among them, plus a UUID with a byte too many or too few.
+NON_UUID_IDS = [
+    KEY,
+    f"{KEY}-0000",
+    "order-1",
+    "00000000000040008000000000016a009",
+    "00000000-0000-4000-8000-00000016a0090",
+    "00000000-0000-4000-8000-00000016a00",
+    "0000000g-0000-4000-8000-00000016a009",
+]
+
+
+@pytest.mark.parametrize("bad_id", ["", 7, None, "../account", *NON_UUID_IDS])
 async def test_an_ack_without_a_usable_order_id_is_a_broker_error(bad_id: object) -> None:
     r = Router()
     r.add("POST", "/v2/orders", 200, {**ENTRY["json"], "id": bad_id})
@@ -148,10 +161,11 @@ async def test_an_ack_without_a_usable_order_id_is_a_broker_error(bad_id: object
 
 async def test_get_order_with_another_id_is_a_broker_error() -> None:  # builder call, review I4
     resting = probe("D2-resting", run="round2")["json"]
+    other = "00000000-0000-4000-8000-0000000000ff"
     r = Router()
-    r.add("GET", "/v2/orders/other-id", 200, resting)
-    with pytest.raises(BrokerError, match="request"):
-        await (await broker(r)).get_order("other-id")
+    r.add("GET", f"/v2/orders/{other}", 200, resting)
+    with pytest.raises(BrokerError, match="request rid-1"):
+        await (await broker(r)).get_order(other)
 
 
 async def test_get_order_and_the_client_id_lookup_map_the_recorded_orders() -> None:
@@ -189,7 +203,7 @@ async def test_a_resting_order_reads_without_a_fill_price() -> None:
     assert r.unrouted == []
 
 
-@pytest.mark.parametrize("bad_id", ["../account", "a/b", f"id {KEY}", ""])
+@pytest.mark.parametrize("bad_id", ["../account", "a/b", f"id {KEY}", "", *NON_UUID_IDS])
 async def test_the_client_id_lookup_refuses_an_unsafe_order_id(bad_id: str) -> None:
     # Final review M1: the returned id is checked like the ack's and get_order's; it later
     # goes into a path (`get_order`) and a log line (`risk.order_lookup_mismatch`).
@@ -204,14 +218,51 @@ async def test_the_client_id_lookup_refuses_an_unsafe_order_id(bad_id: str) -> N
     assert r.unrouted == []
 
 
-@pytest.mark.parametrize("bad", ["../account", "", "a/b", "id?x=1", "id with space"])
-async def test_unsafe_order_ids_are_refused_before_io(bad: str) -> None:  # review M6
+@pytest.mark.parametrize("bad", ["../account", "", "a/b", "id?x=1", "id with space", *NON_UUID_IDS])
+async def test_unsafe_order_ids_are_refused_before_io(bad: str) -> None:  # review M6, Codex P2-3
     r = Router()
     b = await broker(r)
     for call in (b.get_order(bad), b.cancel_order(bad)):
         with pytest.raises(BrokerError):
             await call
     assert r.requests == []
+
+
+def test_order_ids_must_be_alpacas_uuid_form() -> None:
+    # Codex P2-3: a UUID has no dash-free run longer than 12 characters, so it cannot contain
+    # a 20-character key id or a 40-character secret; recorded ids pass, either case.
+    assert alpaca._ORDER_ID.fullmatch(OID)
+    assert alpaca._ORDER_ID.fullmatch(OID.upper())
+    assert alpaca._ORDER_ID.fullmatch(ENTRY["json"]["id"])
+    assert not any(alpaca._ORDER_ID.fullmatch(bad) for bad in NON_UUID_IDS)
+
+
+@pytest.mark.parametrize("call", ["by_client_id", "submit"])
+async def test_a_key_bearing_order_id_is_refused_and_never_rendered(call: str) -> None:
+    # Codex P2-3 sentinel: a response whose order id embeds the key id is refused, nothing is
+    # returned, and the production log chain renders neither credential.
+    bad_id = f"{KEY}-0000"
+    r = Router()
+    if call == "submit":
+        r.add("POST", "/v2/orders", 200, {**ENTRY["json"], "id": bad_id})
+    else:
+        r.add("GET", "/v2/orders:by_client_order_id", 200, {**ENTRY["json"], "id": bad_id})
+    t = structlog.get_logger("t")
+    buf = io.StringIO()
+    configure_logging(stream=buf)  # production chain; tests/conftest.py restores it
+    returned: object = None
+    with pytest.raises(BrokerError) as e:
+        try:
+            returned = await _invoke(await broker(r), call)
+        except BrokerError:
+            t.exception("risk.order_lookup_failed")  # renders the traceback, as the engine does
+            raise
+    assert returned is None and type(e.value) is BrokerError
+    rendered, text = buf.getvalue(), str(e.value)
+    assert "alpaca.http" in rendered and "risk.order_lookup_failed" in rendered
+    assert KEY not in rendered and SECRET not in rendered
+    assert KEY not in text and f"<withheld: {len(bad_id)} chars>" in text
+    assert r.unrouted == []
 
 
 # --- writes switched off (acceptance 10) -----------------------------------------------

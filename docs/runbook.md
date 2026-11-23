@@ -481,6 +481,12 @@ name), `elapsed_ms`, and `request_id` (Alpaca's `X-Request-ID`); a non-2xx adds 
 request id is also in the text of every `BrokerError` raised from a response, so the incident or
 `risk.*` line carries it too: quote it when asking Alpaca about a call.
 
+Broker order ids must be Alpaca's UUID form (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, hex). The
+adapter refuses any other id before the request, and an off-pattern id in a response, with
+`refusing an unsafe order id: <withheld: N chars>`. A broker id typed into `repair link` or set
+by hand with SQL (steps above) that is not a UUID fails every read of the row with that message:
+copy the id exactly as Alpaca shows it.
+
 A submit the transport proved unsent is marked `not_submitted` and logged
 `risk.order_not_submitted` with `reason="request not sent: <message>"`. Only a connect error, a
 connect timeout, a pool-wait timeout or a call on a closed client count (the connection never

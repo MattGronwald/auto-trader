@@ -3,6 +3,7 @@
 handling (Task 3) and the adapter's mapping (Task 5) that each side's own stubs cannot.
 """
 
+import io
 from collections.abc import AsyncIterator
 from decimal import Decimal as D
 from pathlib import Path
@@ -26,6 +27,7 @@ from autotrader.broker.base import (
 from autotrader.core.bus import EventBus
 from autotrader.core.kill import ControlGate
 from autotrader.core.ledger import Ledger
+from autotrader.core.logging import configure_logging
 from autotrader.journal.db import make_engine, make_sessionmaker, upgrade
 from autotrader.risk.resolve import entry_client_id
 from autotrader.risk.types import ExitRequest
@@ -182,6 +184,46 @@ async def test_a_filled_status_with_no_fill_leaves_the_row_unsettled(
         await ledger.apply_all(synced)
         stored = await tr.order(sessions, row)
         assert (stored.status, stored.settled_at, stored.incident) == ("new", None, None)
+        assert router.unrouted == []
+    finally:
+        await broker.aclose()
+
+
+async def test_a_key_bearing_id_from_the_client_id_lookup_is_never_linked_or_logged(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    # Codex P2-3 (PR #43): the lookup's order id is linked into the journal and later logged.
+    # The order otherwise matches the row, so before the UUID check it was linked; one that
+    # embeds the key id is now refused, the row stays unlinked, the lookup counts as failed,
+    # and the rendered production log carries neither credential.
+    cid = entry_client_id(await tr.jid_of(sessions), 1)
+    visible = {**probe("E-visible")["json"], "client_order_id": cid, "id": f"{KEY}-0000"}
+    row = await tr.insert_row(
+        sessions,
+        cid=cid,
+        status="unknown",
+        qty=D(visible["qty"]),
+        type_="limit",
+        limit_price=D(visible["limit_price"]),
+    )
+    router = Router()
+    router.add("GET", "/v2/orders:by_client_order_id", 200, visible, repeat=True)
+    broker = spy(router)
+    buf = io.StringIO()
+    configure_logging(stream=buf)  # production chain; tests/conftest.py restores it
+    try:
+        clock = te.Clock(NOW)
+        ledger = Ledger(EventBus(sessions), sessions, clock=clock)
+        engine = te.make_engine_(broker, sessions, gate, clock=clock, ledger=ledger)
+        for seconds in (0, 81):  # within the window, then past order_resolution_timeout_s
+            clock.now = NOW + seconds * SEC
+            await ledger.apply_all(await engine.sync_orders())
+        stored = await tr.order(sessions, row)
+        assert (stored.broker_order_id, stored.incident) == (None, "lookup_failed")
+        rendered = buf.getvalue()
+        assert "risk.order_lookup_failed" in rendered
+        assert KEY not in rendered and SECRET not in rendered
+        assert [r.url.path for r in router.requests] == ["/v2/orders:by_client_order_id"] * 2
         assert router.unrouted == []
     finally:
         await broker.aclose()

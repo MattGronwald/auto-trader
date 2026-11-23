@@ -24,7 +24,8 @@ docs/alpaca-notes.md for sources, raw values and open questions.
   read fails and the row stays unsettled. The submit ack must echo the
   order (client id, symbol, side, type, TIF, qty, limit price);
   a difference logs `alpaca.ack_mismatch` with the broker order id and raises `BrokerError`.
-  Order ids from responses (ack, `get_order_by_client_id`) must match `[A-Za-z0-9-]+`.
+  Order ids (ack, `get_order_by_client_id`, and every id `get_order` / `cancel_order` put
+  into a path) must be Alpaca's UUID form (`_ORDER_ID`, Codex P2-3).
   A looked-up order's client id and symbol are withheld when off-pattern (not raised, so a
   strange order under our client id stays a mismatch, not a failed lookup).
 - Order writes (`submit_order`, `cancel_order`) are refused before any I/O unless
@@ -93,8 +94,14 @@ FEE_TIERS: dict[int, FeeSchedule] = {
 }
 ASSET_RULES_TTL_S = 300.0
 # An order id goes into a URL path: httpx normalises `/orders/../account`, and an empty id
-# would make `DELETE /orders` Alpaca's cancel-all (review M6).
-_ORDER_ID = re.compile(r"[A-Za-z0-9-]+")
+# would make `DELETE /orders` Alpaca's cancel-all (review M6). It also goes into log lines
+# (`alpaca.http`, `alpaca.ack_*`, the engine's) and the journal unredacted, so it must be
+# Alpaca's UUID form (Codex P2-3, PR #43, owner): a UUID has no dash-free run longer than 12
+# characters, so it cannot contain a 20-character key id or a 40-character secret, and no log
+# site needs to redact it.
+_ORDER_ID = re.compile(
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+)
 # A symbol goes into a URL path (`/assets/{symbol}`) and exception text (Fable review M1): the
 # config's `Symbol` pattern. A client order id from a response reaches `repair link`'s output
 # (Fable review M2); ours are `at-<jid>-...`, Alpaca allows up to 128 characters.
@@ -474,9 +481,12 @@ def _view_symbol(raw: str) -> str:
 
 
 def _check_order_id(order_id: str) -> None:
-    # The id is withheld: in the ack check and the client-id lookup it is response data.
+    # The id is withheld: in the ack check and the client-id lookup it is response data, and
+    # an off-pattern one may embed a credential (Codex P2-3).
     if not _ORDER_ID.fullmatch(order_id):
-        raise BrokerError(f"refusing an unsafe order id: <withheld: {len(order_id)} chars>")
+        raise BrokerError(
+            f"refusing an unsafe order id: <withheld: {len(order_id)} chars>"
+        ) from None
 
 
 def _str(raw: object) -> str:
