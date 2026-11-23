@@ -14,11 +14,15 @@ docs/alpaca-notes.md for sources, raw values and open questions.
   through `sanitize_message`, every other response-derived value through `AlpacaHttp.diag`.
 - Responses: decimals must be JSON strings (a JSON number is malformed: `Decimal(0.5)` would
   be its binary expansion), timestamps must be timezone-aware, symbols go through
-  `_slash_symbol`. A status outside the spec 3.4 table raises `UnknownOrderStatus` (from the
-  submit ack it first logs `alpaca.ack_status_unknown` with the broker order id). The
-  submit ack must echo the order (client id, symbol, side, type, TIF, qty, limit price);
+  `_slash_symbol`; a position's symbol must then match `BASE/QUOTE` (it goes into the
+  `/assets/{symbol}` path, which `asset_rules` checks too). A status outside the spec 3.4
+  table raises `UnknownOrderStatus` (from the submit ack it first logs
+  `alpaca.ack_status_unknown` with the broker order id). The submit ack must echo the
+  order (client id, symbol, side, type, TIF, qty, limit price);
   a difference logs `alpaca.ack_mismatch` with the broker order id and raises `BrokerError`.
   Order ids from responses (ack, `get_order_by_client_id`) must match `[A-Za-z0-9-]+`.
+  A looked-up order's client id and symbol are withheld when off-pattern (not raised, so a
+  strange order under our client id stays a mismatch, not a failed lookup).
 - Order writes (`submit_order`, `cancel_order`) are refused before any I/O unless
   `orders_enabled`, which `connect()` never sets (enabling is WP 1.6d; paper only).
   `order_fills` lands in WP 1.6b. Reads of one order work from 1.6a on (`repair link`).
@@ -87,6 +91,11 @@ ASSET_RULES_TTL_S = 300.0
 # An order id goes into a URL path: httpx normalises `/orders/../account`, and an empty id
 # would make `DELETE /orders` Alpaca's cancel-all (review M6).
 _ORDER_ID = re.compile(r"[A-Za-z0-9-]+")
+# A symbol goes into a URL path (`/assets/{symbol}`) and exception text (Fable review M1): the
+# config's `Symbol` pattern. A client order id from a response reaches `repair link`'s output
+# (Fable review M2); ours are `at-<jid>-...`, Alpaca allows up to 128 characters.
+_SYMBOL = re.compile(r"[A-Z0-9]+/[A-Z0-9]+")
+_CLIENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 log = structlog.get_logger(__name__)
 
@@ -101,6 +110,21 @@ def _slash_symbol(raw: str) -> str:
         if raw.endswith(quote) and len(raw) > len(quote):
             return f"{raw[: -len(quote)]}/{quote}"
     raise BrokerError(f"cannot map position symbol to BASE/QUOTE: <withheld: {len(raw)} chars>")
+
+
+def _safe_symbol(raw: str) -> str:
+    """`_slash_symbol`, and the result must match `_SYMBOL` (Fable review M1): a position's
+    symbol goes into the `/assets/{symbol}` path and exception text."""
+    mapped = _slash_symbol(raw)
+    _check_symbol(mapped, shown=len(raw))
+    return mapped
+
+
+def _check_symbol(symbol: str, *, shown: int | None = None) -> None:
+    """Refuse a symbol off `_SYMBOL` before it goes into a path; the message withholds it."""
+    if _SYMBOL.fullmatch(symbol) is None:
+        n = len(symbol) if shown is None else shown
+        raise BrokerError(f"refusing an unsafe symbol: <withheld: {n} chars>") from None
 
 
 def order_state(raw: str, filled_qty: Decimal, request_id: str | None = None) -> OrderState:
@@ -203,7 +227,7 @@ class AlpacaBroker:
         with _parsing("positions", result.request_id):
             return [
                 Position(
-                    symbol=_slash_symbol(_str(p["symbol"])),
+                    symbol=_safe_symbol(_str(p["symbol"])),
                     qty=_decimal(p["qty"]),
                     qty_available=_decimal(p["qty_available"]),
                     avg_entry_price=_decimal(p["avg_entry_price"]),
@@ -213,6 +237,7 @@ class AlpacaBroker:
             ]
 
     async def asset_rules(self, symbol: str) -> AssetRules:
+        _check_symbol(symbol)
         now = self._monotonic()
         cached = self._rules.get(symbol)
         if cached is not None and now < cached[0]:
@@ -313,8 +338,8 @@ class AlpacaBroker:
             _check_order_id(order_id)  # it goes into a path (`get_order`) and log lines
             return BrokerOrderView(
                 order_id=order_id,
-                client_order_id=_str(raw["client_order_id"]),
-                symbol=_slash_symbol(_str(raw["symbol"])),
+                client_order_id=self._http.diag(_str(raw["client_order_id"]), _CLIENT_ID),
+                symbol=_view_symbol(_str(raw["symbol"])),
                 side=raw["side"],
                 qty=_decimal(raw["qty"]),
                 type=raw["type"],
@@ -410,6 +435,16 @@ def _body(result: HttpResult, what: str) -> Any:
     if 200 <= result.status < 300 and result.parsed:
         return result.body
     raise BrokerError(f"alpaca {what} returned {result.status} (request {result.request_id})")
+
+
+def _view_symbol(raw: str) -> str:
+    """A looked-up order's symbol; one that does not map is withheld, not raised (Fable
+    review M2): the order exists under our client id, so the caller's match check must see
+    a difference (`client_id_mismatch`), not a failed lookup (`lookup_failed`)."""
+    try:
+        return _safe_symbol(raw)
+    except BrokerError:
+        return f"<withheld: {len(raw)} chars>"
 
 
 def _check_order_id(order_id: str) -> None:

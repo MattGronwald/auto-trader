@@ -787,6 +787,61 @@ async def test_unmappable_position_symbol_is_a_broker_error() -> None:
     assert r.unrouted == []
 
 
+@pytest.mark.parametrize("raw_symbol", ["../account", "BTC/USD/../x", "BTC/USD?a=1", f"{KEY}/USD"])
+async def test_an_unsafe_position_symbol_is_withheld_and_never_reaches_a_path(
+    raw_symbol: str,
+) -> None:
+    """Fable review M1: a position symbol is response data; it goes into `/assets/{symbol}`
+    and exception text only after matching the config's `BASE/QUOTE` pattern."""
+    positions = [
+        {
+            "symbol": raw_symbol,
+            "asset_class": "crypto",
+            "qty": "1",
+            "qty_available": "1",
+            "avg_entry_price": "1",
+        }
+    ]
+    r = Router()
+    r.add("GET", "/v2/positions", 200, positions)
+    with pytest.raises(BrokerError) as e:
+        await (await broker(r)).get_positions()
+    text = str(e.value)
+    assert f"<withheld: {len(raw_symbol)} chars>" in text and "(request rid-1)" in text
+    assert "account" not in text and KEY not in text and "?" not in text
+    assert e.value.__cause__ is None and e.value.__suppress_context__
+    assert r.unrouted == []
+
+
+@pytest.mark.parametrize("symbol", ["../account", "BTC/USD/../x", "btc/usd", "", f"{KEY}/USD"])
+async def test_asset_rules_refuses_an_unsafe_symbol_before_any_request(symbol: str) -> None:
+    r = Router()  # no route: any request would be recorded as unrouted
+    with pytest.raises(BrokerError) as e:
+        await (await broker(r)).asset_rules(symbol)
+    text = str(e.value)
+    assert f"<withheld: {len(symbol)} chars>" in text
+    assert (symbol == "" or symbol not in text) and KEY not in text
+    assert e.value.__cause__ is None and e.value.__suppress_context__
+    assert r.unrouted == [] and r.requests == []
+
+
+async def test_the_client_id_lookup_withholds_an_unsafe_client_id_and_symbol() -> None:
+    """Fable review M2: the view's client id and symbol reach `repair link`'s refusal text
+    and its printed `broker_view`. Off-pattern values are withheld, not raised: the order
+    exists under our client id, so the caller must see a mismatch (`client_id_mismatch`),
+    not a failed lookup (`lookup_failed`)."""
+    bad_cid, bad_symbol = f"at-0123abcd-c1-e {KEY}", "../account"
+    r = Router()
+    body = {**probe("E-visible")["json"], "client_order_id": bad_cid, "symbol": bad_symbol}
+    r.add("GET", "/v2/orders:by_client_order_id", 200, body)
+    view = await (await broker(r)).get_order_by_client_id("at-0123abcd-c1-e")
+    assert view is not None
+    assert view.client_order_id == f"<withheld: {len(bad_cid)} chars>"
+    assert view.symbol == f"<withheld: {len(bad_symbol)} chars>"
+    assert KEY not in view.model_dump_json() and "account" not in view.model_dump_json()
+    assert r.unrouted == []
+
+
 # --- one error contract at the adapter boundary (PR #9 review, ported) ---------------------
 
 TRANSPORT_ERRORS: list[tuple[type[httpx.TransportError], type[BrokerError]]] = [
