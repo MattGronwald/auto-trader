@@ -106,13 +106,16 @@ async def test_submit_outcomes_through_the_engine(
     else:
         router.add("POST", "/v2/orders", raises=outcome[1])
     broker = spy(router)
-    engine = te.make_engine_(broker, sessions, gate)
-    result = await engine.exit(ExitRequest(symbol=BTC, reason="stop"))  # needs no feed
-    (row,) = [o for o in await te.orders(sessions) if o.side == "sell"]
-    assert (result.status, row.status) == (row_status, row_status)
-    assert [type(e) for e in broker.raised] == [cause]  # exact class, not a subclass
-    assert [r.method for r in router.requests if r.url.path == "/v2/orders"] == ["POST"]
-    assert router.unrouted == []
+    try:
+        engine = te.make_engine_(broker, sessions, gate)
+        result = await engine.exit(ExitRequest(symbol=BTC, reason="stop"))  # needs no feed
+        (row,) = [o for o in await te.orders(sessions) if o.side == "sell"]
+        assert (result.status, row.status) == (row_status, row_status)
+        assert [type(e) for e in broker.raised] == [cause]  # exact class, not a subclass
+        assert [r.method for r in router.requests if r.url.path == "/v2/orders"] == ["POST"]
+        assert router.unrouted == []
+    finally:
+        await broker.aclose()
 
 
 async def test_an_unknown_status_row_becomes_an_unknown_status_incident(
@@ -132,13 +135,17 @@ async def test_an_unknown_status_row_becomes_an_unknown_status_incident(
     router = Router()
     router.add("GET", f"/v2/orders/{oid}", 200, held, repeat=True)
     router.add("GET", "/v2/orders:by_client_order_id", 200, held, repeat=True)
-    clock = te.Clock(NOW)
-    ledger = Ledger(EventBus(sessions), sessions, clock=clock)
-    engine = te.make_engine_(spy(router), sessions, gate, clock=clock, ledger=ledger)
-    first = await engine.sync_orders()
-    await ledger.apply_all(first)
-    assert row in first.failed
-    clock.now = NOW + 80 * SEC  # order_resolution_timeout_s after the clock started
-    await ledger.apply_all(await engine.sync_orders())
-    assert (await tr.order(sessions, row)).incident == "unknown_status"
-    assert router.unrouted == []
+    broker = spy(router)
+    try:
+        clock = te.Clock(NOW)
+        ledger = Ledger(EventBus(sessions), sessions, clock=clock)
+        engine = te.make_engine_(broker, sessions, gate, clock=clock, ledger=ledger)
+        first = await engine.sync_orders()
+        await ledger.apply_all(first)
+        assert row in first.failed
+        clock.now = NOW + 81 * SEC  # clearly past order_resolution_timeout_s (80 s)
+        await ledger.apply_all(await engine.sync_orders())
+        assert (await tr.order(sessions, row)).incident == "unknown_status"
+        assert router.unrouted == []
+    finally:
+        await broker.aclose()
