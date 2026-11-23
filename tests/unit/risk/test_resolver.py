@@ -646,6 +646,20 @@ async def test_an_unknown_status_read_makes_a_type_b_candidate_then_an_incident(
     assert (await order(r.sessions, row_id)).incident == "unknown_status"
 
 
+async def test_the_unknown_status_memory_forgets_a_row_that_left_resolution(
+    sessions: async_sessionmaker[AsyncSession], gate: ControlGate
+) -> None:
+    """Fable review 2 M6: a row that became an incident is no longer read or resolved, so the
+    in-memory evidence for it is dropped instead of growing for the life of the process."""
+    r = rig(make_sim(HeldStatus), sessions, gate)
+    row_id, _ = await acked_entry(r)
+    await r.sync_at(0)
+    assert r.engine._status_unknown == {row_id}
+    assert (row_id, "incident", "unknown_status") in actions(await r.sync_at(80))
+    await r.sync_at(81)  # the incident row is skipped: neither a candidate nor a failure
+    assert r.engine._status_unknown == set()
+
+
 async def test_a_type_a_row_whose_lookup_meets_an_unknown_status_becomes_that_incident(
     sessions: async_sessionmaker[AsyncSession], gate: ControlGate
 ) -> None:

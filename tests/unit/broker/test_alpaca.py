@@ -361,6 +361,19 @@ CONTRACT: list[tuple[str, int, Any, type[BrokerError] | None]] = [
     ("get_order", 401, {"message": "unauthorized"}, BrokerError),
     ("by_client_id", 404, probe("A-get-unknown-cid")["json"], None),
     ("by_client_id", 500, {"message": "x"}, BrokerError),
+    # Only a 404 is "no such order"; any other 4xx is a failed lookup (PLAN 3.2 item 4,
+    # Fable review 2 M6).
+    ("by_client_id", 400, {"message": "bad"}, BrokerError),
+    ("by_client_id", 401, {"message": "unauthorized"}, BrokerError),
+    ("by_client_id", 403, {"message": "forbidden"}, BrokerError),
+    ("by_client_id", 422, {"message": "invalid"}, BrokerError),
+    ("by_client_id", 429, {"message": "rate limit"}, BrokerError),
+    # A redirect is not followed and is not success (Fable review 2 M6).
+    ("by_client_id", 302, None, BrokerError),
+    ("get_order", 302, None, BrokerError),
+    ("submit", 302, None, BrokerError),
+    ("cancel", 302, None, BrokerError),
+    ("cancel", 304, None, BrokerError),
     ("cancel", 204, None, None),
     ("cancel", 200, None, None),  # any 2xx returns
     ("cancel", 422, probe("G-cancel-final")["json"], BrokerError),

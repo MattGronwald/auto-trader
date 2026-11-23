@@ -1574,6 +1574,48 @@ async def test_a_forced_broker_close_makes_the_exit_unclean(
     assert "broker" in forced["steps"]
 
 
+async def test_teardown_closes_the_broker_after_the_flatten_and_the_bus(
+    cfg: AppConfig, lock: JournalLock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec 3.7 (Fable review 2 M6): the broker step runs after the shutdown flatten and
+    `bus.close`, so no exit or cancel still in flight loses its client."""
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    order: list[str] = []
+    real_request = request_flatten
+
+    async def request(*a: Any, **kw: Any) -> Any:
+        result = await real_request(*a, **kw)
+        order.append("flatten.request")
+        return result
+
+    class OrderedBus(EventBus):
+        async def close(self, budget_s: float = 1.0) -> None:
+            order.append("bus.close")
+            await super().close(budget_s)
+
+    class OrderedClose(FakeBroker):
+        async def aclose(self) -> None:
+            order.append("broker.aclose")
+            await super().aclose()
+
+    monkeypatch.setattr(runtime, "request_flatten", request)
+    monkeypatch.setattr(runtime, "EventBus", OrderedBus)
+    control, _ = make_control()
+    task = start_core(
+        _with_shutdown_flatten(cfg),
+        lock,
+        control,
+        connect_broker=sim_connect(OrderedClose()),
+        sync_s=0.01,
+        manage_s=0.01,
+    )
+    await _wait_for(lambda: bool(_named(buf, "core.started")))
+    control.begin("stop")
+    assert await asyncio.wait_for(task, timeout=10) == EXIT_CLEAN
+    assert order == ["flatten.request", "bus.close", "broker.aclose"]
+
+
 class CountingBroker(FakeBroker):
     """Cannot place orders; counts the calls (the Position Manager asks every step)."""
 

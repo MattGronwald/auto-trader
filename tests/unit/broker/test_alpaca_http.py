@@ -18,11 +18,13 @@ import structlog
 from structlog.testing import capture_logs
 
 from autotrader.broker.alpaca_http import (
+    MESSAGE_CAP,
     PAPER_URL,
     REQUEST_ID_RE,
     STATUS_RE,
     AlpacaHttp,
     ClosingBackend,
+    sanitize,
     wire_decimal,
 )
 from autotrader.broker.base import BrokerError, RequestNotSent
@@ -185,6 +187,21 @@ async def test_a_closed_client_is_request_not_sent() -> None:  # review I7
     assert seen == []
 
 
+def test_sanitize_removes_format_characters_before_redacting() -> None:
+    # A secret split by a zero-width space (category Cf) is still a secret once joined.
+    split = SECRET[:5] + "\u200b" + SECRET[5:]
+    text = sanitize(f"bad {split} end", (KEY, SECRET))
+    assert text == "bad [redacted] end"
+
+
+def test_sanitize_redacts_before_capping() -> None:
+    # A secret straddling the cap: capping first would keep its first part.
+    pad = "x" * (MESSAGE_CAP - 10)
+    text = sanitize(pad + SECRET + "tail", (KEY, SECRET))
+    assert SECRET[:10] not in text
+    assert text == (pad + "[redacted]tail")[:MESSAGE_CAP] + "..."
+
+
 def test_decimals_go_out_without_exponent() -> None:
     assert wire_decimal(Decimal("1E-7")) == "0.0000001"
     assert wire_decimal(Decimal("73667.30052")) == "73667.30052"
@@ -289,5 +306,9 @@ async def test_writes_open_a_fresh_connection_reads_reuse_one() -> None:
         await h.get("/account", "/account")
         await h.get("/account", "/account")
         assert srv.connections == 3
+        oid = "00000000-0000-4000-8000-00000016a009"
+        for _ in range(2):  # a cancel is a write too (spec 3.1, Fable review 2 M6)
+            await h.delete("/orders/{id}", f"/orders/{oid}", order_id=oid)
+        assert srv.connections == 5
         await h.aclose()
     assert h.closed
