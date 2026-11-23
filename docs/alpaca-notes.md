@@ -190,6 +190,14 @@ unsettled orders on three symbols already use about 180 of the 200. `AlpacaBroke
 `min_order_size`, decides what is orderable, so the cache is safe. 1.6d has to measure the real
 request rate before enabling writes (PLAN 1.6 row).
 
+**Response values.** Decimals must be plain decimal strings (`-?digits(.digits)?`, the form every
+recorded response uses; whitespace, `_`, a `+`, an exponent, NaN or Infinity fail the read) and in
+range: equity, a position's qty and entry price at least 0, `qty_available` between 0 and `qty`,
+one position row per symbol, an order's `qty` and `filled_avg_price` above 0, `filled_qty` at most
+`qty`. Account `cash` is not range-checked (a margin account can show it below zero). A value
+out of range is a `BrokerError` naming the request id, never the value (Fable review 2 M2,
+2026-11-23).
+
 **Logging.** One `alpaca.http` line per call: method, path template, order id (own field), status
 or error type, elapsed ms, `X-Request-ID`; Alpaca's `message` for a non-2xx. Never headers or keys.
 The request id is also in every `BrokerError` message raised from a response, so an operator can

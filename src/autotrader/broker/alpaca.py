@@ -12,8 +12,12 @@ docs/alpaca-notes.md for sources, raw values and open questions.
   `OrderRejected` and `UnknownOrderStatus` included, names Alpaca's request id and is
   raised `from None` (a rendered traceback has no cause chain). Alpaca's `message` passes
   through `sanitize_message`, every other response-derived value through `AlpacaHttp.diag`.
-- Responses: decimals must be JSON strings (a JSON number is malformed: `Decimal(0.5)` would
-  be its binary expansion), timestamps must be timezone-aware, symbols go through
+- Responses: decimals must be plain decimal JSON strings (`-?digits(.digits)?`; a JSON number
+  is malformed: `Decimal(0.5)` would be its binary expansion) and in range (Fable review 2
+  M2): equity, a position's qty and entry price non-negative, `0 <= qty_available <= qty`,
+  one row per symbol, an order's `qty` and `filled_avg_price` positive and `filled_qty <=
+  qty` where the body carries `qty`; account cash may be negative (margin). Timestamps must
+  be timezone-aware, symbols go through
   `_slash_symbol`; a position's symbol must then match `BASE/QUOTE` (it goes into the
   `/assets/{symbol}` path, which `asset_rules` checks too). The positions body must be a JSON
   array of objects that each carry a known `asset_class` (an empty array means flat, so a
@@ -268,7 +272,9 @@ class AlpacaBroker:
         result = await self._http.get("/account", "/account")
         raw = _body(result, "account")
         with _parsing("account", result.request_id):
-            return Account(equity=_decimal(raw["equity"]), cash=_decimal(raw["cash"]))
+            # Cash is not range-checked: a margin account reports it below zero once buying
+            # power beyond cash is spent. Equity below zero is not a state to trade on.
+            return Account(equity=_non_negative(raw["equity"]), cash=_decimal(raw["cash"]))
 
     async def get_positions(self) -> list[Position]:
         result = await self._http.get("/positions", "/positions")
@@ -286,16 +292,10 @@ class AlpacaBroker:
                 f"known asset_class (request {result.request_id})"
             ) from None
         with _parsing("positions", result.request_id):
-            return [
-                Position(
-                    symbol=_safe_symbol(_str(p["symbol"])),
-                    qty=_decimal(p["qty"]),
-                    qty_available=_decimal(p["qty_available"]),
-                    avg_entry_price=_decimal(p["avg_entry_price"]),
-                )
-                for p in raw
-                if p.get("asset_class") == "crypto"
-            ]
+            positions = [_position(p) for p in raw if p.get("asset_class") == "crypto"]
+            if len({p.symbol for p in positions}) != len(positions):
+                raise ValueError("two positions for one symbol")
+            return positions
 
     async def asset_rules(self, symbol: str) -> AssetRules:
         _check_symbol(symbol)
@@ -378,7 +378,7 @@ class AlpacaBroker:
                 order_id=order_id,
                 status=state,
                 filled_qty=filled,
-                avg_fill_price=None if avg is None else _decimal(avg),
+                avg_fill_price=None if avg is None else _positive(avg),
                 reason=None,
             )
 
@@ -428,7 +428,11 @@ class AlpacaBroker:
         if status not in _MAPPED_STATUSES:
             raise UnknownOrderStatus(self._http.diag(status, STATUS_RE), request_id) from None
         filled = _decimal(raw.get("filled_qty"))
-        return order_state(status, filled, request_id), filled
+        state = order_state(status, filled, request_id)
+        qty = raw.get("qty")  # every order we place has one; checked where the body carries it
+        if qty is not None and filled > _positive(qty):
+            raise ValueError("filled_qty exceeds qty")
+        return state, filled
 
     def _ack(self, order: BrokerOrder, result: HttpResult) -> OrderAck:
         """Validate a 200 submit response against the order we sent (spec 3.4)."""
@@ -526,9 +530,48 @@ def _str(raw: object) -> str:
     return raw
 
 
+# A plain decimal string, the form every recorded paper response uses (Fable review 2 M2):
+# `Decimal()` would also take whitespace, `_` separators, a sign, an exponent, non-ASCII
+# digits, NaN and Infinity.
+_PLAIN_DECIMAL = re.compile(r"-?[0-9]+(?:\.[0-9]+)?")
+
+
 def _decimal(raw: object) -> Decimal:
-    """Money/qty fields arrive as JSON strings; a JSON number has already lost precision."""
-    return Decimal(_str(raw))
+    """Money/qty fields arrive as JSON strings; a JSON number has already lost precision.
+    Anything but a plain decimal string is a `ValueError` (the value stays out of it)."""
+    text = _str(raw)
+    if _PLAIN_DECIMAL.fullmatch(text) is None:
+        raise ValueError("not a plain decimal string")
+    return Decimal(text)
+
+
+def _non_negative(raw: object) -> Decimal:
+    value = _decimal(raw)
+    if value < 0:
+        raise ValueError("negative where a non-negative value belongs")
+    return value
+
+
+def _positive(raw: object) -> Decimal:
+    value = _decimal(raw)
+    if value <= 0:
+        raise ValueError("not positive where a positive value belongs")
+    return value
+
+
+def _position(raw: dict[str, Any]) -> Position:
+    """One crypto row: `0 <= qty_available <= qty`, a non-negative entry price (Fable review 2
+    M2: a negative qty would read as dust and let a flatten check pass)."""
+    qty = _non_negative(raw["qty"])
+    available = _non_negative(raw["qty_available"])
+    if available > qty:
+        raise ValueError("qty_available exceeds qty")
+    return Position(
+        symbol=_safe_symbol(_str(raw["symbol"])),
+        qty=qty,
+        qty_available=available,
+        avg_entry_price=_non_negative(raw["avg_entry_price"]),
+    )
 
 
 def _aware(raw: object) -> datetime:

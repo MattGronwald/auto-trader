@@ -1076,6 +1076,113 @@ async def test_malformed_position_payload_is_a_broker_error() -> None:
     assert r.unrouted == []
 
 
+# --- impossible values (Fable review 2 M2, PR #43) ------------------------------------------
+
+# `Decimal()` accepts all of these; only a plain decimal string (`-?digits(.digits)?`, the
+# form every recorded paper response uses) is a quantity or a price.
+NOT_PLAIN_DECIMALS = [
+    " 1_0 ",
+    "1_0",
+    " 1",
+    "1 ",
+    "+1",
+    "1e-3",
+    "1E3",
+    ".5",
+    "5.",
+    "",
+    "NaN",
+    "-Infinity",
+    "Infinity",
+    chr(0x661),  # ARABIC-INDIC DIGIT ONE
+]
+
+
+@pytest.mark.parametrize("value", NOT_PLAIN_DECIMALS)
+async def test_a_decimal_that_is_not_plain_digits_is_a_broker_error(value: str) -> None:
+    r = Router()
+    r.add("GET", "/v2/account", 200, {**ACCOUNT, "cash": value})
+    with pytest.raises(BrokerError, match="unexpected alpaca account response") as e:
+        await (await broker(r)).get_account()
+    assert "(request rid-1)" in str(e.value) and e.value.__cause__ is None
+    assert r.unrouted == []
+
+
+async def test_a_negative_equity_is_a_broker_error_but_negative_cash_reads() -> None:
+    # Negative cash is what a margin account shows after spending buying power, so it is not
+    # refused here; equity below zero is not a state this account can report.
+    r = Router()
+    r.add("GET", "/v2/account", 200, {**ACCOUNT, "equity": "-1"})
+    r.add("GET", "/v2/account", 200, {**ACCOUNT, "cash": "-5.25"})
+    b = await broker(r)
+    with pytest.raises(BrokerError, match="unexpected alpaca account response"):
+        await b.get_account()
+    assert (await b.get_account()).cash == Decimal("-5.25")
+    assert r.unrouted == []
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [{"qty": "-1", "qty_available": "0"}],
+        [{"qty": "1", "qty_available": "2"}],
+        [{"qty": "1", "qty_available": "-0.1"}],
+        [{"avg_entry_price": "-5"}],
+        [{}, {"symbol": "BTCUSD"}],  # two rows for one symbol
+    ],
+)
+async def test_an_impossible_position_is_a_broker_error(rows: list[dict[str, str]]) -> None:
+    base = {"symbol": "BTC/USD", "asset_class": "crypto", "qty": "1"}
+    body = [{**base, "qty_available": "1", "avg_entry_price": "1", **row} for row in rows]
+    r = Router()
+    r.add("GET", "/v2/positions", 200, body)
+    with pytest.raises(BrokerError) as e:
+        await (await broker(r)).get_positions()
+    assert type(e.value) is BrokerError and "(request rid-1)" in str(e.value)
+    assert e.value.__cause__ is None and r.unrouted == []
+
+
+async def test_a_zero_position_and_a_zero_entry_price_read() -> None:
+    row = {"asset_class": "crypto", "qty": "0", "qty_available": "0", "avg_entry_price": "0"}
+    r = Router()
+    r.add("GET", "/v2/positions", 200, [{**row, "symbol": "BTC/USD"}])
+    (position,) = await (await broker(r)).get_positions()
+    assert (position.qty, position.qty_available) == (Decimal(0), Decimal(0))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"filled_qty": "999"},  # more filled than ordered
+        {"status": "new", "filled_qty": "5"},  # would read as partially_filled
+        {"qty": "0"},
+        {"qty": "-1"},
+        {"filled_avg_price": "-5"},
+        {"filled_avg_price": "0"},
+    ],
+)
+async def test_an_impossible_order_read_is_a_broker_error(change: dict[str, str]) -> None:
+    final = {**probe("E-final")["json"], "qty": "1", "filled_qty": "1", **change}
+    r = Router()
+    r.add("GET", f"/v2/orders/{final['id']}", 200, final)
+    with pytest.raises(BrokerError) as e:
+        await (await broker(r)).get_order(final["id"])
+    assert type(e.value) is BrokerError and "(request rid-1)" in str(e.value)
+    assert e.value.__cause__ is None and r.unrouted == []
+
+
+@pytest.mark.parametrize("call", ["by_client_id", "submit"])
+async def test_a_lookup_or_ack_filled_beyond_its_qty_is_a_broker_error(call: str) -> None:
+    body = {**(probe("E-visible") if call == "by_client_id" else ENTRY)["json"]}
+    body.update(status="partially_filled", filled_qty="0.1")  # qty is 0.000204026
+    r = Router()
+    r.add(*_ROUTES[call], 200, body)
+    with pytest.raises(BrokerError) as e:
+        await _invoke(await broker(r), call)
+    assert type(e.value) is BrokerError and "(request rid-1)" in str(e.value)
+    assert r.unrouted == []
+
+
 async def test_an_empty_position_list_reads_as_no_holdings() -> None:
     r = Router()
     r.add("GET", "/v2/positions", 200, [])
