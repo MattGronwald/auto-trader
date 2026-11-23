@@ -404,7 +404,7 @@ never migrates: it refuses a journal path that does not exist (`no journal at <p
    left to book:** the next sync pass reads the order's executions whenever the broker reports
    more filled than the row has booked, and `AlpacaBroker.order_fills` raises until 1.6b. So a
    linked order that filled, or a partially filled order that ended `canceled`, fails every sync
-   pass (`risk.order_sync_failed`) and stays unsettled, holding back its symbol and flat. In 1.6a
+   pass (`risk.order_sync_failed`) and stays unsettled, holding back its symbol and flatten. In 1.6a
    only a final order with nothing filled beyond the row's booked qty (e.g. `canceled` or
    `rejected` with zero fill) settles after the link. Keep the manual pause in place until 1.6b
    can reconcile the fills (the link still records the broker id and your evidence).
