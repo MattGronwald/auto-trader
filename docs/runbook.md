@@ -68,7 +68,7 @@ These disable admission until the next restart; the exits keep running. Each log
 
 | Reason | Level | What to do |
 |---|---|---|
-| `broker cannot place orders` | warning | Expected with `AlpacaBroker` before WP 1.6. Nothing to fix. |
+| `broker cannot place orders` | warning | Expected with `AlpacaBroker` before WP 1.6d. Nothing to fix. |
 | `backfill failed` | error | The history backfill raised (`feed.backfill_failed`) and the scanner is not subscribed. Restart once the data API answers. |
 | `recover failed` | error | `recover()` raised (traceback in the log). Fix the cause (usually the journal or a hung database), then restart. Candidates are logged as dropped meanwhile. |
 
@@ -468,11 +468,14 @@ name), `elapsed_ms`, and `request_id` (Alpaca's `X-Request-ID`); a non-2xx adds 
 request id is also in the text of every `BrokerError` raised from a response, so the incident or
 `risk.*` line carries it too: quote it when asking Alpaca about a call.
 
-A submit the transport proved unsent (connect, DNS, TLS or pool wait failed or was cancelled
-before any byte was written) is marked `not_submitted` and logged `risk.order_not_submitted` with
-`reason="request not sent: <message>"`; the message carries the cause's type name and the request
-id, never the cause's text. It needs no repair: nothing reached Alpaca. A failure after the
-request may have been written becomes `unknown` and goes to the resolver as before.
+A submit the transport proved unsent is marked `not_submitted` and logged
+`risk.order_not_submitted` with `reason="request not sent: <message>"`. Only a connect error, a
+connect timeout, a pool-wait timeout or a call on a closed client count (the connection never
+existed, or none was handed out); the message is `alpaca <METHOD> <path template> not sent:
+<cause type name>` (or `client closed`), with no request id (no response exists) and never the
+cause's text. It needs no repair: nothing reached Alpaca. Any other failure, and a submit that
+times out inside the engine's I/O budget, may have been written: the row becomes `unknown` and goes
+to the resolver as before. A cancelled caller is not mapped to either; the cancellation propagates.
 
 With `AlpacaBroker` no order is ever placed before 1.6d (`can_place_orders()` is false and
 admission is disabled), so none of this arises in production yet.
