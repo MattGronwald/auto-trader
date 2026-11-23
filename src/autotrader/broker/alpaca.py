@@ -15,7 +15,9 @@ docs/alpaca-notes.md for sources, raw values and open questions.
 - Responses: decimals must be JSON strings (a JSON number is malformed: `Decimal(0.5)` would
   be its binary expansion), timestamps must be timezone-aware, symbols go through
   `_slash_symbol`; a position's symbol must then match `BASE/QUOTE` (it goes into the
-  `/assets/{symbol}` path, which `asset_rules` checks too). A status outside the spec 3.4
+  `/assets/{symbol}` path, which `asset_rules` checks too). The positions body must be a JSON
+  array of objects that each carry a string `asset_class` (an empty array means flat, so a
+  `{}` or an unclassed row fails the read; Codex P2-1). A status outside the spec 3.4
   table raises `UnknownOrderStatus` (from the submit ack it first logs
   `alpaca.ack_status_unknown` with the broker order id). The submit ack must echo the
   order (client id, symbol, side, type, TIF, qty, limit price);
@@ -224,6 +226,16 @@ class AlpacaBroker:
     async def get_positions(self) -> list[Position]:
         result = await self._http.get("/positions", "/positions")
         raw = _body(result, "positions")
+        # An empty list claims the account holds nothing, and the Position Manager's flatten
+        # check reads it so: only a JSON array of rows that each name a string `asset_class`
+        # is a holdings list (Codex P2-1, PR #43). Other asset classes are skipped.
+        if not isinstance(raw, list) or not all(
+            isinstance(p, dict) and isinstance(p.get("asset_class"), str) for p in raw
+        ):
+            raise BrokerError(
+                "unexpected alpaca positions response: not a list of positions with an "
+                f"asset_class (request {result.request_id})"
+            ) from None
         with _parsing("positions", result.request_id):
             return [
                 Position(

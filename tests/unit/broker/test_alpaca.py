@@ -931,6 +931,47 @@ async def test_malformed_position_payload_is_a_broker_error() -> None:
     assert r.unrouted == []
 
 
+async def test_an_empty_position_list_reads_as_no_holdings() -> None:
+    r = Router()
+    r.add("GET", "/v2/positions", 200, [])
+    assert await (await broker(r)).get_positions() == []
+    assert r.unrouted == []
+
+
+_BTC_ROW = {"symbol": "BTC/USD", "qty": "1", "qty_available": "1", "avg_entry_price": "1"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        "",
+        {"positions": []},
+        [f"row {SECRET}"],
+        [None],
+        [_BTC_ROW],  # no asset_class
+        [{**_BTC_ROW, "asset_class": None}],
+        [{**_BTC_ROW, "asset_class": 7}],
+        [{**_BTC_ROW, "asset_class": "crypto"}, {**_BTC_ROW, "asset_class": ["crypto"]}],
+    ],
+)
+async def test_a_positions_body_that_is_not_a_list_of_classed_rows_is_a_broker_error(
+    body: Any,
+) -> None:
+    # Codex P2-1 (PR #43): an empty holdings list is a claim that the account is flat (the
+    # Position Manager's flatten check reads it so); a `200 {}` or a row without a string
+    # `asset_class` must fail the read, not read as "no crypto holdings".
+    r = Router()
+    r.add("GET", "/v2/positions", 200, body)
+    with pytest.raises(BrokerError) as e:
+        await (await broker(r)).get_positions()
+    text = str(e.value)
+    assert type(e.value) is BrokerError and "(request rid-1)" in text
+    assert SECRET not in text and "BTC" not in text
+    assert e.value.__cause__ is None and e.value.__suppress_context__
+    assert r.unrouted == []
+
+
 async def test_cancellation_is_not_swallowed() -> None:
     started, never = asyncio.Event(), asyncio.Event()
 

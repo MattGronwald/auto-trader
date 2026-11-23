@@ -307,6 +307,12 @@ it moves there unchanged until 1.6c. Startup's broker check
 `io_timeout_s` **(builder call)**, so a hung connect no longer blocks startup unbounded (Fable M7).
 Both steps close the clients on failure (3.7).
 
+**2026-11-23 note (owner's Codex review of PR #43, P2-1):** `get_positions` parsing is no longer
+unchanged. An empty holdings list means "flat" to the Position Manager, so the body must be a
+JSON array whose rows are objects with a string `asset_class`; a `200 {}`, a `""` or an
+unclassed row raises `BrokerError` (request id, no response data) instead of reading as no
+holdings. Rows of another asset class are still skipped.
+
 ### 3.6 Match check: `BrokerOrderView` and `mismatches`
 
 `BrokerOrderView` gains `type: OrderType`, `limit_price: Dec | None`, `time_in_force:
